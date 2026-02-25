@@ -241,6 +241,86 @@ impl Sampler for NSGAIISampler {
     }
 }
 
+/// Builder for constructing an [`NSGAIISampler`] with custom parameters.
+///
+/// # Example
+///
+/// ```
+/// use optuna_rs::{NSGAIISamplerBuilder, StudyDirection};
+///
+/// let sampler = NSGAIISamplerBuilder::new(vec![
+///     StudyDirection::Minimize,
+///     StudyDirection::Minimize,
+/// ])
+/// .population_size(100)
+/// .seed(42)
+/// .build();
+/// ```
+pub struct NSGAIISamplerBuilder {
+    directions: Vec<StudyDirection>,
+    population_size: Option<usize>,
+    crossover: Option<Box<dyn Crossover>>,
+    crossover_prob: Option<f64>,
+    mutation_prob: Option<f64>,
+    seed: Option<u64>,
+}
+
+impl NSGAIISamplerBuilder {
+    /// Create a new builder with the given optimization directions.
+    pub fn new(directions: Vec<StudyDirection>) -> Self {
+        Self {
+            directions,
+            population_size: None,
+            crossover: None,
+            crossover_prob: None,
+            mutation_prob: None,
+            seed: None,
+        }
+    }
+
+    /// Set the population size.
+    pub fn population_size(mut self, size: usize) -> Self {
+        self.population_size = Some(size);
+        self
+    }
+
+    /// Set the crossover operator.
+    pub fn crossover(mut self, crossover: Box<dyn Crossover>) -> Self {
+        self.crossover = Some(crossover);
+        self
+    }
+
+    /// Set the crossover probability.
+    pub fn crossover_prob(mut self, prob: f64) -> Self {
+        self.crossover_prob = Some(prob);
+        self
+    }
+
+    /// Set the mutation probability.
+    pub fn mutation_prob(mut self, prob: f64) -> Self {
+        self.mutation_prob = Some(prob);
+        self
+    }
+
+    /// Set the random seed.
+    pub fn seed(mut self, seed: u64) -> Self {
+        self.seed = Some(seed);
+        self
+    }
+
+    /// Build the [`NSGAIISampler`].
+    pub fn build(self) -> NSGAIISampler {
+        NSGAIISampler::new(
+            self.directions,
+            self.population_size,
+            self.crossover,
+            self.crossover_prob,
+            self.mutation_prob,
+            self.seed,
+        )
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

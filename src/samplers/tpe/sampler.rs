@@ -333,6 +333,102 @@ impl Sampler for TpeSampler {
     }
 }
 
+/// Builder for constructing a [`TpeSampler`] with custom parameters.
+///
+/// # Example
+///
+/// ```
+/// use optuna_rs::{TpeSamplerBuilder, StudyDirection};
+///
+/// let sampler = TpeSamplerBuilder::new(StudyDirection::Minimize)
+///     .seed(42)
+///     .n_startup_trials(20)
+///     .multivariate(true)
+///     .build();
+/// ```
+pub struct TpeSamplerBuilder {
+    direction: StudyDirection,
+    seed: Option<u64>,
+    n_startup_trials: usize,
+    n_ei_candidates: usize,
+    multivariate: bool,
+    consider_magic_clip: bool,
+    consider_endpoints: bool,
+    prior_weight: f64,
+}
+
+impl TpeSamplerBuilder {
+    /// Create a new builder with the given optimization direction.
+    pub fn new(direction: StudyDirection) -> Self {
+        Self {
+            direction,
+            seed: None,
+            n_startup_trials: 10,
+            n_ei_candidates: 24,
+            multivariate: false,
+            consider_magic_clip: true,
+            consider_endpoints: false,
+            prior_weight: 1.0,
+        }
+    }
+
+    /// Set the random seed.
+    pub fn seed(mut self, seed: u64) -> Self {
+        self.seed = Some(seed);
+        self
+    }
+
+    /// Set the number of random startup trials before TPE kicks in.
+    pub fn n_startup_trials(mut self, n: usize) -> Self {
+        self.n_startup_trials = n;
+        self
+    }
+
+    /// Set the number of EI candidates to evaluate.
+    pub fn n_ei_candidates(mut self, n: usize) -> Self {
+        self.n_ei_candidates = n;
+        self
+    }
+
+    /// Enable or disable multivariate (joint) sampling.
+    pub fn multivariate(mut self, multivariate: bool) -> Self {
+        self.multivariate = multivariate;
+        self
+    }
+
+    /// Enable or disable magic clip for bandwidth selection.
+    pub fn consider_magic_clip(mut self, consider: bool) -> Self {
+        self.consider_magic_clip = consider;
+        self
+    }
+
+    /// Enable or disable considering endpoints in the Parzen estimator.
+    pub fn consider_endpoints(mut self, consider: bool) -> Self {
+        self.consider_endpoints = consider;
+        self
+    }
+
+    /// Set the prior weight for the Parzen estimator.
+    pub fn prior_weight(mut self, weight: f64) -> Self {
+        self.prior_weight = weight;
+        self
+    }
+
+    /// Build the [`TpeSampler`].
+    pub fn build(self) -> TpeSampler {
+        TpeSampler::new(
+            self.direction,
+            self.seed,
+            self.n_startup_trials,
+            self.n_ei_candidates,
+            self.multivariate,
+            self.consider_magic_clip,
+            self.consider_endpoints,
+            self.prior_weight,
+        )
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

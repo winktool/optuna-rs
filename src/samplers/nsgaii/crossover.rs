@@ -5,7 +5,7 @@ pub trait Crossover: Send + Sync {
     /// Number of parent solutions required.
     fn n_parents(&self) -> usize;
 
-    /// Perform crossover on parent vectors (in [0,1] space) to produce a child.
+    /// Perform crossover on parent vectors (in \[0,1\] space) to produce a child.
     fn crossover(&self, parents: &[Vec<f64>], rng: &mut dyn RngCore) -> Vec<f64>;
 }
 

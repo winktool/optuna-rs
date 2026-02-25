@@ -10,6 +10,7 @@ use crate::pruners::Pruner;
 use crate::samplers::Sampler;
 use crate::storage::Storage;
 use crate::study::StudyDirection;
+use crate::terminators::Terminator;
 use crate::trial::{FrozenTrial, Trial, TrialState};
 
 /// An optimization study.
@@ -277,6 +278,89 @@ impl Study {
                 break;
             }
             if timeout.is_some_and(|t| start.elapsed() >= t) {
+                break;
+            }
+
+            self.run_trial_multi(&func, callbacks)?;
+            i_trial += 1;
+        }
+
+        self.storage.remove_session();
+        Ok(())
+    }
+
+    /// Run the optimization loop with terminator support.
+    ///
+    /// Like [`optimize`](Self::optimize), but also checks terminators after
+    /// each trial. If any terminator returns `true`, optimization stops.
+    pub fn optimize_with_terminators<F>(
+        &self,
+        func: F,
+        n_trials: Option<usize>,
+        timeout: Option<Duration>,
+        callbacks: Option<&[&dyn Callback]>,
+        terminators: Option<&[Arc<dyn Terminator>]>,
+    ) -> Result<()>
+    where
+        F: Fn(&mut Trial) -> Result<f64>,
+    {
+        self.stop_flag.store(false, Ordering::Release);
+        let start = Instant::now();
+
+        let mut i_trial: usize = 0;
+        loop {
+            if self.stop_flag.load(Ordering::Acquire) {
+                break;
+            }
+            if n_trials.is_some_and(|n| i_trial >= n) {
+                break;
+            }
+            if timeout.is_some_and(|t| start.elapsed() >= t) {
+                break;
+            }
+            if let Some(terms) = terminators
+                && terms.iter().any(|t| t.should_terminate(self))
+            {
+                break;
+            }
+
+            self.run_trial(&func, callbacks)?;
+            i_trial += 1;
+        }
+
+        self.storage.remove_session();
+        Ok(())
+    }
+
+    /// Run the multi-objective optimization loop with terminator support.
+    pub fn optimize_multi_with_terminators<F>(
+        &self,
+        func: F,
+        n_trials: Option<usize>,
+        timeout: Option<Duration>,
+        callbacks: Option<&[&dyn Callback]>,
+        terminators: Option<&[Arc<dyn Terminator>]>,
+    ) -> Result<()>
+    where
+        F: Fn(&mut Trial) -> Result<Vec<f64>>,
+    {
+        self.stop_flag.store(false, Ordering::Release);
+        let start = Instant::now();
+
+        let mut i_trial: usize = 0;
+        loop {
+            if self.stop_flag.load(Ordering::Acquire) {
+                break;
+            }
+            if n_trials.is_some_and(|n| i_trial >= n) {
+                break;
+            }
+            if timeout.is_some_and(|t| start.elapsed() >= t) {
+                break;
+            }
+            if let Some(terms) = terminators
+                && terms.iter().any(|t| t.should_terminate(self))
+            {
                 break;
             }
 

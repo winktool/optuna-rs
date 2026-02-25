@@ -9,14 +9,14 @@ pub(crate) mod random;
 mod tpe;
 
 pub use brute_force::BruteForceSampler;
-pub use cmaes::CmaEsSampler;
+pub use cmaes::{CmaEsSampler, CmaEsSamplerBuilder};
 pub use grid::GridSampler;
-pub use nsgaii::NSGAIISampler;
-pub use nsgaiii::NSGAIIISampler;
+pub use nsgaii::{NSGAIISampler, NSGAIISamplerBuilder};
+pub use nsgaiii::{NSGAIIISampler, NSGAIIISamplerBuilder};
 pub use partial_fixed::PartialFixedSampler;
 pub use qmc::QmcSampler;
 pub use random::RandomSampler;
-pub use tpe::TpeSampler;
+pub use tpe::{TpeSampler, TpeSamplerBuilder};
 
 use std::collections::HashMap;
 

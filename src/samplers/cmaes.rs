@@ -590,6 +590,84 @@ impl Sampler for CmaEsSampler {
     }
 }
 
+/// Builder for constructing a [`CmaEsSampler`] with custom parameters.
+///
+/// # Example
+///
+/// ```
+/// use optuna_rs::{CmaEsSamplerBuilder, StudyDirection};
+///
+/// let sampler = CmaEsSamplerBuilder::new(StudyDirection::Minimize)
+///     .sigma0(0.5)
+///     .n_startup_trials(10)
+///     .seed(42)
+///     .build();
+/// ```
+pub struct CmaEsSamplerBuilder {
+    direction: StudyDirection,
+    sigma0: Option<f64>,
+    n_startup_trials: Option<usize>,
+    popsize: Option<usize>,
+    independent_sampler: Option<Arc<dyn Sampler>>,
+    seed: Option<u64>,
+}
+
+impl CmaEsSamplerBuilder {
+    /// Create a new builder with the given optimization direction.
+    pub fn new(direction: StudyDirection) -> Self {
+        Self {
+            direction,
+            sigma0: None,
+            n_startup_trials: None,
+            popsize: None,
+            independent_sampler: None,
+            seed: None,
+        }
+    }
+
+    /// Set the initial step size (sigma).
+    pub fn sigma0(mut self, sigma: f64) -> Self {
+        self.sigma0 = Some(sigma);
+        self
+    }
+
+    /// Set the number of random startup trials before CMA-ES kicks in.
+    pub fn n_startup_trials(mut self, n: usize) -> Self {
+        self.n_startup_trials = Some(n);
+        self
+    }
+
+    /// Set the population size (lambda).
+    pub fn popsize(mut self, popsize: usize) -> Self {
+        self.popsize = Some(popsize);
+        self
+    }
+
+    /// Set the independent sampler used for parameters outside the search space.
+    pub fn independent_sampler(mut self, sampler: Arc<dyn Sampler>) -> Self {
+        self.independent_sampler = Some(sampler);
+        self
+    }
+
+    /// Set the random seed.
+    pub fn seed(mut self, seed: u64) -> Self {
+        self.seed = Some(seed);
+        self
+    }
+
+    /// Build the [`CmaEsSampler`].
+    pub fn build(self) -> CmaEsSampler {
+        CmaEsSampler::new(
+            self.direction,
+            self.sigma0,
+            self.n_startup_trials,
+            self.popsize,
+            self.independent_sampler,
+            self.seed,
+        )
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

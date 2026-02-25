@@ -377,6 +377,106 @@ impl Sampler for NSGAIIISampler {
     }
 }
 
+/// Builder for constructing an [`NSGAIIISampler`] with custom parameters.
+///
+/// # Example
+///
+/// ```
+/// use optuna_rs::{NSGAIIISamplerBuilder, StudyDirection};
+///
+/// let sampler = NSGAIIISamplerBuilder::new(vec![
+///     StudyDirection::Minimize,
+///     StudyDirection::Minimize,
+///     StudyDirection::Minimize,
+/// ])
+/// .population_size(100)
+/// .dividing_parameter(4)
+/// .seed(42)
+/// .build();
+/// ```
+pub struct NSGAIIISamplerBuilder {
+    directions: Vec<StudyDirection>,
+    population_size: Option<usize>,
+    crossover: Option<Box<dyn Crossover>>,
+    crossover_prob: Option<f64>,
+    mutation_prob: Option<f64>,
+    dividing_parameter: Option<usize>,
+    reference_points: Option<Vec<Vec<f64>>>,
+    seed: Option<u64>,
+}
+
+impl NSGAIIISamplerBuilder {
+    /// Create a new builder with the given optimization directions.
+    pub fn new(directions: Vec<StudyDirection>) -> Self {
+        Self {
+            directions,
+            population_size: None,
+            crossover: None,
+            crossover_prob: None,
+            mutation_prob: None,
+            dividing_parameter: None,
+            reference_points: None,
+            seed: None,
+        }
+    }
+
+    /// Set the population size.
+    pub fn population_size(mut self, size: usize) -> Self {
+        self.population_size = Some(size);
+        self
+    }
+
+    /// Set the crossover operator.
+    pub fn crossover(mut self, crossover: Box<dyn Crossover>) -> Self {
+        self.crossover = Some(crossover);
+        self
+    }
+
+    /// Set the crossover probability.
+    pub fn crossover_prob(mut self, prob: f64) -> Self {
+        self.crossover_prob = Some(prob);
+        self
+    }
+
+    /// Set the mutation probability.
+    pub fn mutation_prob(mut self, prob: f64) -> Self {
+        self.mutation_prob = Some(prob);
+        self
+    }
+
+    /// Set the dividing parameter for Das-Dennis reference point generation.
+    pub fn dividing_parameter(mut self, divs: usize) -> Self {
+        self.dividing_parameter = Some(divs);
+        self
+    }
+
+    /// Set custom reference points (overrides dividing_parameter).
+    pub fn reference_points(mut self, points: Vec<Vec<f64>>) -> Self {
+        self.reference_points = Some(points);
+        self
+    }
+
+    /// Set the random seed.
+    pub fn seed(mut self, seed: u64) -> Self {
+        self.seed = Some(seed);
+        self
+    }
+
+    /// Build the [`NSGAIIISampler`].
+    pub fn build(self) -> NSGAIIISampler {
+        NSGAIIISampler::new(
+            self.directions,
+            self.population_size,
+            self.crossover,
+            self.crossover_prob,
+            self.mutation_prob,
+            self.dividing_parameter,
+            self.reference_points,
+            self.seed,
+        )
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

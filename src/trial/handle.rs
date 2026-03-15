@@ -708,4 +708,54 @@ mod tests {
         assert!((x - 0.25).abs() < 1e-12);
         assert_eq!(calls.load(Ordering::Relaxed), 1);
     }
+
+    /// 对齐 Python: suggest_categorical 基本功能
+    #[test]
+    fn test_suggest_categorical() {
+        let study = create_study(
+            None, None, None, None,
+            Some(StudyDirection::Minimize), None, false,
+        ).unwrap();
+        let mut trial = study.ask(None).unwrap();
+        let val = trial.suggest_categorical(
+            "optimizer",
+            vec![
+                crate::distributions::CategoricalChoice::Str("adam".into()),
+                crate::distributions::CategoricalChoice::Str("sgd".into()),
+                crate::distributions::CategoricalChoice::Str("rmsprop".into()),
+            ],
+        ).unwrap();
+        // 应返回有效的 CategoricalChoice::Str 变体
+        match val {
+            crate::distributions::CategoricalChoice::Str(s) => {
+                assert!(["adam", "sgd", "rmsprop"].contains(&s.as_str()));
+            }
+            _ => panic!("should return Str variant"),
+        }
+    }
+
+    /// 对齐 Python: user_attrs 设置和读取
+    #[test]
+    fn test_trial_user_attrs() {
+        let study = create_study(
+            None, None, None, None,
+            Some(StudyDirection::Minimize), None, false,
+        ).unwrap();
+        let trial = study.ask(None).unwrap();
+        trial.set_user_attr("key1", serde_json::json!("value1")).unwrap();
+        let attrs = trial.user_attrs().unwrap();
+        assert_eq!(attrs.get("key1").unwrap(), &serde_json::json!("value1"));
+    }
+
+    /// 对齐 Python: 无中间值时 should_prune 返回 false
+    #[test]
+    fn test_should_prune_no_report() {
+        let study = create_study(
+            None, None, None, None,
+            Some(StudyDirection::Minimize), None, false,
+        ).unwrap();
+        let trial = study.ask(None).unwrap();
+        // 未 report 任何中间值 → should_prune = false
+        assert!(!trial.should_prune().unwrap());
+    }
 }

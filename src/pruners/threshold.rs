@@ -214,7 +214,55 @@ mod tests {
     #[test]
     #[should_panic]
     fn test_both_none_panics() {
-        // lower 和 upper 都为 None 应该 panic
         ThresholdPruner::new(None, None, 0, 1);
+    }
+
+    /// 对齐 Python: lower > upper 应 panic
+    #[test]
+    #[should_panic(expected = "lower")]
+    fn test_lower_gt_upper_panics() {
+        ThresholdPruner::new(Some(10.0), Some(1.0), 0, 1);
+    }
+
+    /// 对齐 Python: interval_steps > 1 的行为
+    #[test]
+    fn test_interval_steps() {
+        let pruner = ThresholdPruner::new(Some(0.0), None, 0, 3);
+        // step 0 是第一个检查点
+        let trial0 = make_trial(vec![(0, -1.0)]);
+        assert!(pruner.prune(&[], &trial0, None).unwrap());
+        // step 1 不在间隔上
+        let trial1 = make_trial(vec![(0, 5.0), (1, -1.0)]);
+        assert!(!pruner.prune(&[], &trial1, None).unwrap());
+    }
+
+    /// 对齐 Python: 多步骤只检查最新步骤
+    #[test]
+    fn test_multi_step_latest_only() {
+        let pruner = ThresholdPruner::new(Some(0.0), Some(10.0), 0, 1);
+        // 中间有超界值，但最新步骤在范围内
+        let trial = make_trial(vec![(0, -5.0), (1, 15.0), (2, 5.0)]);
+        // 最新步骤 2 的值 5.0 在范围内 → 不剪枝
+        assert!(!pruner.prune(&[], &trial, None).unwrap());
+    }
+
+    /// 对齐 Python: lower == upper 边界
+    #[test]
+    fn test_lower_eq_upper() {
+        let pruner = ThresholdPruner::new(Some(5.0), Some(5.0), 0, 1);
+        let ok = make_trial(vec![(0, 5.0)]);
+        assert!(!pruner.prune(&[], &ok, None).unwrap());
+        let bad = make_trial(vec![(0, 5.1)]);
+        assert!(pruner.prune(&[], &bad, None).unwrap());
+    }
+
+    /// 对齐 Python: Inf 值测试
+    #[test]
+    fn test_inf_values() {
+        let pruner = ThresholdPruner::new(Some(0.0), Some(100.0), 0, 1);
+        let inf_trial = make_trial(vec![(0, f64::INFINITY)]);
+        assert!(pruner.prune(&[], &inf_trial, None).unwrap());
+        let neg_inf = make_trial(vec![(0, f64::NEG_INFINITY)]);
+        assert!(pruner.prune(&[], &neg_inf, None).unwrap());
     }
 }

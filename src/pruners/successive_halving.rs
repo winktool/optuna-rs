@@ -66,6 +66,11 @@ impl SuccessiveHalvingPruner {
         if let Some(mr) = min_resource {
             assert!(mr >= 1, "min_resource 必须 >= 1");
         }
+        // 对齐 Python: bootstrap_count > 0 与 min_resource = auto(None) 互斥
+        assert!(
+            !(bootstrap_count > 0 && min_resource.is_none()),
+            "bootstrap_count > 0 和 min_resource = auto(None) 互不兼容"
+        );
 
         Self {
             min_resource,
@@ -355,5 +360,52 @@ mod tests {
         );
         let trial = make_trial_with_attrs(0, vec![], attrs, TrialState::Running);
         assert_eq!(SuccessiveHalvingPruner::get_current_rung(&trial), 2);
+    }
+
+    /// 对齐 Python: bootstrap_count > 0 与 min_resource=None 互斥
+    #[test]
+    #[should_panic(expected = "互不兼容")]
+    fn test_bootstrap_auto_incompatible() {
+        // Python: ValueError("bootstrap_count > 0 and min_resource == 'auto' are mutually incompatible")
+        SuccessiveHalvingPruner::new(None, 4, 0, 1, StudyDirection::Minimize);
+    }
+
+    /// 验证 reduction_factor < 2 被拒绝
+    #[test]
+    #[should_panic(expected = "reduction_factor")]
+    fn test_reduction_factor_too_small() {
+        SuccessiveHalvingPruner::new(Some(1), 1, 0, 0, StudyDirection::Minimize);
+    }
+
+    /// 验证 min_resource=0 被拒绝
+    #[test]
+    #[should_panic(expected = "min_resource")]
+    fn test_min_resource_zero() {
+        SuccessiveHalvingPruner::new(Some(0), 4, 0, 0, StudyDirection::Minimize);
+    }
+
+    /// 验证 min_early_stopping_rate 负值被拒绝
+    #[test]
+    #[should_panic(expected = "min_early_stopping_rate")]
+    fn test_negative_early_stopping_rate() {
+        SuccessiveHalvingPruner::new(Some(1), 4, -1, 0, StudyDirection::Minimize);
+    }
+
+    /// estimate_min_resource：正常估计
+    #[test]
+    fn test_estimate_min_resource() {
+        // 最大步骤 = 100 → min_resource = 100/100 = 1
+        let t = make_completed_trial(0, vec![(100, 1.0)]);
+        assert_eq!(SuccessiveHalvingPruner::estimate_min_resource(&[&t]), Some(1));
+        // 最大步骤 = 500 → min_resource = 500/100 = 5
+        let t2 = make_completed_trial(1, vec![(500, 1.0)]);
+        assert_eq!(SuccessiveHalvingPruner::estimate_min_resource(&[&t2]), Some(5));
+    }
+
+    /// estimate_min_resource：无试验时返回 None
+    #[test]
+    fn test_estimate_min_resource_empty() {
+        let trials: Vec<&FrozenTrial> = vec![];
+        assert_eq!(SuccessiveHalvingPruner::estimate_min_resource(&trials), None);
     }
 }

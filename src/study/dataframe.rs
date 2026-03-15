@@ -267,6 +267,7 @@ fn param_value_to_string(v: &ParamValue) -> String {
 mod tests {
     use super::*;
     use crate::testing::create_frozen_trial;
+    use std::collections::HashMap;
 
     #[test]
     fn test_empty_trials() {
@@ -362,5 +363,95 @@ mod tests {
         ).unwrap();
         assert!(df.get_column_names().contains(&&PlSmallStr::from("intermediate_values_1")));
         assert!(df.get_column_names().contains(&&PlSmallStr::from("intermediate_values_2")));
+    }
+
+    /// 对齐 Python: Pruned/Failed 试验的 values = None
+    #[test]
+    fn test_pruned_trial_null_values() {
+        let now = chrono::Utc::now();
+        let trial = FrozenTrial {
+            number: 0,
+            state: crate::trial::TrialState::Pruned,
+            values: None,
+            datetime_start: Some(now),
+            datetime_complete: Some(now),
+            params: HashMap::new(),
+            distributions: HashMap::new(),
+            user_attrs: HashMap::new(),
+            system_attrs: HashMap::new(),
+            intermediate_values: HashMap::new(),
+            trial_id: 0,
+        };
+        let df = trials_to_dataframe(&[trial], false, None, None, false).unwrap();
+        assert_eq!(df.height(), 1);
+        // value 列应为 null
+        let col = df.column("value").unwrap();
+        assert!(col.f64().unwrap().get(0).is_none());
+    }
+
+    /// 对齐 Python: user_attrs 跨试验不一致
+    #[test]
+    fn test_user_attrs_inconsistent_across_trials() {
+        let now = chrono::Utc::now();
+        let mut ua1 = HashMap::new();
+        ua1.insert("x".to_string(), serde_json::json!(1));
+        let t1 = FrozenTrial {
+            number: 0,
+            state: crate::trial::TrialState::Complete,
+            values: Some(vec![1.0]),
+            datetime_start: Some(now),
+            datetime_complete: Some(now),
+            params: HashMap::new(),
+            distributions: HashMap::new(),
+            user_attrs: ua1,
+            system_attrs: HashMap::new(),
+            intermediate_values: HashMap::new(),
+            trial_id: 0,
+        };
+        let t2 = FrozenTrial {
+            number: 1,
+            state: crate::trial::TrialState::Complete,
+            values: Some(vec![2.0]),
+            datetime_start: Some(now),
+            datetime_complete: Some(now),
+            params: HashMap::new(),
+            distributions: HashMap::new(),
+            user_attrs: HashMap::new(), // 没有 "x" attr
+            system_attrs: HashMap::new(),
+            intermediate_values: HashMap::new(),
+            trial_id: 1,
+        };
+        let df = trials_to_dataframe(&[t1, t2], false, None, None, false).unwrap();
+        assert_eq!(df.height(), 2);
+        // user_attrs_x 列应该存在
+        assert!(df.get_column_names().contains(&&PlSmallStr::from("user_attrs_x")));
+    }
+
+    /// 对齐 Python: duration 列
+    #[test]
+    fn test_duration_column() {
+        let start = chrono::Utc::now();
+        let end = start + chrono::Duration::seconds(10);
+        let trial = FrozenTrial {
+            number: 0,
+            state: crate::trial::TrialState::Complete,
+            values: Some(vec![1.0]),
+            datetime_start: Some(start),
+            datetime_complete: Some(end),
+            params: HashMap::new(),
+            distributions: HashMap::new(),
+            user_attrs: HashMap::new(),
+            system_attrs: HashMap::new(),
+            intermediate_values: HashMap::new(),
+            trial_id: 0,
+        };
+        let df = trials_to_dataframe(
+            &[trial], false, None,
+            Some(&["number", "duration"]), false,
+        ).unwrap();
+        assert!(df.get_column_names().contains(&&PlSmallStr::from("duration")));
+        let dur = df.column("duration").unwrap().f64().unwrap().get(0).unwrap();
+        // duration 应约为 10 秒
+        assert!((dur - 10.0).abs() < 0.1, "duration should be ~10s, got {dur}");
     }
 }

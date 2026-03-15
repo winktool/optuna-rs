@@ -316,4 +316,79 @@ mod tests {
         cached.delete_study(study_id).unwrap();
         assert!(cached.get_study_directions(study_id).is_err());
     }
+
+    /// 对齐 Python: 多 study 缓存隔离
+    #[test]
+    fn test_cached_storage_multi_study_isolation() {
+        let backend = Arc::new(InMemoryStorage::new());
+        let cached = CachedStorage::new(backend);
+        let dirs = vec![StudyDirection::Minimize];
+
+        let sid1 = cached.create_new_study(&dirs, Some("study1")).unwrap();
+        let sid2 = cached.create_new_study(&dirs, Some("study2")).unwrap();
+
+        let tid1 = cached.create_new_trial(sid1, None).unwrap();
+        cached.set_trial_state_values(tid1, TrialState::Complete, Some(&[1.0])).unwrap();
+
+        let tid2 = cached.create_new_trial(sid2, None).unwrap();
+        cached.set_trial_state_values(tid2, TrialState::Complete, Some(&[2.0])).unwrap();
+
+        // study1 只有 1 个试验
+        let trials1 = cached.get_all_trials(sid1, None).unwrap();
+        assert_eq!(trials1.len(), 1);
+        assert_eq!(trials1[0].values.as_ref().unwrap()[0], 1.0);
+
+        // study2 只有 1 个试验
+        let trials2 = cached.get_all_trials(sid2, None).unwrap();
+        assert_eq!(trials2.len(), 1);
+        assert_eq!(trials2[0].values.as_ref().unwrap()[0], 2.0);
+    }
+
+    /// 对齐 Python: Pruned 试验也被缓存
+    #[test]
+    fn test_cached_storage_pruned_trial_cached() {
+        let backend = Arc::new(InMemoryStorage::new());
+        let cached = CachedStorage::new(backend);
+        let dirs = vec![StudyDirection::Minimize];
+        let study_id = cached.create_new_study(&dirs, Some("test")).unwrap();
+
+        let tid = cached.create_new_trial(study_id, None).unwrap();
+        cached.set_trial_state_values(tid, TrialState::Pruned, None).unwrap();
+
+        // 获取所有试验以填充缓存
+        let trials = cached.get_all_trials(study_id, None).unwrap();
+        assert_eq!(trials.len(), 1);
+        assert_eq!(trials[0].state, TrialState::Pruned);
+
+        // 通过 get_trial 应能命中缓存
+        let t = cached.get_trial(tid).unwrap();
+        assert_eq!(t.state, TrialState::Pruned);
+    }
+
+    /// 对齐 Python: get_trial 在缓存未命中时查询后端
+    #[test]
+    fn test_cached_storage_get_trial_cache_miss() {
+        let backend: Arc<dyn Storage> = Arc::new(InMemoryStorage::new());
+        let cached = CachedStorage::new(Arc::clone(&backend));
+        let dirs = vec![StudyDirection::Minimize];
+        let study_id = cached.create_new_study(&dirs, Some("test")).unwrap();
+
+        let tid = cached.create_new_trial(study_id, None).unwrap();
+        // 不调用 get_all_trials（不填充缓存），直接 get_trial → 从后端获取
+        let t = cached.get_trial(tid).unwrap();
+        assert_eq!(t.state, TrialState::Running); // 新建的试验状态是 Running
+    }
+
+    /// 对齐 Python: user_attrs / system_attrs 透传
+    #[test]
+    fn test_cached_storage_attrs_passthrough() {
+        let backend = Arc::new(InMemoryStorage::new());
+        let cached = CachedStorage::new(backend);
+        let dirs = vec![StudyDirection::Minimize];
+        let study_id = cached.create_new_study(&dirs, Some("test")).unwrap();
+
+        cached.set_study_user_attr(study_id, "key1", serde_json::json!("val1")).unwrap();
+        let attrs = cached.get_study_user_attrs(study_id).unwrap();
+        assert_eq!(attrs.get("key1").unwrap(), &serde_json::json!("val1"));
+    }
 }

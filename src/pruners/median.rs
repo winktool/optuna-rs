@@ -117,4 +117,57 @@ mod tests {
         // Only 2 completed trials < 5 startup, so no pruning
         assert!(!pruner.prune(&completed, &trial, None).unwrap());
     }
+
+    /// 对齐 Python: MedianPruner 在 Maximize 方向的剪枝行为
+    #[test]
+    fn test_median_pruner_maximize() {
+        let pruner = MedianPruner::new(0, 0, 1, 1, StudyDirection::Maximize);
+        let completed = vec![
+            make_trial(0, TrialState::Complete, vec![(0, 10.0)]),
+            make_trial(1, TrialState::Complete, vec![(0, 20.0)]),
+            make_trial(2, TrialState::Complete, vec![(0, 30.0)]),
+        ];
+        // 低于中位数 → 剪枝（最大化方向）
+        let bad = make_trial(3, TrialState::Running, vec![(0, 1.0)]);
+        assert!(pruner.prune(&completed, &bad, None).unwrap());
+        // 高于中位数 → 保留
+        let good = make_trial(3, TrialState::Running, vec![(0, 50.0)]);
+        assert!(!pruner.prune(&completed, &good, None).unwrap());
+    }
+
+    /// 对齐 Python: n_warmup_steps 透传测试
+    #[test]
+    fn test_median_pruner_warmup() {
+        let pruner = MedianPruner::new(0, 5, 1, 1, StudyDirection::Minimize);
+        let completed = vec![
+            make_trial(0, TrialState::Complete, vec![(0, 1.0), (5, 1.0)]),
+        ];
+        // step 2 < warmup 5 → 不剪枝
+        let trial = make_trial(1, TrialState::Running, vec![(2, 100.0)]);
+        assert!(!pruner.prune(&completed, &trial, None).unwrap());
+        // step 5 >= warmup 5 → 可以剪枝
+        let trial2 = make_trial(1, TrialState::Running, vec![(5, 100.0)]);
+        assert!(pruner.prune(&completed, &trial2, None).unwrap());
+    }
+
+    /// 对齐 Python: n_min_trials 透传测试
+    #[test]
+    fn test_median_pruner_n_min_trials() {
+        let pruner = MedianPruner::new(0, 0, 1, 3, StudyDirection::Minimize);
+        // 只有 2 个试验在 step 0 有值 < n_min_trials=3
+        let completed = vec![
+            make_trial(0, TrialState::Complete, vec![(0, 1.0)]),
+            make_trial(1, TrialState::Complete, vec![(0, 2.0)]),
+        ];
+        let trial = make_trial(2, TrialState::Running, vec![(0, 100.0)]);
+        assert!(!pruner.prune(&completed, &trial, None).unwrap());
+    }
+
+    /// 对齐 Python: 无已完成试验 → 不剪枝
+    #[test]
+    fn test_median_pruner_no_completed() {
+        let pruner = MedianPruner::new(0, 0, 1, 1, StudyDirection::Minimize);
+        let trial = make_trial(0, TrialState::Running, vec![(0, 100.0)]);
+        assert!(!pruner.prune(&[], &trial, None).unwrap());
+    }
 }

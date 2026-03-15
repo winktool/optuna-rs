@@ -72,6 +72,11 @@ impl HyperbandPruner {
                 "max_resource 必须 >= min_resource"
             );
         }
+        // 对齐 Python: bootstrap_count > 0 与 max_resource="auto"(None) 互斥
+        assert!(
+            !(bootstrap_count > 0 && max_resource.is_none()),
+            "bootstrap_count > 0 和 max_resource = auto(None) 互不兼容"
+        );
 
         Self {
             min_resource,
@@ -120,6 +125,11 @@ impl HyperbandPruner {
             inner.n_brackets = Some(n);
             n
         };
+
+        // 防止重复初始化：如果已经有 pruners 则跳过
+        if !inner.pruners.is_empty() {
+            return;
+        }
 
         // 为每个括号创建 SuccessiveHalvingPruner
         for bracket_id in 0..n_brackets {
@@ -302,7 +312,6 @@ mod tests {
 
     #[test]
     fn test_bracket_allocation() {
-        // 测试括号预算分配
         let pruner =
             HyperbandPruner::new(1, Some(27), 3, 0, StudyDirection::Minimize, "test_study");
         // n_brackets = floor(log_3(27/1)) + 1 = 3 + 1 = 4
@@ -310,10 +319,82 @@ mod tests {
         let budget_1 = pruner.calculate_trial_allocation_budget(1, 4);
         let budget_2 = pruner.calculate_trial_allocation_budget(2, 4);
         let budget_3 = pruner.calculate_trial_allocation_budget(3, 4);
-        // 验证预算非零
         assert!(budget_0 > 0);
         assert!(budget_1 > 0);
         assert!(budget_2 > 0);
         assert!(budget_3 > 0);
+    }
+
+    /// 对齐 Python: bootstrap_count > 0 + max_resource=None 互斥
+    #[test]
+    #[should_panic(expected = "互不兼容")]
+    fn test_bootstrap_auto_incompatible() {
+        HyperbandPruner::new(1, None, 3, 1, StudyDirection::Minimize, "test");
+    }
+
+    /// 对齐 Python: 重复调用 prune 不会重复初始化括号
+    #[test]
+    fn test_no_double_initialization() {
+        let pruner =
+            HyperbandPruner::new(1, Some(27), 3, 0, StudyDirection::Minimize, "test_study");
+        let completed = make_completed_trial(0, 26);
+        let trial = make_running_trial(1, 0, 1.0);
+        // 第一次调用初始化
+        let _ = pruner.prune(&[completed.clone()], &trial, None);
+        // 第二次调用不应重复
+        let _ = pruner.prune(&[completed.clone()], &trial, None);
+        // 验证  pruners 数量正确：n_brackets = 4
+        let inner = pruner.inner.lock().unwrap();
+        assert_eq!(inner.pruners.len(), 4);
+        assert_eq!(inner.trial_allocation_budgets.len(), 4);
+    }
+
+    /// 对齐 Python: max_resource=None 自动估计
+    #[test]
+    fn test_auto_max_resource() {
+        let pruner =
+            HyperbandPruner::new(1, None, 3, 0, StudyDirection::Minimize, "test_study");
+        // 第一个已完成试验 max_step=26 → max_resource=27
+        let completed = make_completed_trial(0, 26);
+        let trial = make_running_trial(1, 0, 1.0);
+        let _ = pruner.prune(&[completed], &trial, None);
+        // 验证初始化成功：n_brackets = floor(log_3(27)) + 1 = 4
+        let inner = pruner.inner.lock().unwrap();
+        assert_eq!(inner.n_brackets, Some(4));
+    }
+
+    /// 对齐 Python: 多个试验被分配到不同括号
+    #[test]
+    fn test_different_brackets_for_different_trials() {
+        let pruner =
+            HyperbandPruner::new(1, Some(27), 3, 0, StudyDirection::Minimize, "test_study");
+        let completed = make_completed_trial(0, 26);
+        // 初始化
+        let trial0 = make_running_trial(1, 0, 1.0);
+        let _ = pruner.prune(&[completed.clone()], &trial0, None);
+        // 获取预算分配
+        let inner = pruner.inner.lock().unwrap();
+        let budgets = inner.trial_allocation_budgets.clone();
+        drop(inner);
+        // 检查多个试验的括号分配
+        let mut bracket_ids = std::collections::HashSet::new();
+        for trial_num in 0..100 {
+            let bid = pruner.get_bracket_id(trial_num, "test_study", &budgets);
+            bracket_ids.insert(bid);
+        }
+        // 100 个试验应该分布在多个括号中
+        assert!(bracket_ids.len() > 1, "试验应分布在多个括号中");
+    }
+
+    /// 对齐 Python: CRC32 与 Python binascii.crc32 一致
+    #[test]
+    fn test_crc32_cross_python() {
+        // Python: binascii.crc32(b"test_study_0") = 某个特定值
+        // 只要 Rust 的 CRC32 实现与标准一致即可
+        let h1 = crc32_hash(b"test_study_0");
+        let h2 = crc32_hash(b"test_study_1");
+        assert_ne!(h1, h2, "不同输入应产生不同哈希");
+        // 验证标准 CRC32 值
+        assert_eq!(crc32_hash(b"test"), 0xD87F7E0C);
     }
 }

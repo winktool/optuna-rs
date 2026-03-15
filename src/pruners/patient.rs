@@ -235,4 +235,51 @@ mod tests {
         let trial = make_trial(vec![(0, 1.0), (1, 0.95), (2, 0.92), (3, 0.91)]);
         assert!(!pruner.prune(&[], &trial, None).unwrap());
     }
+
+    /// 对齐 Python: patience=0 时只要最新值不如之前就剪枝
+    #[test]
+    fn test_patience_zero() {
+        let pruner = PatientPruner::new(None, 0, 0.0, StudyDirection::Minimize);
+        // before = [0] → min = 0.5
+        // after  = [1] → min = 0.8
+        // 0.5 + 0.0 < 0.8 → true → 剪枝
+        let trial = make_trial(vec![(0, 0.5), (1, 0.8)]);
+        assert!(pruner.prune(&[], &trial, None).unwrap());
+    }
+
+    /// 对齐 Python: 全 NaN before/after 窗口 → 不剪枝
+    #[test]
+    fn test_nan_in_windows() {
+        let pruner = PatientPruner::new(None, 1, 0.0, StudyDirection::Minimize);
+        // before 窗口全 NaN
+        let trial = make_trial(vec![
+            (0, f64::NAN),
+            (1, 1.0),
+            (2, 2.0),
+        ]);
+        assert!(!pruner.prune(&[], &trial, None).unwrap());
+    }
+
+    /// 对齐 Python: min_delta + Maximize 方向
+    #[test]
+    fn test_min_delta_maximize() {
+        let pruner = PatientPruner::new(None, 2, 0.5, StudyDirection::Maximize);
+        // before = [0, 1] → max = 10.0
+        // after  = [2, 3, 4] → max = 9.8
+        // 10.0 - 0.5 > 9.8 → 9.5 > 9.8 → false → 不剪枝
+        let trial = make_trial(vec![(0, 8.0), (1, 10.0), (2, 9.5), (3, 9.8), (4, 9.2)]);
+        assert!(!pruner.prune(&[], &trial, None).unwrap());
+    }
+
+    /// 对齐 Python: 不连续步骤
+    #[test]
+    fn test_non_contiguous_steps() {
+        let pruner = PatientPruner::new(None, 2, 0.0, StudyDirection::Minimize);
+        // steps = [0, 5, 10, 15, 20]，patience=2
+        // before = [0, 5] → min = 1.0
+        // after  = [10, 15, 20] → min = 2.0
+        // 1.0 < 2.0 → 剪枝
+        let trial = make_trial(vec![(0, 1.0), (5, 3.0), (10, 2.0), (15, 4.0), (20, 5.0)]);
+        assert!(pruner.prune(&[], &trial, None).unwrap());
+    }
 }

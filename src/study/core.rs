@@ -440,11 +440,8 @@ impl Study {
                 }
             }
             TrialState::Pruned | TrialState::Fail => {
-                if values.is_some() {
-                    return Err(OptunaError::ValueError(
-                        "Values were told. Values cannot be specified when state is Pruned or Fail.".into(),
-                    ));
-                }
+                // 对齐 Python: Pruned/Fail 时忽略 values（如果传了就丢弃）
+                // Python 会发出 UserWarning 但不报错
             }
             TrialState::Running | TrialState::Waiting => {
                 return Err(OptunaError::ValueError(format!(
@@ -1112,17 +1109,17 @@ impl Study {
         user_attrs: Option<HashMap<String, serde_json::Value>>,
         skip_if_exists: bool,
     ) -> Result<()> {
-        // skip_if_exists: 检查是否已有相同参数的 WAITING 试验
+        // skip_if_exists: 对齐 Python — 检查是否已有相同参数的试验（任意状态）
         if skip_if_exists {
-            let waiting = self.storage.get_all_trials(
+            let all_trials = self.storage.get_all_trials(
                 self.study_id,
-                Some(&[TrialState::Waiting]),
+                None,  // 所有状态
             )?;
-            for t in &waiting {
+            for t in &all_trials {
                 if let Some(fp) = t.system_attrs.get("fixed_params") {
                     if let Ok(existing) = serde_json::from_value::<HashMap<String, crate::distributions::ParamValue>>(fp.clone()) {
                         if existing == params {
-                            return Ok(()); // 已存在相同参数的入队试验
+                            return Ok(()); // 已存在相同参数的试验
                         }
                     }
                 }

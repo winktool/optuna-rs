@@ -365,15 +365,73 @@ mod tests {
     /// Python: np.percentile([1.0, 3.0], 25) = 1.5
     #[test]
     fn test_python_cross_percentile_edge() {
-        // 单个值
         assert!((nan_percentile(&[5.0], 50.0) - 5.0).abs() < 1e-12);
         assert!((nan_percentile(&[5.0], 0.0) - 5.0).abs() < 1e-12);
         assert!((nan_percentile(&[5.0], 100.0) - 5.0).abs() < 1e-12);
-        // 两个值的线性插值
         assert!((nan_percentile(&[1.0, 3.0], 50.0) - 2.0).abs() < 1e-12);
         assert!((nan_percentile(&[1.0, 3.0], 25.0) - 1.5).abs() < 1e-12);
-        // 不均匀间距
         let p50 = nan_percentile(&[1.0, 10.0, 100.0], 50.0);
         assert!((p50 - 10.0).abs() < 1e-12, "Python: p50=10.0, got {p50}");
+    }
+
+    /// 对齐 Python: 全 NaN 中间值 → 剪枝
+    #[test]
+    fn test_all_nan_intermediate_prunes() {
+        let pruner = PercentilePruner::new(50.0, 0, 0, 1, 1, StudyDirection::Minimize);
+        let completed = vec![
+            make_complete_trial(0, vec![(0, 1.0)]),
+        ];
+        let trial = make_running_trial(1, vec![(0, f64::NAN)]);
+        // 全 NaN → best = NaN → prune = true
+        assert!(pruner.prune(&completed, &trial, None).unwrap());
+    }
+
+    /// 对齐 Python: completed trial 在某步有 NaN 时的 percentile 忽略 NaN
+    #[test]
+    fn test_nan_in_completed_trials() {
+        let pruner = PercentilePruner::new(50.0, 0, 0, 1, 1, StudyDirection::Minimize);
+        let completed = vec![
+            make_complete_trial(0, vec![(0, 1.0)]),
+            make_complete_trial(1, vec![(0, f64::NAN)]),
+            make_complete_trial(2, vec![(0, 3.0)]),
+        ];
+        // NaN 被过滤后，有效值 = [1.0, 3.0]，p50 = 2.0
+        let good = make_running_trial(3, vec![(0, 1.5)]);
+        assert!(!pruner.prune(&completed, &good, None).unwrap());
+        let bad = make_running_trial(3, vec![(0, 5.0)]);
+        assert!(pruner.prune(&completed, &bad, None).unwrap());
+    }
+
+    /// 对齐 Python: 不同 percentile 值（25, 75）
+    #[test]
+    fn test_different_percentiles() {
+        let completed = vec![
+            make_complete_trial(0, vec![(0, 1.0)]),
+            make_complete_trial(1, vec![(0, 2.0)]),
+            make_complete_trial(2, vec![(0, 3.0)]),
+            make_complete_trial(3, vec![(0, 4.0)]),
+        ];
+        // p25 = 1.75, 值 2.5 > 1.75 → 剪枝（低容忍）
+        let p25 = PercentilePruner::new(25.0, 0, 0, 1, 1, StudyDirection::Minimize);
+        let trial = make_running_trial(4, vec![(0, 2.5)]);
+        assert!(p25.prune(&completed, &trial, None).unwrap());
+        // p75 = 3.25, 值 2.5 < 3.25 → 不剪枝（高容忍）
+        let p75 = PercentilePruner::new(75.0, 0, 0, 1, 1, StudyDirection::Minimize);
+        assert!(!p75.prune(&completed, &trial, None).unwrap());
+    }
+
+    /// 对齐 Python: 多步场景的 best intermediate
+    #[test]
+    fn test_multi_step_best_intermediate() {
+        let pruner = PercentilePruner::new(50.0, 0, 0, 1, 1, StudyDirection::Minimize);
+        let completed = vec![
+            make_complete_trial(0, vec![(0, 10.0), (1, 5.0), (2, 8.0)]),
+            make_complete_trial(1, vec![(0, 10.0), (1, 6.0), (2, 7.0)]),
+        ];
+        // Running trial: best over steps = min(100, 4, 50) = 4.0
+        // At step 2, p50 of [8.0, 7.0] = 7.5
+        // best(4.0) < p50(7.5) → 不剪枝
+        let trial = make_running_trial(2, vec![(0, 100.0), (1, 4.0), (2, 50.0)]);
+        assert!(!pruner.prune(&completed, &trial, None).unwrap());
     }
 }

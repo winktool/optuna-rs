@@ -467,7 +467,13 @@ impl Sampler for CmaEsSampler {
             return HashMap::new();
         }
 
-        self.search_space.lock().calculate(trials)
+        // 对齐 Python: 过滤掉 CategoricalDistribution 和 single-value 分布
+        // CMA-ES 只能采样连续参数
+        let space = self.search_space.lock().calculate(trials);
+        space
+            .into_iter()
+            .filter(|(_, d)| !matches!(d, Distribution::CategoricalDistribution { .. }) && !d.single())
+            .collect()
     }
 
     fn sample_relative(
@@ -481,7 +487,16 @@ impl Sampler for CmaEsSampler {
 
         let complete: Vec<&FrozenTrial> = trials
             .iter()
-            .filter(|t| t.state == TrialState::Complete && t.values.is_some())
+            .filter(|t| {
+                if t.state == TrialState::Complete && t.values.is_some() {
+                    true
+                } else if self.consider_pruned_trials && t.state == TrialState::Pruned {
+                    // 对齐 Python: pruned trial 使用最后一个中间值作为其 value
+                    !t.intermediate_values.is_empty()
+                } else {
+                    false
+                }
+            })
             .collect();
 
         if complete.len() < self.n_startup_trials {
@@ -658,12 +673,21 @@ impl Sampler for CmaEsSampler {
         state: TrialState,
         values: Option<&[f64]>,
     ) {
-        if state != TrialState::Complete {
+        // 对齐 Python: 支持 Complete + Pruned (当 consider_pruned_trials=true 时)
+        let effective_value = if state == TrialState::Complete {
+            match values {
+                Some(v) if !v.is_empty() => v[0],
+                _ => return,
+            }
+        } else if self.consider_pruned_trials && state == TrialState::Pruned {
+            // Pruned trial: 使用最后一个中间值作为目标值
+            if let Some(max_step) = trial.intermediate_values.keys().max() {
+                trial.intermediate_values[max_step]
+            } else {
+                return;
+            }
+        } else {
             return;
-        }
-        let values = match values {
-            Some(v) if !v.is_empty() => v,
-            _ => return,
         };
 
         let mut state_guard = self.state.lock();
@@ -696,9 +720,9 @@ impl Sampler for CmaEsSampler {
             if trial_params.len() == param_names.len() {
                 let encoded = transform.transform(&trial_params);
                 let value = if self.direction == StudyDirection::Maximize {
-                    -values[0]
+                    -effective_value
                 } else {
-                    values[0]
+                    effective_value
                 };
                 cma_state.tell(encoded, value);
             }
@@ -955,5 +979,69 @@ mod tests {
             best < 25.0,
             "CMA-ES should find a reasonable solution, got {best}"
         );
+    }
+
+    /// 对齐 Python: infer_relative_search_space 应过滤 Categorical 分布
+    #[test]
+    fn test_cmaes_filters_categorical() {
+        let sampler = CmaEsSampler::new(
+            StudyDirection::Minimize,
+            None, Some(0), None, None, Some(42), None,
+            false, false, false, false, None,
+        );
+        let now = chrono::Utc::now();
+        use crate::distributions::CategoricalDistribution;
+        use crate::distributions::FloatDistribution;
+        let mut dists = HashMap::new();
+        dists.insert("x".to_string(), Distribution::FloatDistribution(
+            FloatDistribution::new(0.0, 1.0, false, None).unwrap()));
+        dists.insert("cat".to_string(), Distribution::CategoricalDistribution(
+            CategoricalDistribution::new(vec![
+                crate::distributions::CategoricalChoice::Str("a".into()),
+                crate::distributions::CategoricalChoice::Str("b".into()),
+            ]).unwrap()));
+        let trial = FrozenTrial {
+            number: 0, state: TrialState::Complete, values: Some(vec![1.0]),
+            datetime_start: Some(now), datetime_complete: Some(now),
+            params: HashMap::new(), distributions: dists,
+            user_attrs: HashMap::new(), system_attrs: HashMap::new(),
+            intermediate_values: HashMap::new(), trial_id: 0,
+        };
+        let space = sampler.infer_relative_search_space(&[trial]);
+        assert!(space.contains_key("x"), "should contain float param");
+        assert!(!space.contains_key("cat"), "should not contain categorical param");
+    }
+
+    /// 对齐 Python: CmaEsSamplerBuilder 功能
+    #[test]
+    fn test_builder_pattern() {
+        let sampler = CmaEsSamplerBuilder::new(StudyDirection::Minimize)
+            .sigma0(0.3)
+            .n_startup_trials(5)
+            .popsize(10)
+            .consider_pruned_trials(true)
+            .use_separable_cma(true)
+            .with_margin(true)
+            .lr_adapt(true)
+            .seed(123)
+            .build();
+        assert_eq!(sampler.n_startup_trials, 5);
+        assert_eq!(sampler.popsize, Some(10));
+        assert!(sampler.consider_pruned_trials);
+        assert!(sampler.use_separable_cma);
+        assert!(sampler.with_margin);
+        assert!(sampler.lr_adapt);
+    }
+
+    /// 对齐 Python: default_popsize
+    #[test]
+    fn test_default_popsize() {
+        // Python: popsize = 4 + floor(3 * ln(n))
+        // n=2: 4 + floor(3*0.693) = 4 + 2 = 6 → max(6, 5) = 6
+        assert_eq!(CmaEsSampler::default_popsize(2), 6);
+        // n=1: 4 + floor(3*0) = 4 → max(4, 5) = 5
+        assert_eq!(CmaEsSampler::default_popsize(1), 5);
+        // n=10: 4 + floor(3*2.302) = 4 + 6 = 10
+        assert_eq!(CmaEsSampler::default_popsize(10), 10);
     }
 }

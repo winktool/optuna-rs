@@ -44,12 +44,22 @@ impl MaxTrialsCallback {
     ///
     /// # 参数
     /// * `n_trials` - 最大试验数
-    /// * `states` - 要计数的状态。默认为 `[Complete]`。`None` 表示计数所有状态。
+    /// * `states` - 要计数的状态。`None` 表示计数所有状态。
+    ///
+    /// 对齐 Python: `MaxTrialsCallback(n_trials, states=None)` → 计数所有状态
     pub fn new(n_trials: usize, states: Option<Vec<TrialState>>) -> Self {
+        // 对齐 Python: 保留 None 语义（所有状态），不自动填充默认值
+        // 用户需要显式传入 Some(vec![Complete]) 来只计数 Complete 状态
+        // Python 默认值 states=(TrialState.COMPLETE,) 在调用侧处理
         Self {
             n_trials,
-            states: states.or_else(|| Some(vec![TrialState::Complete])),
+            states,
         }
+    }
+
+    /// 便捷构造器：只计数 Complete 状态（对齐 Python 默认行为）。
+    pub fn with_default_states(n_trials: usize) -> Self {
+        Self::new(n_trials, Some(vec![TrialState::Complete]))
     }
 }
 
@@ -224,9 +234,16 @@ mod tests {
     use crate::study::StudyDirection;
 
     #[test]
-    fn test_max_trials_callback_default_states() {
-        // 默认只计 Complete 状态
+    fn test_max_trials_callback_none_means_all() {
+        // 对齐 Python: states=None → 计数所有状态
         let cb = MaxTrialsCallback::new(5, None);
+        assert!(cb.states.is_none(), "None 应保持为 None（所有状态）");
+    }
+
+    #[test]
+    fn test_max_trials_callback_with_default_states() {
+        // 便捷构造器：只计 Complete 状态（Python 默认行为）
+        let cb = MaxTrialsCallback::with_default_states(5);
         assert!(cb.states.as_ref().unwrap().contains(&TrialState::Complete));
     }
 

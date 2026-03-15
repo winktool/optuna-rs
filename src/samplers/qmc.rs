@@ -750,6 +750,34 @@ mod tests {
         assert_eq!(s.seed, 12345);
     }
 
+    #[test]
+    fn test_qmc_infer_relative_search_space_no_complete_trials() {
+        // 对齐 Python: 没有完成试验时，QMC 搜索空间为空。
+        let sampler = QmcSampler::new(None, None, Some(7), None, None, None);
+        let trial = FrozenTrial {
+            number: 0,
+            trial_id: 0,
+            state: TrialState::Running,
+            values: None,
+            params: HashMap::new(),
+            distributions: HashMap::new(),
+            user_attrs: HashMap::new(),
+            system_attrs: HashMap::new(),
+            intermediate_values: HashMap::new(),
+            datetime_start: None,
+            datetime_complete: None,
+        };
+        let ss = sampler.infer_relative_search_space(&[trial]);
+        assert!(ss.is_empty());
+    }
+
+    #[test]
+    fn test_qmc_sample_relative_empty_search_space_returns_empty() {
+        let sampler = QmcSampler::new(None, None, Some(11), None, None, None);
+        let out = sampler.sample_relative(&[], &HashMap::new()).unwrap();
+        assert!(out.is_empty());
+    }
+
     /// Sobol 采样产生的值应在参数范围内
     #[test]
     fn test_qmc_sample_relative_values_in_range() {
@@ -903,6 +931,56 @@ mod tests {
         let r2 = s2.sample_relative(&[trial.clone()], &ss).unwrap();
         // 不同种子的 scrambled 序列应不同
         assert_ne!(r1["x"], r2["x"], "不同种子的 scramble 序列应不同");
+    }
+
+    #[test]
+    fn test_qmc_independent_sampling_without_warning_flag() {
+        // 覆盖 warn_independent_sampling=false 分支，确保可正常独立采样。
+        use crate::distributions::FloatDistribution;
+
+        let sampler = QmcSampler::new(
+            Some(QmcType::Sobol),
+            Some(false),
+            Some(42),
+            None,
+            Some(false),
+            Some(false),
+        );
+
+        // 冻结搜索空间（使 sample_independent 进入警告判断分支）
+        let mut ss = HashMap::new();
+        ss.insert(
+            "x".to_string(),
+            Distribution::FloatDistribution(FloatDistribution {
+                low: 0.0,
+                high: 1.0,
+                log: false,
+                step: None,
+            }),
+        );
+        let trial_done = FrozenTrial {
+            number: 0,
+            trial_id: 0,
+            state: TrialState::Complete,
+            values: Some(vec![0.1]),
+            params: {
+                let mut p = HashMap::new();
+                p.insert("x".to_string(), crate::distributions::ParamValue::Float(0.1));
+                p
+            },
+            distributions: ss.clone(),
+            user_attrs: HashMap::new(),
+            system_attrs: HashMap::new(),
+            intermediate_values: HashMap::new(),
+            datetime_start: None,
+            datetime_complete: None,
+        };
+        let _ = sampler.infer_relative_search_space(&[trial_done.clone()]);
+
+        let v = sampler
+            .sample_independent(&[trial_done.clone()], &trial_done, "x", ss.get("x").unwrap())
+            .unwrap();
+        assert!((0.0..=1.0).contains(&v));
     }
 
     /// 完整优化测试: Sobol + log 参数 + int 参数

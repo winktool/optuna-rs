@@ -218,16 +218,18 @@ impl Trial {
         // Check if this param was already set (re-suggest returns same value)
         let existing = self.storage.get_trial(self.trial_id)?;
         if let Some(existing_dist) = existing.distributions.get(name) {
-            // 对齐 Python: 同名参数若分布不一致, 仅发出警告并沿用首次分布/取值。
+            // 兼容性检查：允许同类型不同 range（对齐 Python）
+            crate::distributions::check_distribution_compatibility(existing_dist, dist)?;
+
+            // 对齐 Python `_check_distribution`: 仅在兼容但不相等时发 RuntimeWarning。
             if existing_dist != dist {
                 crate::optuna_warn!(
-                    "Inconsistent parameter values for distribution with name \"{}\"! This might be a configuration mistake. Optuna allows to call the same distribution with the same name more than once in a trial. When the parameter values are inconsistent optuna only uses the values of the first call and ignores all following. Using these values: {:?}",
+                    "RuntimeWarning: Inconsistent parameter values for distribution with name \"{}\"! This might be a configuration mistake. Optuna allows to call the same distribution with the same name more than once in a trial. When the parameter values are inconsistent optuna only uses the values of the first call and ignores all following. Using these values: {:?}",
                     name,
                     existing_dist
                 );
             }
-            // 兼容性检查：允许同类型不同 range（对齐 Python）
-            crate::distributions::check_distribution_compatibility(existing_dist, dist)?;
+
             let val = existing.params.get(name).unwrap();
             return dist.to_internal_repr(val);
         }

@@ -1284,6 +1284,7 @@ impl Storage for JournalFileStorage {
 mod tests {
     use super::*;
     use std::fs;
+    use std::io::Write;
 
     fn temp_path() -> String {
         let id = uuid::Uuid::new_v4();
@@ -1438,6 +1439,61 @@ mod tests {
         match err {
             OptunaError::UpdateFinishedTrialError(_) => {}
             e => panic!("expected UpdateFinishedTrialError, got {e:?}"),
+        }
+        fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn test_journal_file_backend_read_logs_skips_invalid_lines() {
+        let path = temp_path();
+        {
+            let mut f = File::create(&path).unwrap();
+            writeln!(f, "{{\"op_code\":0,\"study_id\":null,\"trial_id\":null,\"data\":{{\"study_name\":\"x\",\"directions\":[1]}}}}")
+                .unwrap();
+            writeln!(f, "not-json-line").unwrap();
+            writeln!(f, "").unwrap();
+        }
+
+        let backend = JournalFileBackend::new(&path).unwrap();
+        let logs = backend.read_logs(0).unwrap();
+        assert_eq!(logs.len(), 1);
+        assert_eq!(logs[0].op_code, 0);
+        fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn test_journal_storage_ignores_unknown_op_code_on_replay() {
+        let path = temp_path();
+        {
+            let mut f = File::create(&path).unwrap();
+            writeln!(
+                f,
+                "{{\"op_code\":999,\"study_id\":null,\"trial_id\":null,\"data\":{{}}}}"
+            )
+            .unwrap();
+        }
+
+        // unknown op_code 应被忽略，初始化不应失败
+        let storage = JournalFileStorage::new(&path).unwrap();
+        let studies = storage.get_all_studies().unwrap();
+        assert!(studies.is_empty());
+        fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn test_journal_storage_set_trial_state_values_missing_trial_error() {
+        let path = temp_path();
+        let backend = JournalFileBackend::new(&path).unwrap();
+        let storage = JournalStorage::new(Box::new(backend)).unwrap();
+
+        let err = storage
+            .set_trial_state_values(123456, TrialState::Complete, Some(&[1.0]))
+            .unwrap_err();
+        match err {
+            OptunaError::ValueError(msg) => {
+                assert!(msg.contains("trial_id 123456 not found") || msg.contains("trial 123456 not found"));
+            }
+            e => panic!("expected ValueError, got {e:?}"),
         }
         fs::remove_file(&path).ok();
     }

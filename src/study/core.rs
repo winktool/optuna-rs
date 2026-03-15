@@ -1694,4 +1694,59 @@ mod tests {
         assert!(trial.params.contains_key("x"));
         assert!(trial.distributions.contains_key("x"));
     }
+
+    #[test]
+    fn test_tell_skip_if_finished_returns_existing_trial() {
+        let study = create_study(
+            None,
+            None,
+            None,
+            None,
+            Some(StudyDirection::Minimize),
+            None,
+            false,
+        )
+        .unwrap();
+
+        let mut trial = study.ask(None).unwrap();
+        let x = trial.suggest_float_default("x", 0.0, 1.0).unwrap();
+        let first = study
+            .tell(trial.trial_id(), TrialState::Complete, Some(&[x]))
+            .unwrap();
+
+        let second = study
+            .tell_with_options(trial.trial_id(), TrialState::Complete, Some(&[x]), true)
+            .unwrap();
+        assert_eq!(first.trial_id, second.trial_id);
+        assert_eq!(second.state, TrialState::Complete);
+    }
+
+    #[test]
+    fn test_ask_with_fixed_distributions_prefills_relative_param() {
+        let study = create_study(
+            None,
+            None,
+            None,
+            None,
+            Some(StudyDirection::Minimize),
+            None,
+            false,
+        )
+        .unwrap();
+
+        let mut fixed = HashMap::new();
+        fixed.insert(
+            "x".to_string(),
+            Distribution::FloatDistribution(
+                crate::distributions::FloatDistribution::new(0.0, 1.0, false, None).unwrap(),
+            ),
+        );
+
+        let mut trial = study.ask(Some(&fixed)).unwrap();
+        let rel = trial.relative_params_internal();
+        assert!(rel.contains_key("x"));
+
+        let x = trial.suggest_float_default("x", 0.0, 1.0).unwrap();
+        assert!((0.0..=1.0).contains(&x));
+    }
 }

@@ -209,6 +209,14 @@ impl Trial {
         // Check if this param was already set (re-suggest returns same value)
         let existing = self.storage.get_trial(self.trial_id)?;
         if let Some(existing_dist) = existing.distributions.get(name) {
+            // 对齐 Python: 同名参数若分布不一致, 仅发出警告并沿用首次分布/取值。
+            if existing_dist != dist {
+                crate::optuna_warn!(
+                    "Inconsistent parameter values for distribution with name \"{}\"! This might be a configuration mistake. Optuna allows to call the same distribution with the same name more than once in a trial. When the parameter values are inconsistent optuna only uses the values of the first call and ignores all following. Using these values: {:?}",
+                    name,
+                    existing_dist
+                );
+            }
             // 兼容性检查：允许同类型不同 range（对齐 Python）
             crate::distributions::check_distribution_compatibility(existing_dist, dist)?;
             let val = existing.params.get(name).unwrap();
@@ -245,7 +253,7 @@ impl Trial {
         }
         if step < 0 {
             return Err(OptunaError::ValueError(format!(
-                "step must be non-negative, got {step}"
+                "The `step` argument is {step} but cannot be negative."
             )));
         }
         // 检查是否已经 report 过该 step（对齐 Python：重复 report 忽略并警告）
@@ -328,10 +336,18 @@ impl Trial {
         let ft = self.storage.get_trial(self.trial_id)?;
         Ok(ft.datetime_start)
     }
+
+    /// 返回相对采样参数（内部表示）。
+    /// 对应 Python `Trial.relative_params` 的只读语义。
+    pub fn relative_params_internal(&self) -> HashMap<String, f64> {
+        self.relative_params.clone()
+    }
 }
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashMap;
+
     use crate::distributions::Distribution;
     use crate::study::{StudyDirection, create_study};
 
@@ -435,5 +451,83 @@ mod tests {
             }
             _ => panic!("d should use int distribution"),
         }
+    }
+
+    #[test]
+    fn test_report_same_step_ignored_and_keeps_first_value() {
+        let study = create_study(
+            None,
+            None,
+            None,
+            None,
+            Some(StudyDirection::Minimize),
+            None,
+            false,
+        )
+        .unwrap();
+
+        let trial = study.ask(None).unwrap();
+        trial.report(0.1, 0).unwrap();
+        trial.report(0.9, 0).unwrap();
+
+        let frozen = study
+            .tell(trial.trial_id(), crate::trial::TrialState::Pruned, None)
+            .unwrap();
+        assert_eq!(frozen.intermediate_values.len(), 1);
+        assert_eq!(frozen.intermediate_values.get(&0).copied(), Some(0.1));
+    }
+
+    #[test]
+    fn test_resuggest_same_param_with_different_range_keeps_first_value() {
+        let study = create_study(
+            None,
+            None,
+            None,
+            None,
+            Some(StudyDirection::Minimize),
+            None,
+            false,
+        )
+        .unwrap();
+
+        let mut trial = study.ask(None).unwrap();
+        let first = trial.suggest_float_default("x", 0.0, 1.0).unwrap();
+        let second = trial.suggest_float_default("x", -10.0, 10.0).unwrap();
+        assert_eq!(first, second);
+
+        let dists = trial.distributions().unwrap();
+        match dists.get("x").unwrap() {
+            Distribution::FloatDistribution(dist) => {
+                assert_eq!(dist.low, 0.0);
+                assert_eq!(dist.high, 1.0);
+            }
+            _ => panic!("x should use float distribution"),
+        }
+    }
+
+    #[test]
+    fn test_relative_params_accessor() {
+        let mut fixed = HashMap::new();
+        fixed.insert(
+            "x".to_string(),
+            Distribution::FloatDistribution(
+                crate::distributions::FloatDistribution::new(0.0, 1.0, false, None).unwrap(),
+            ),
+        );
+
+        let study = create_study(
+            None,
+            None,
+            None,
+            None,
+            Some(StudyDirection::Minimize),
+            None,
+            false,
+        )
+        .unwrap();
+
+        let trial = study.ask(Some(&fixed)).unwrap();
+        let rel = trial.relative_params_internal();
+        assert!(rel.contains_key("x"));
     }
 }

@@ -190,7 +190,7 @@ impl FixedTrial {
             .get(name)
             .ok_or_else(|| {
                 OptunaError::ValueError(format!(
-                    "fixed param '{name}' not found in the provided params"
+                    "The value of the parameter '{name}' is not found. Please set it at the construction of the FixedTrial object."
                 ))
             })?
             .clone();
@@ -199,8 +199,10 @@ impl FixedTrial {
         let internal = dist.to_internal_repr(&value)?;
         if !dist.contains(internal) {
             crate::optuna_warn!(
-                "Fixed param '{}' value is out of the distribution range.",
-                name
+                "The value {:?} of the parameter '{}' is out of the range of the distribution {:?}.",
+                value,
+                name,
+                dist
             );
         }
 

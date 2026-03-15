@@ -371,8 +371,10 @@ impl FrozenTrial {
         if let Ok(internal) = distribution.to_internal_repr(&value) {
             if !distribution.contains(internal) {
                 crate::optuna_warn!(
-                    "The value {} of the parameter '{}' is out of the range of the distribution {:?}.",
-                    internal, name, distribution
+                    "The value {:?} of the parameter '{}' is out of the range of the distribution {:?}.",
+                    value,
+                    name,
+                    distribution
                 );
             }
         }

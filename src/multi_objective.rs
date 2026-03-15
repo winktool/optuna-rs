@@ -1265,6 +1265,53 @@ mod tests {
         assert!(fronts[0].contains(&0) && fronts[0].contains(&2));
     }
 
+    #[test]
+    fn test_constrained_dominates_when_only_one_has_constraints() {
+        let dirs = vec![StudyDirection::Minimize];
+        let mut a = make_trial(0, vec![1.0]);
+        a.system_attrs
+            .insert(CONSTRAINTS_KEY.to_string(), serde_json::json!([-1.0]));
+        let b = make_trial(1, vec![0.5]);
+
+        assert!(constrained_dominates(&a, &b, &dirs));
+        assert!(!constrained_dominates(&b, &a, &dirs));
+    }
+
+    #[test]
+    fn test_constrained_dominates_state_gating() {
+        let dirs = vec![StudyDirection::Minimize];
+        let mut a = make_constrained_trial(0, vec![1.0], vec![-1.0]);
+        let b = make_constrained_trial(1, vec![2.0], vec![-1.0]);
+
+        // a 非完成态时不支配
+        a.state = TrialState::Running;
+        assert!(!constrained_dominates(&a, &b, &dirs));
+
+        // b 非完成态时 a 直接支配
+        let mut b2 = b.clone();
+        b2.state = TrialState::Running;
+        let a2 = make_constrained_trial(2, vec![3.0], vec![-1.0]);
+        assert!(constrained_dominates(&a2, &b2, &dirs));
+    }
+
+    #[test]
+    fn test_get_pareto_front_trials_filters_incomplete_and_none_values() {
+        let dirs = vec![StudyDirection::Minimize, StudyDirection::Minimize];
+        let t0 = make_trial(0, vec![1.0, 1.0]);
+        let mut t1 = make_trial(1, vec![2.0, 2.0]);
+        let mut t2 = make_trial(2, vec![0.5, 3.0]);
+
+        // 应被过滤掉: 非 COMPLETE
+        t1.state = TrialState::Running;
+        // 应被过滤掉: values=None
+        t2.values = None;
+
+        let trials = vec![t0.clone(), t1, t2];
+        let front = get_pareto_front_trials(&trials, &dirs);
+        assert_eq!(front.len(), 1);
+        assert_eq!(front[0].number, t0.number);
+    }
+
     // ── HSSP 测试 ──
 
     #[test]

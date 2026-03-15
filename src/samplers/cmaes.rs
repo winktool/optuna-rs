@@ -429,7 +429,8 @@ impl CmaEsSampler {
         Self {
             direction,
             sigma0,
-            n_startup_trials: n_startup_trials.unwrap_or(25),
+            // 对齐 Python: n_startup_trials 默认值为 1
+            n_startup_trials: n_startup_trials.unwrap_or(1),
             popsize,
             independent_sampler: independent_sampler
                 .unwrap_or_else(|| Arc::new(RandomSampler::new(seed))),
@@ -567,33 +568,10 @@ impl Sampler for CmaEsSampler {
                     vec![0.5; n_dims]
                 }
             } else {
-                // Use the best trial from current study
-                let best_idx = complete
-                    .iter()
-                    .enumerate()
-                    .min_by(|(_, a), (_, b)| {
-                        let va = a.values.as_ref().unwrap()[0];
-                        let vb = b.values.as_ref().unwrap()[0];
-                        let va = if self.direction == StudyDirection::Maximize { -va } else { va };
-                        let vb = if self.direction == StudyDirection::Maximize { -vb } else { vb };
-                        va.partial_cmp(&vb).unwrap_or(std::cmp::Ordering::Equal)
-                    })
-                    .map(|(i, _)| i)
-                    .unwrap_or(0);
-
-                let best_trial = complete[best_idx];
-                let mut best_params = IndexMap::new();
-                for name in &param_names {
-                    if let Some(pv) = best_trial.params.get(name) {
-                        best_params.insert(name.clone(), pv.clone());
-                    }
-                }
-
-                if best_params.len() == ordered_space.len() {
-                    transform.transform(&best_params)
-                } else {
-                    vec![0.5; n_dims]
-                }
+                // 对齐 Python: 使用搜索空间的中心作为初始均值
+                // Python: mean = lower_bounds + (upper_bounds - lower_bounds) / 2
+                // 在变换空间中，这等价于每个维度取 0.5
+                vec![0.5; n_dims]
             };
 
             let mut new_state = CmaState::new(mean, sigma, lambda, param_names.clone());

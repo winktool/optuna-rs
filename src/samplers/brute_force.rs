@@ -62,11 +62,17 @@ impl BruteForceSampler {
         }
     }
 
-    /// Get all parameter combinations that have been visited by completed trials.
+    /// Get all parameter combinations that have been visited.
+    /// 对齐 Python: 包含 Complete, Pruned, Running, Fail 四种状态
     fn get_visited_combinations(trials: &[FrozenTrial], param_names: &[String]) -> HashSet<Vec<i64>> {
         let mut visited = HashSet::new();
         for trial in trials {
-            if trial.state == TrialState::Complete || trial.state == TrialState::Running {
+            // 对齐 Python: states=(COMPLETE, PRUNED, RUNNING, FAIL)
+            if trial.state == TrialState::Complete
+                || trial.state == TrialState::Pruned
+                || trial.state == TrialState::Running
+                || trial.state == TrialState::Fail
+            {
                 let key: Vec<i64> = param_names
                     .iter()
                     .map(|name| {

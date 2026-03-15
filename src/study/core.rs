@@ -528,28 +528,39 @@ impl Study {
             final_values = None;
         }
 
-        // 5. after_trial 在 set_trial_state_values 之前执行（对齐 Python try/finally 顺序）
+        // 5. after_trial + set_trial_state_values 对齐 Python try/finally 语义：
+        //    Python: try { after_trial(...) } finally { set_trial_state_values(...) }
+        //    即使 after_trial 失败，也必须写入试验最终状态。
         let all_trials = self.storage.get_all_trials(self.study_id, None)?;
-        self.sampler.after_trial(
-            &all_trials,
-            &frozen,
-            state,
-            final_values.as_deref(),
-        );
 
-        // 5b. 对齐 Python _process_constraints_after_trial:
-        // 计算约束值并存储到 trial.system_attrs
+        // 对齐 Python _process_constraints_after_trial:
+        // 计算约束值并存储到 trial.system_attrs（在 after_trial 之前）
         if let Some(constraints) = self.sampler.compute_constraints(&frozen, state) {
-            self.storage.set_trial_system_attr(
+            let _ = self.storage.set_trial_system_attr(
                 trial_id,
                 crate::multi_objective::CONSTRAINTS_KEY,
                 serde_json::json!(constraints),
-            )?;
+            );
         }
 
-        // 6. set_trial_state_values 放在 finally 等价位置
+        // 对齐 Python try/finally: 无论 after_trial 是否出错，都写入最终状态
+        let after_trial_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            self.sampler.after_trial(
+                &all_trials,
+                &frozen,
+                state,
+                final_values.as_deref(),
+            );
+        }));
+
+        // finally: 始终写入试验最终状态（对齐 Python finally 块）
         self.storage
             .set_trial_state_values(trial_id, state, final_values.as_deref())?;
+
+        // 如果 after_trial 发生 panic，日志记录但不中断流程（对齐 Python 的 try/finally）
+        if let Err(e) = after_trial_result {
+            crate::optuna_warn!("after_trial panicked for trial {}: {:?}", trial_id, e);
+        }
 
         let result = self.storage.get_trial(trial_id)?;
         Ok(result)
@@ -1159,17 +1170,28 @@ impl Study {
         skip_if_exists: bool,
     ) -> Result<()> {
         // skip_if_exists: 对齐 Python — 检查是否已有相同参数的试验（任意状态）
+        // Python: trial_params = trial.system_attrs.get("fixed_params", trial.params)
+        // 即先查 system_attrs["fixed_params"]，没有则回退到 trial.params
         if skip_if_exists {
             let all_trials = self.storage.get_all_trials(
                 self.study_id,
                 None,  // 所有状态
             )?;
             for t in &all_trials {
-                if let Some(fp) = t.system_attrs.get("fixed_params") {
-                    if let Ok(existing) = serde_json::from_value::<HashMap<String, crate::distributions::ParamValue>>(fp.clone()) {
-                        if existing == params {
-                            return Ok(()); // 已存在相同参数的试验
-                        }
+                // 对齐 Python: 先查 fixed_params，再回退到 params
+                let trial_params: Option<HashMap<String, crate::distributions::ParamValue>> =
+                    t.system_attrs.get("fixed_params")
+                        .and_then(|fp| serde_json::from_value(fp.clone()).ok())
+                        .or_else(|| {
+                            if t.params.is_empty() {
+                                None
+                            } else {
+                                Some(t.params.clone())
+                            }
+                        });
+                if let Some(existing) = trial_params {
+                    if existing == params {
+                        return Ok(()); // 已存在相同参数的试验
                     }
                 }
             }

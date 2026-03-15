@@ -420,14 +420,15 @@ fn hypervolume_3d(points: &[Vec<f64>], reference: &[f64]) -> f64 {
     });
 
     // 3. 构造 N×N 矩阵 z_delta
-    //    z_delta[y_rank][x_rank] = ref_z - sorted[y_order[y_rank]][2]
-    //    只在对角线位置放置非零值，其余为 0
+    //    对齐 Python: z_delta[y_order, np.arange(n)] = ref[2] - sorted[y_order, 2]
+    //    即 z_delta[y_order[i]][i] = ref[2] - sorted[y_order[i]][2]
+    //    y_order[i] 是 y 排名第 i 的点在 x-sorted 数组中的索引 (x_rank)
+    //    所以 row = x_rank, col = y_rank_loop_idx, val = 该点的 z 差值
     let mut z_delta = vec![vec![0.0_f64; n]; n];
-    for (x_rank, &y_rank) in y_order.iter().enumerate() {
-        // x_rank 对应排序后的第 x_rank 个点
-        // y_rank 是该点在 y_order 中的排名
-        // 注意: Python 中 z_delta[y_order, np.arange(n)] 意味着 z_delta[y_order[i]][i]
-        z_delta[y_rank][x_rank] = reference[2] - sorted[x_rank][2];
+    for (i, &x_rank_of_point) in y_order.iter().enumerate() {
+        // i = y 维循环变量 (y-rank), x_rank_of_point = y_order[i] = 该点的 x 排名
+        // 位置: (x_rank_of_point, i), 值: 该点自身的 z 差值
+        z_delta[x_rank_of_point][i] = reference[2] - sorted[x_rank_of_point][2];
     }
 
     // 4a. 累积最大值: 沿行（axis=0，即从上到下）
@@ -461,15 +462,16 @@ fn hypervolume_3d(points: &[Vec<f64>], reference: &[f64]) -> f64 {
     }
     y_delta[n - 1] = reference[1] - sorted[y_order[n - 1]][1];
 
-    // 6. 矩阵-向量-向量乘积: volume = x_delta^T @ z_delta^T @ y_delta
-    //    等价于 sum_j( x_delta[j] * sum_i( z_delta[i][j] * y_delta[i] ) )
+    // 6. 矩阵-向量-向量乘积: volume = np.dot(np.dot(z_delta, y_delta), x_delta)
+    //    对齐 Python: result[j] = sum_i(z_delta[j][i] * y_delta[i])
+    //                 volume = sum_j(result[j] * x_delta[j])
     let mut volume = 0.0;
     for j in 0..n {
-        let mut col_sum = 0.0;
+        let mut row_sum = 0.0;
         for i in 0..n {
-            col_sum += z_delta[i][j] * y_delta[i];
+            row_sum += z_delta[j][i] * y_delta[i];
         }
-        volume += col_sum * x_delta[j];
+        volume += row_sum * x_delta[j];
     }
 
     volume
@@ -1461,6 +1463,42 @@ mod tests {
         let ref_point = vec![3.0, 3.0, 3.0];
         let hv = hypervolume(&pts, &ref_point);
         assert!((hv - 8.0).abs() < 1e-12, "Python: hv=8.0, got={hv}");
+    }
+
+    /// Python 交叉验证: 3D 超体积 — 4 个非支配点
+    #[test]
+    fn test_python_cross_hypervolume_3d_four_points() {
+        let pts = vec![
+            vec![1.0, 4.0, 3.0],
+            vec![2.0, 2.0, 2.0],
+            vec![3.0, 1.0, 4.0],
+            vec![4.0, 3.0, 1.0],
+        ];
+        let ref_point = vec![5.0, 5.0, 5.0];
+        let hv = hypervolume(&pts, &ref_point);
+        assert!((hv - 33.0).abs() < 1e-10, "Python: hv=33.0, got={hv}");
+    }
+
+    /// Python 交叉验证: 3D 超体积 — 含被支配的点
+    #[test]
+    fn test_python_cross_hypervolume_3d_with_dominated() {
+        let pts = vec![
+            vec![1.0, 1.0, 1.0],
+            vec![2.0, 2.0, 2.0],
+            vec![3.0, 3.0, 0.5],
+        ];
+        let ref_point = vec![4.0, 4.0, 4.0];
+        let hv = hypervolume(&pts, &ref_point);
+        assert!((hv - 27.5).abs() < 1e-10, "Python: hv=27.5, got={hv}");
+    }
+
+    /// Python 交叉验证: 3D 超体积 — 单点
+    #[test]
+    fn test_python_cross_hypervolume_3d_single() {
+        let pts = vec![vec![2.0, 3.0, 1.0]];
+        let ref_point = vec![5.0, 5.0, 5.0];
+        let hv = hypervolume(&pts, &ref_point);
+        assert!((hv - 24.0).abs() < 1e-10, "Python: hv=24.0, got={hv}");
     }
 
     /// Python 交叉验证: 单点 2D 超体积

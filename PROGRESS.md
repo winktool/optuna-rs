@@ -2,9 +2,9 @@
 
 ## 总览
 
-- **Rust 测试基线**: 647 default / 723 all-features
-- **Python 交叉验证**: 103 tests (全部通过)
-- **最新提交**: Session 29 on gitlab/main
+- **Rust 测试基线**: 647 default / 730 all-features
+- **Python 交叉验证**: 110 tests (全部通过)
+- **最新提交**: Session 30 on gitlab/main
 
 ## 功能对齐状态 (对比 Python optuna)
 
@@ -76,6 +76,25 @@
 - 深度审计: distributions, trial, samplers/tpe, callbacks, importance, terminators
 - 新增 18 个 Rust 内联测试 (629→647)
 - 新增 13 个 Python 交叉验证测试 (90→103)
+
+### Session 30
+**全仓深度审计**: study/core.rs, distributions, TPE, trial, pruners, storage, importance, terminators, callbacks, search_space, multi_objective
+- [CRITICAL] hypervolume_3d z_delta 索引 BUG: z_delta 矩阵写入了错误点的 z 值 + 矩阵乘法使用了转置 → 修复为对齐 Python 的 fancy indexing + 正确的 np.dot 顺序
+- [CRITICAL] NSGA-II elite selection: "取最后 N 个试验" → 正确的非支配排序 + 拥挤距离截断
+- [CRITICAL] NSGA-III elite selection: "取最后 N 个试验" → 正确的非支配排序 + 参考点 niche 保留
+- [HIGH] study/core.rs after_trial finally 语义: after_trial 异常不保证 set_trial_state_values → catch_unwind + 保证写入
+- [HIGH] CMA-ES n_startup_trials 默认值 25 → 1 (对齐 Python)
+- [HIGH] CMA-ES 均值初始化: 使用最佳试验 → 搜索空间中心 (对齐 Python)
+- [HIGH] storage set_trial_param 分布兼容性: 精确相等 → Python 兼容性检查 (同类型不同 range 允许, 不同 log 报错)
+- [HIGH] FloatDistribution contains: 移除 ±1e-10 容差，使用严格 low <= value <= high (对齐 Python)
+- [HIGH] FloatDistribution adjust_discrete_uniform_high: f64 直接计算 → 字符串精度整数域计算 (对齐 Python Decimal)
+- [HIGH] EMMR margin: 移除错误的 +0.1 常数 (Python 不加此 margin)
+- [MEDIUM] BruteForce visited check: 未包含 PRUNED/FAIL 状态 → 添加 (对齐 Python)
+- [MEDIUM] Grid unvisited check: 未排除 RUNNING 试验 → 添加 Running 排除 + 回退逻辑
+- [MEDIUM] enqueue_trial skip_if_exists: 仅检查 fixed_params → 回退到 trial.params (对齐 Python)
+- [MEDIUM] TPE group 模式键未排序 → 添加 sorted_keys (对齐 Python sorted(sub_space.items()))
+- 新增 7 个 Rust 内联测试 (723→730)
+- 新增 7 个 Python 交叉验证测试 (103→110)
 
 ## 测试覆盖
 

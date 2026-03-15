@@ -1357,6 +1357,109 @@ def test_tpe_intersection_search_space_includes_pruned():
     assert "x" in search_space, f"x 应在搜索空间中"
     assert "z" in search_space, f"z 应在搜索空间中"
 
+
+# ═══════════════════════════════════════════════════════════════════════════
+#  分布兼容性检查交叉验证
+# ═══════════════════════════════════════════════════════════════════════════
+
+def test_distribution_compatibility_same_kind_different_range():
+    """对齐 Python check_distribution_compatibility: 同类型不同 range 应允许。"""
+    from optuna.distributions import check_distribution_compatibility, FloatDistribution
+    d1 = FloatDistribution(0.0, 1.0)
+    d2 = FloatDistribution(0.0, 2.0)
+    # 不应报错
+    check_distribution_compatibility(d1, d2)
+
+def test_distribution_compatibility_different_log():
+    """对齐 Python: 同类型不同 log 应报错。"""
+    from optuna.distributions import check_distribution_compatibility, FloatDistribution
+    d1 = FloatDistribution(0.1, 1.0)
+    d2 = FloatDistribution(0.1, 1.0, log=True)
+    try:
+        check_distribution_compatibility(d1, d2)
+        assert False, "应报错"
+    except ValueError:
+        pass
+
+def test_distribution_compatibility_different_kind():
+    """对齐 Python: 不同类型应报错。"""
+    from optuna.distributions import check_distribution_compatibility, FloatDistribution, IntDistribution
+    d1 = FloatDistribution(0.0, 1.0)
+    d2 = IntDistribution(0, 10)
+    try:
+        check_distribution_compatibility(d1, d2)
+        assert False, "应报错"
+    except ValueError:
+        pass
+
+def test_distribution_compatibility_categorical_dynamic():
+    """对齐 Python: Categorical 不同选项应报错。"""
+    from optuna.distributions import check_distribution_compatibility, CategoricalDistribution
+    d1 = CategoricalDistribution(["a", "b"])
+    d2 = CategoricalDistribution(["a", "c"])
+    try:
+        check_distribution_compatibility(d1, d2)
+        assert False, "应报错"
+    except ValueError as e:
+        assert "dynamic value space" in str(e)
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+#  FloatDistribution contains 精确边界交叉验证
+# ═══════════════════════════════════════════════════════════════════════════
+
+def test_float_contains_strict_boundary():
+    """严格 low <= value <= high 无容差。"""
+    d = optuna.distributions.FloatDistribution(0.0, 1.0)
+    assert d._contains(0.0) == True
+    assert d._contains(1.0) == True
+    assert d._contains(0.5) == True
+    # 超出边界
+    assert d._contains(1.0 + 1e-11) == False
+    assert d._contains(-1e-11) == False
+
+def test_float_contains_step_adjusted():
+    """step=0.3 时 high 调整为 0.9, contains(0.9) 应为 True。"""
+    d = optuna.distributions.FloatDistribution(0.0, 1.0, step=0.3)
+    assert d.high == 0.9
+    assert d._contains(0.9) == True
+    assert d._contains(1.0) == False
+    assert d._contains(0.6) == True
+    assert d._contains(0.3) == True
+    assert d._contains(0.0) == True
+    assert d._contains(0.4) == False
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+#  3D 超体积交叉验证
+# ═══════════════════════════════════════════════════════════════════════════
+
+def test_hypervolume_3d_cross_validation():
+    """对齐 Python _compute_3d: 3D 超体积计算。"""
+    import numpy as np
+    from optuna._hypervolume.wfg import _compute_3d
+
+    # 4 个非支配点
+    pts = np.array([[1.0, 4.0, 3.0], [2.0, 2.0, 2.0], [3.0, 1.0, 4.0], [4.0, 3.0, 1.0]])
+    ref = np.array([5.0, 5.0, 5.0])
+    pts_sorted = pts[np.argsort(pts[:, 0])]
+    hv = _compute_3d(pts_sorted, ref)
+    assert abs(hv - 33.0) < 1e-10, f"Expected 33.0, got {hv}"
+
+    # 含被支配点
+    pts2 = np.array([[1.0, 1.0, 1.0], [2.0, 2.0, 2.0], [3.0, 3.0, 0.5]])
+    ref2 = np.array([4.0, 4.0, 4.0])
+    pts2_sorted = pts2[np.argsort(pts2[:, 0])]
+    hv2 = _compute_3d(pts2_sorted, ref2)
+    assert abs(hv2 - 27.5) < 1e-10, f"Expected 27.5, got {hv2}"
+
+    # 两个不对角的点
+    pts3 = np.array([[1.0, 3.0, 2.0], [2.0, 1.0, 3.0]])
+    ref3 = np.array([4.0, 4.0, 4.0])
+    pts3_sorted = pts3[np.argsort(pts3[:, 0])]
+    hv3 = _compute_3d(pts3_sorted, ref3)
+    assert abs(hv3 - 10.0) < 1e-10, f"Expected 10.0, got {hv3}"
+
 # ═══════════════════════════════════════════════════════════════════════════
 #  执行
 # ═══════════════════════════════════════════════════════════════════════════

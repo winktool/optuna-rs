@@ -500,12 +500,18 @@ impl Sampler for TpeSampler {
 
         if self.group {
             // Group mode: sample each sub-space independently
+            // 对齐 Python: sorted(sub_space.items()) 确保键排序
             let gs = self.group_search_space.lock();
             let mut params = HashMap::new();
             for sub_space in gs.search_spaces() {
                 let mut filtered: IndexMap<String, Distribution> = IndexMap::new();
-                for (name, dist) in sub_space.iter() {
-                    if search_space.contains_key(name) {
+                let mut sorted_keys: Vec<&String> = sub_space
+                    .keys()
+                    .filter(|name| search_space.contains_key(*name))
+                    .collect();
+                sorted_keys.sort();
+                for name in sorted_keys {
+                    if let Some(dist) = sub_space.get(name) {
                         filtered.insert(name.clone(), dist.clone());
                     }
                 }

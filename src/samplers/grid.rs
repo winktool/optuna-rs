@@ -151,9 +151,28 @@ impl GridSampler {
     }
 
     /// Get unvisited grid indices.
+    /// 对齐 Python: 排除已完成(finished)和正在运行(running)的grid_id
+    /// 如果全部被占用，回退到仅排除已完成的（允许 running 试验的 grid_id 被重新分配）
     fn get_unvisited_grid_ids(&self, trials: &[FrozenTrial]) -> Vec<usize> {
-        let visited: std::collections::HashSet<usize> =
-            self.get_visited_grid_ids(trials).into_iter().collect();
+        let mut visited = std::collections::HashSet::new();
+        let mut running = std::collections::HashSet::new();
+        for trial in trials {
+            if let Some(gid) = Self::get_grid_id(trial) {
+                if trial.state.is_finished() {
+                    visited.insert(gid);
+                } else if trial.state == TrialState::Running {
+                    running.insert(gid);
+                }
+            }
+        }
+        // 优先排除 visited + running
+        let unvisited: Vec<usize> = (0..self.all_grids.len())
+            .filter(|i| !visited.contains(i) && !running.contains(i))
+            .collect();
+        if !unvisited.is_empty() {
+            return unvisited;
+        }
+        // 回退: 仅排除已完成的（允许重试正在运行的 grid_id）
         (0..self.all_grids.len())
             .filter(|i| !visited.contains(i))
             .collect()

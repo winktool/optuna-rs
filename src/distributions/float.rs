@@ -59,12 +59,14 @@ impl FloatDistribution {
     }
 
     /// Check if `value` (in internal representation) is contained in this distribution.
+    /// 对齐 Python: 严格 low <= value <= high（无容差）
     pub fn contains(&self, value: f64) -> bool {
-        if value < self.low - 1e-10 || value > self.high + 1e-10 {
+        if value < self.low || value > self.high {
             return false;
         }
         if let Some(step) = self.step {
-            // 对齐 Python `_contains`: k = (value - low) / step; abs(k - round(k)) < 1e-8
+            // 对齐 Python `_contains`: (value - low) % step == 0
+            // 使用浮点容差: k = (value - low) / step; abs(k - round(k)) < 1e-8
             let k = (value - self.low) / step;
             (k - k.round()).abs() < 1.0e-8
         } else {
@@ -110,28 +112,53 @@ impl FloatDistribution {
 
 /// 对应 Python `_adjust_discrete_uniform_high(low, high, step)`。
 /// 当 (high - low) 不能被 step 整除时，向下调整 high 到最近的 step 网格点。
-/// 使用 f64 算术（无 Decimal），在常规数值范围内足够精确。
+/// 对齐 Python: 使用与 Decimal(str(...)) 等价的精确计算方式。
 fn adjust_discrete_uniform_high(low: f64, high: f64, step: f64) -> f64 {
+    // 模拟 Python Decimal(str(x)) 算术:
+    // n = floor((high - low) / step), adjusted = low + n * step
+    // 由于 f64 直接运算会有精度问题 (如 3.0*0.3 = 0.8999...),
+    // 先计算 n，然后用 round-trip 通过字符串精确表示
     let r = high - low;
-    let remainder = r % step;
-    // 浮点取模可能有微小误差，用 epsilon 判断
-    if remainder.abs() > 1e-12 && (step - remainder.abs()).abs() > 1e-12 {
-        let n = (r / step).floor();
-        let adjusted = n * step + low;
-        // 对应 Python: optuna_warn(...)
-        optuna_warn!(
-            "The distribution is specified by [{}, {}] and step={}, but the range is \
-             not divisible by `step`. It will be replaced with [{}, {}].",
-            low,
-            high,
-            step,
-            low,
-            adjusted
-        );
-        adjusted
-    } else {
-        high
+    let n = (r / step).floor();
+    let n_steps = n as i64;
+    let remainder_check = r - n * step;
+
+    // 检查 remainder 是否为零（含浮点容差）
+    if remainder_check.abs() < 1e-12 || (step - remainder_check.abs()).abs() < 1e-12 {
+        return high;
     }
+
+    // 使用与 Python Decimal(str(x)) 等价的方法：
+    // 通过格式化为字符串并重新解析来获得精确结果
+    // Python: float(Decimal(str(n)) * Decimal(str(step)) + Decimal(str(low)))
+    // 在 Rust 中用有限精度的 f64 近似:
+    // 由于 n 是整数, step 和 low 是用户提供的 "简单" 浮点数,
+    // 使用 format!("{}", x) (Display trait) 模拟 str(x) 的行为
+    let step_str = format!("{}", step);
+    let low_str = format!("{}", low);
+
+    // 解析小数位数以确定精度
+    let step_decimals = step_str.find('.').map_or(0, |p| step_str.len() - p - 1);
+    let low_decimals = low_str.find('.').map_or(0, |p| low_str.len() - p - 1);
+    let max_decimals = step_decimals.max(low_decimals);
+
+    // 缩放到整数域进行精确计算
+    let scale = 10_f64.powi(max_decimals as i32);
+    let step_scaled = (step * scale).round() as i64;
+    let low_scaled = (low * scale).round() as i64;
+    let adjusted_scaled = n_steps * step_scaled + low_scaled;
+    let adjusted = adjusted_scaled as f64 / scale;
+
+    optuna_warn!(
+        "The distribution is specified by [{}, {}] and step={}, but the range is \
+         not divisible by `step`. It will be replaced with [{}, {}].",
+        low,
+        high,
+        step,
+        low,
+        adjusted
+    );
+    adjusted
 }
 
 #[cfg(test)]

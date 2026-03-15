@@ -835,8 +835,8 @@ impl ImprovementEvaluator for EMMREvaluator {
         let kl_bound = rhs1 + rhs2 + rhs3;
         let term4 = kappa_t1 * (0.5 * kl_bound.max(0.0)).sqrt();
 
-        // EMMR = term1 + term2 + term3 + term4，加数值稳定边距
-        let emmr = delta_mu + term2 + term3 + term4 + EMMR_MARGIN;
+        // EMMR = term1 + term2 + term3 + term4（对齐 Python，不加额外 margin）
+        let emmr = delta_mu + term2 + term3 + term4;
 
         // 乘以 y_std 转换回原始尺度，限制上界
         (emmr * y_std).min(f64::MAX * 0.5)

@@ -336,13 +336,63 @@ impl Storage for InMemoryStorage {
         let trial = &study.trials[trial_number as usize];
         Self::check_updatable(trial)?;
 
-        // Validate distribution compatibility
-        if let Some(existing) = study.param_distribution.get(param_name)
-            && existing != distribution
-        {
-            return Err(OptunaError::ValueError(format!(
-                "cannot set different distribution for param '{param_name}'"
-            )));
+        // 对齐 Python check_distribution_compatibility:
+        // 同类型同 log 配置允许不同 range（仅警告），CategoricalDistribution 必须完全相同
+        if let Some(existing) = study.param_distribution.get(param_name) {
+            // 不同分布类型 → 报错
+            let same_kind = matches!(
+                (existing, distribution),
+                (
+                    Distribution::FloatDistribution(_),
+                    Distribution::FloatDistribution(_)
+                ) | (
+                    Distribution::IntDistribution(_),
+                    Distribution::IntDistribution(_)
+                ) | (
+                    Distribution::CategoricalDistribution(_),
+                    Distribution::CategoricalDistribution(_)
+                )
+            );
+            if !same_kind {
+                return Err(OptunaError::ValueError(format!(
+                    "Cannot set different distribution kind to the same parameter name '{param_name}'."
+                )));
+            }
+            // Float/Int: log 配置必须一致; Categorical 必须完全相同
+            match (existing, distribution) {
+                (
+                    Distribution::FloatDistribution(old),
+                    Distribution::FloatDistribution(new),
+                ) => {
+                    if old.log != new.log {
+                        return Err(OptunaError::ValueError(format!(
+                            "Cannot set different log configuration to the same parameter name '{param_name}'."
+                        )));
+                    }
+                }
+                (
+                    Distribution::IntDistribution(old),
+                    Distribution::IntDistribution(new),
+                ) => {
+                    if old.log != new.log {
+                        return Err(OptunaError::ValueError(format!(
+                            "Cannot set different log configuration to the same parameter name '{param_name}'."
+                        )));
+                    }
+                }
+                (
+                    Distribution::CategoricalDistribution(_),
+                    Distribution::CategoricalDistribution(_),
+                ) => {
+                    if existing != distribution {
+                        return Err(OptunaError::ValueError(
+                            "CategoricalDistribution does not support dynamic value space."
+                                .to_string(),
+                        ));
+                    }
+                }
+                _ => {}
+            }
         }
 
         let external_value = distribution.to_external_repr(param_value_internal)?;
@@ -965,5 +1015,91 @@ mod tests {
         storage.set_trial_user_attr(tid, "key", serde_json::json!("val")).unwrap();
         let trial = storage.get_trial(tid).unwrap();
         assert_eq!(trial.user_attrs.get("key"), Some(&serde_json::json!("val")));
+    }
+
+    // ========================================================================
+    // 分布兼容性检查测试（对齐 Python check_distribution_compatibility）
+    // ========================================================================
+
+    /// 同类型 Float 不同 range 应允许（不报错）
+    #[test]
+    fn test_distribution_compat_float_different_range() {
+        let storage = InMemoryStorage::new();
+        let sid = storage.create_new_study(&[StudyDirection::Minimize], None).unwrap();
+        let tid = storage.create_new_trial(sid, None).unwrap();
+
+        let dist1 = Distribution::FloatDistribution(
+            crate::distributions::FloatDistribution::new(0.0, 1.0, false, None).unwrap(),
+        );
+        let dist2 = Distribution::FloatDistribution(
+            crate::distributions::FloatDistribution::new(0.0, 2.0, false, None).unwrap(),
+        );
+        storage.set_trial_param(tid, "x", 0.5, &dist1).unwrap();
+        // 同类型 Float 不同 range 仍应成功（对齐 Python）
+        assert!(storage.set_trial_param(tid, "x", 0.5, &dist2).is_ok());
+    }
+
+    /// 同类型 Float log 属性不同应报错
+    #[test]
+    fn test_distribution_compat_float_different_log() {
+        let storage = InMemoryStorage::new();
+        let sid = storage.create_new_study(&[StudyDirection::Minimize], None).unwrap();
+        let tid = storage.create_new_trial(sid, None).unwrap();
+
+        let dist1 = Distribution::FloatDistribution(
+            crate::distributions::FloatDistribution::new(0.1, 1.0, false, None).unwrap(),
+        );
+        let dist2 = Distribution::FloatDistribution(
+            crate::distributions::FloatDistribution::new(0.1, 1.0, true, None).unwrap(),
+        );
+        storage.set_trial_param(tid, "x", 0.5, &dist1).unwrap();
+        assert!(storage.set_trial_param(tid, "x", 0.5, &dist2).is_err());
+    }
+
+    /// 不同类型分布应报错 (Float vs Int)
+    #[test]
+    fn test_distribution_compat_different_kind() {
+        let storage = InMemoryStorage::new();
+        let sid = storage.create_new_study(&[StudyDirection::Minimize], None).unwrap();
+        let tid = storage.create_new_trial(sid, None).unwrap();
+
+        let dist_float = Distribution::FloatDistribution(
+            crate::distributions::FloatDistribution::new(0.0, 1.0, false, None).unwrap(),
+        );
+        let dist_int = Distribution::IntDistribution(
+            crate::distributions::IntDistribution::new(0, 10, false, 1).unwrap(),
+        );
+        storage.set_trial_param(tid, "x", 0.5, &dist_float).unwrap();
+        let result = storage.set_trial_param(tid, "x", 5.0, &dist_int);
+        assert!(result.is_err());
+        let err_msg = result.unwrap_err().to_string();
+        assert!(err_msg.contains("different distribution kind"));
+    }
+
+    /// Categorical 不同选项应报错
+    #[test]
+    fn test_distribution_compat_categorical_different_choices() {
+        let storage = InMemoryStorage::new();
+        let sid = storage.create_new_study(&[StudyDirection::Minimize], None).unwrap();
+        let tid = storage.create_new_trial(sid, None).unwrap();
+
+        use crate::distributions::{CategoricalChoice, CategoricalDistribution};
+        let dist1 = Distribution::CategoricalDistribution(
+            CategoricalDistribution::new(vec![
+                CategoricalChoice::Str("a".into()),
+                CategoricalChoice::Str("b".into()),
+            ]).unwrap(),
+        );
+        let dist2 = Distribution::CategoricalDistribution(
+            CategoricalDistribution::new(vec![
+                CategoricalChoice::Str("a".into()),
+                CategoricalChoice::Str("c".into()),
+            ]).unwrap(),
+        );
+        storage.set_trial_param(tid, "cat", 0.0, &dist1).unwrap();
+        let result = storage.set_trial_param(tid, "cat", 0.0, &dist2);
+        assert!(result.is_err());
+        let err_msg = result.unwrap_err().to_string();
+        assert!(err_msg.contains("dynamic value space"));
     }
 }

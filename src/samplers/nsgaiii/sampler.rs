@@ -301,13 +301,74 @@ impl Sampler for NSGAIIISampler {
             let all_trials: Vec<FrozenTrial> = complete.iter().map(|t| (*t).clone()).collect();
             strategy(&all_trials, &self.directions, self.population_size)
         } else {
-            // 默认: 取最后 population_size 个完成试验
-            let start = if complete.len() > self.population_size {
-                complete.len() - self.population_size
-            } else {
-                0
+            // 对齐 Python NSGA-III 默认精英选择:
+            // 非支配排序 → 按 rank 填充 → 最后一级使用参考点关联 + niche 保留
+            let population: Vec<FrozenTrial> = {
+                let start = if complete.len() > self.population_size {
+                    complete.len() - self.population_size
+                } else {
+                    0
+                };
+                complete[start..].iter().map(|t| (*t).clone()).collect()
             };
-            complete[start..].iter().map(|t| (*t).clone()).collect()
+
+            // 非支配排序
+            let pop_refs: Vec<&FrozenTrial> = population.iter().collect();
+            let ranks_by_rank = if self.constraints_func.is_some() {
+                constrained_fast_non_dominated_sort(&pop_refs, &self.directions)
+            } else {
+                fast_non_dominated_sort(&pop_refs, &self.directions)
+            };
+
+            let mut elite = Vec::new();
+            for rank_indices in &ranks_by_rank {
+                if elite.len() + rank_indices.len() <= self.population_size {
+                    for &idx in rank_indices {
+                        elite.push(population[idx].clone());
+                    }
+                } else {
+                    // NSGA-III 特有: 使用参考点关联 + niche 保留选择最后一级
+                    let remaining = self.population_size - elite.len();
+                    let rank_trials: Vec<&FrozenTrial> = rank_indices.iter()
+                        .map(|&i| &population[i])
+                        .collect();
+                    let normalized = Self::normalize_values(&rank_trials, &self.directions);
+                    // 关联每个个体到最近参考点
+                    let mut niche_counts = vec![0usize; self.reference_points.len()];
+                    // 先统计已经在精英池中的 niche 计数
+                    let elite_normalized = Self::normalize_values(
+                        &elite.iter().collect::<Vec<_>>(), &self.directions);
+                    for nv in &elite_normalized {
+                        let niche = self.associate_to_reference_point(nv);
+                        niche_counts[niche] += 1;
+                    }
+                    // 按 niche 保留选择
+                    let mut selected = Vec::new();
+                    let mut candidate_niches: Vec<(usize, usize)> = normalized.iter()
+                        .enumerate()
+                        .map(|(i, nv)| (i, self.associate_to_reference_point(nv)))
+                        .collect();
+                    while selected.len() < remaining && !candidate_niches.is_empty() {
+                        // 找计数最小的 niche
+                        let min_count = candidate_niches.iter()
+                            .map(|(_, n)| niche_counts[*n])
+                            .min()
+                            .unwrap_or(0);
+                        // 从最小 niche 中选一个
+                        let pos = candidate_niches.iter()
+                            .position(|(_, n)| niche_counts[*n] == min_count)
+                            .unwrap();
+                        let (local_idx, niche) = candidate_niches.remove(pos);
+                        selected.push(local_idx);
+                        niche_counts[niche] += 1;
+                    }
+                    for local_idx in selected {
+                        elite.push(population[rank_indices[local_idx]].clone());
+                    }
+                    break;
+                }
+            }
+            elite
         };
 
         if parent_trials.is_empty() {

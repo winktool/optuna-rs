@@ -172,19 +172,57 @@ impl Sampler for NSGAIISampler {
         }
 
         // ── 步骤1: 精英种群选择 ──
-        // 对应 Python `select_parent()` → `self._elite_population_selection_strategy(...)`
+        // 对应 Python `_elite_population_selection_strategy(...)`
         let parent_trials: Vec<FrozenTrial> = if let Some(ref strategy) = self.elite_population_selection_strategy {
             // 使用自定义精英选择策略
             let all_trials: Vec<FrozenTrial> = complete.iter().map(|t| (*t).clone()).collect();
             strategy(&all_trials, &self.directions, self.population_size)
         } else {
-            // 默认: 取最后 population_size 个完成试验，NSGA-II 非支配排序 + 拥挤距离
-            let start = if complete.len() > self.population_size {
-                complete.len() - self.population_size
-            } else {
-                0
+            // 对齐 Python 默认精英选择: NSGA-II 非支配排序 + 拥挤距离
+            // Python: population_per_rank = _rank_population(population, study.directions, ...)
+            //         按 rank 填充精英池，最后一级用拥挤距离截断
+            let population: Vec<FrozenTrial> = {
+                // 取最后 population_size 个完成的试验作为候选种群
+                let start = if complete.len() > self.population_size {
+                    complete.len() - self.population_size
+                } else {
+                    0
+                };
+                complete[start..].iter().map(|t| (*t).clone()).collect()
             };
-            complete[start..].iter().map(|t| (*t).clone()).collect()
+
+            // 非支配排序
+            let pop_refs: Vec<&FrozenTrial> = population.iter().collect();
+            let ranks_by_rank = if self.constraints_func.is_some() {
+                constrained_fast_non_dominated_sort(&pop_refs, &self.directions)
+            } else {
+                fast_non_dominated_sort(&pop_refs, &self.directions)
+            };
+
+            let mut elite = Vec::new();
+            for rank_indices in &ranks_by_rank {
+                if elite.len() + rank_indices.len() <= self.population_size {
+                    // 整级都放入精英池
+                    for &idx in rank_indices {
+                        elite.push(population[idx].clone());
+                    }
+                } else {
+                    // 最后一级: 按拥挤距离排序，取 remaining 个
+                    let remaining = self.population_size - elite.len();
+                    let rank_trials: Vec<&FrozenTrial> = rank_indices.iter()
+                        .map(|&i| &population[i])
+                        .collect();
+                    let cd = crowding_distance(&rank_trials, &self.directions);
+                    // 按拥挤距离降序排序
+                    let mut indexed: Vec<(usize, f64)> = cd.into_iter().enumerate().collect();
+                    indexed.sort_by(|(_, a), (_, b)| b.partial_cmp(a).unwrap_or(std::cmp::Ordering::Equal));
+                    for (local_idx, _) in indexed.into_iter().take(remaining) {
+                        elite.push(population[rank_indices[local_idx]].clone());
+                    }
+                    break;
+                }
+            }
+            elite
         };
 
         if parent_trials.is_empty() {

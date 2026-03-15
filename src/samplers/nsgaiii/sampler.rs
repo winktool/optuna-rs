@@ -126,19 +126,33 @@ impl NSGAIIISampler {
         let divs = dividing_parameter.unwrap_or(3);
         let ref_pts = reference_points.unwrap_or_else(|| generate_reference_points(n_obj, divs));
         let pop_size = population_size.unwrap_or_else(|| ref_pts.len().max(10));
+        // 对齐 Python: population_size >= 2
+        assert!(
+            pop_size >= 2,
+            "`population_size` must be greater than or equal to 2."
+        );
 
         let rng = match seed {
             Some(s) => ChaCha8Rng::seed_from_u64(s),
             None => ChaCha8Rng::from_entropy(),
         };
 
+        let crossover_box = crossover.unwrap_or_else(|| {
+            // 对应 Python: if crossover is None: crossover = UniformCrossover(swapping_prob)
+            Box::new(UniformCrossover::new(swapping_prob))
+        });
+        // 对齐 Python: population_size >= crossover.n_parents
+        assert!(
+            pop_size >= crossover_box.n_parents(),
+            "population_size ({}) must be >= crossover.n_parents ({})",
+            pop_size,
+            crossover_box.n_parents()
+        );
+
         Self {
             directions,
             population_size: pop_size,
-            crossover: crossover.unwrap_or_else(|| {
-                // 对应 Python: if crossover is None: crossover = UniformCrossover(swapping_prob)
-                Box::new(UniformCrossover::new(swapping_prob))
-            }),
+            crossover: crossover_box,
             crossover_prob: crossover_prob.unwrap_or(0.9),
             swapping_prob: swapping_prob.unwrap_or(0.5),
             mutation_prob,
@@ -461,14 +475,16 @@ impl Sampler for NSGAIIISampler {
             parents[0].clone()
         };
 
-        // Mutation
+        // Mutation: 对齐 Python — 被 mutate 的参数从返回结果中排除
         let mutation_prob = self
             .mutation_prob
             .unwrap_or_else(|| 1.0 / n_dims.max(1) as f64);
-        for v in &mut child {
+        let mut mutated = vec![false; n_dims];
+        for (i, m) in mutated.iter_mut().enumerate() {
             if rng.r#gen::<f64>() < mutation_prob {
-                *v = rng.r#gen::<f64>();
+                *m = true;
             }
+            let _ = i;
         }
 
         for v in &mut child {
@@ -480,7 +496,10 @@ impl Sampler for NSGAIIISampler {
         // Untransform
         let decoded = transform.untransform(&child)?;
         let mut result = HashMap::new();
-        for (name, dist) in &ordered_space {
+        for (i, (name, dist)) in ordered_space.iter().enumerate() {
+            if mutated[i] {
+                continue;
+            }
             if let Some(pv) = decoded.get(name) {
                 let internal = dist.to_internal_repr(pv)?;
                 result.insert(name.clone(), internal);

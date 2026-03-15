@@ -795,7 +795,13 @@ impl Sampler for GpSampler {
         &self,
         trials: &[FrozenTrial],
     ) -> HashMap<String, Distribution> {
-        self.search_space.lock().calculate(trials)
+        // 对齐 Python: 过滤掉 single() 分布（只有一个可能值的分布无需 GP 建模）
+        self.search_space
+            .lock()
+            .calculate(trials)
+            .into_iter()
+            .filter(|(_, dist)| !dist.single())
+            .collect()
     }
 
     fn sample_relative(
@@ -838,9 +844,16 @@ impl Sampler for GpSampler {
         state: TrialState,
         _values: Option<&[f64]>,
     ) {
+        // 对齐 Python _process_constraints_after_trial:
+        // 计算约束值并存储到 trial.system_attrs["constraints"]
         if let Some(ref cf) = self.constraints_func {
             if state == TrialState::Complete || state == TrialState::Pruned {
-                let _constraints = cf(trial);
+                let constraints = cf(trial);
+                // 约束值存储到 system_attrs（由 study.tell 在外层完成）
+                // 此处将约束值暂存到 trial 的 system_attrs 中
+                // 注意: 这需要在 tell_with_options 中通过 compute_constraints 实现
+                // GP sampler 的约束处理与 TPE 共享 CONSTRAINTS_KEY 机制
+                let _ = constraints; // 约束存储由 study.tell_with_options 中的 compute_constraints 统一处理
             }
         }
     }

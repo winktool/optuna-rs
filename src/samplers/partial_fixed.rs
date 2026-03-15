@@ -3,6 +3,7 @@ use std::sync::Arc;
 
 use crate::distributions::{Distribution, ParamValue};
 use crate::error::Result;
+use crate::optuna_warn;
 use crate::samplers::Sampler;
 use crate::trial::{FrozenTrial, TrialState};
 
@@ -84,12 +85,9 @@ impl Sampler for PartialFixedSampler {
         trials: &[FrozenTrial],
         search_space: &HashMap<String, Distribution>,
     ) -> Result<HashMap<String, f64>> {
-        let mut result = self.base_sampler.sample_relative(trials, search_space)?;
-        // Inject fixed params
-        for (name, &value) in &self.fixed_params {
-            result.insert(name.clone(), value);
-        }
-        Ok(result)
+        // 对齐 Python: sample_relative 中不注入固定参数
+        // 固定参数通过 sample_independent 路径返回
+        self.base_sampler.sample_relative(trials, search_space)
     }
 
     fn sample_independent(
@@ -100,6 +98,13 @@ impl Sampler for PartialFixedSampler {
         distribution: &Distribution,
     ) -> Result<f64> {
         if let Some(&value) = self.fixed_params.get(param_name) {
+            // 对齐 Python: 检查固定值是否在分布范围内，不在则发出警告
+            if !distribution.contains(value) {
+                optuna_warn!(
+                    "Fixed param '{}' value {} is not contained in distribution {:?}.",
+                    param_name, value, distribution
+                );
+            }
             return Ok(value);
         }
         self.base_sampler
@@ -319,16 +324,17 @@ mod tests {
         assert!(!space.contains_key("x"), "固定参数应被排除");
     }
 
-    /// 验证 sample_relative 注入固定值
+    /// 对齐 Python: sample_relative 不注入固定值，固定参数通过 sample_independent 返回
     #[test]
-    fn test_sample_relative_injects_fixed() {
+    fn test_sample_relative_does_not_inject_fixed() {
         let base: Arc<dyn Sampler> = Arc::new(RandomSampler::new(Some(42)));
         let mut fixed = HashMap::new();
         fixed.insert("x".to_string(), 0.5);
 
         let sampler = PartialFixedSampler::new(fixed, base);
         let result = sampler.sample_relative(&[], &HashMap::new()).unwrap();
-        assert!((result["x"] - 0.5).abs() < 1e-15, "固定参数应被注入");
+        // 固定参数不应在 sample_relative 结果中
+        assert!(!result.contains_key("x"), "固定参数不应被注入到 sample_relative");
     }
 
     /// 验证 Debug trait 实现
@@ -341,5 +347,64 @@ mod tests {
         let debug_str = format!("{:?}", sampler);
         assert!(debug_str.contains("PartialFixedSampler"));
         assert!(debug_str.contains("n_fixed"));
+    }
+
+    /// 对齐 Python: 固定值不在分布范围内应发出警告（不报错）
+    #[test]
+    fn test_fixed_value_out_of_range_warns_but_succeeds() {
+        let base: Arc<dyn Sampler> = Arc::new(RandomSampler::new(Some(42)));
+        let mut fixed = HashMap::new();
+        // 值 99.0 超出 [0, 1] 范围
+        fixed.insert("x".to_string(), 99.0);
+
+        let sampler = PartialFixedSampler::new(fixed, base);
+        let dist = Distribution::FloatDistribution(
+            crate::distributions::FloatDistribution::new(0.0, 1.0, false, None).unwrap(),
+        );
+        let trial = FrozenTrial {
+            number: 0,
+            state: TrialState::Running,
+            values: None,
+            datetime_start: Some(chrono::Utc::now()),
+            datetime_complete: None,
+            params: HashMap::new(),
+            distributions: HashMap::new(),
+            user_attrs: HashMap::new(),
+            system_attrs: HashMap::new(),
+            intermediate_values: HashMap::new(),
+            trial_id: 0,
+        };
+        // 应成功返回（Python 行为: 发出警告但返回固定值）
+        let result = sampler.sample_independent(&[], &trial, "x", &dist);
+        assert!(result.is_ok());
+        assert!((result.unwrap() - 99.0).abs() < 1e-15);
+    }
+
+    /// 对齐 Python: 固定值在范围内不产生任何问题
+    #[test]
+    fn test_fixed_value_in_range_no_warn() {
+        let base: Arc<dyn Sampler> = Arc::new(RandomSampler::new(Some(42)));
+        let mut fixed = HashMap::new();
+        fixed.insert("x".to_string(), 0.5);
+
+        let sampler = PartialFixedSampler::new(fixed, base);
+        let dist = Distribution::FloatDistribution(
+            crate::distributions::FloatDistribution::new(0.0, 1.0, false, None).unwrap(),
+        );
+        let trial = FrozenTrial {
+            number: 0,
+            state: TrialState::Running,
+            values: None,
+            datetime_start: Some(chrono::Utc::now()),
+            datetime_complete: None,
+            params: HashMap::new(),
+            distributions: HashMap::new(),
+            user_attrs: HashMap::new(),
+            system_attrs: HashMap::new(),
+            intermediate_values: HashMap::new(),
+            trial_id: 0,
+        };
+        let result = sampler.sample_independent(&[], &trial, "x", &dist).unwrap();
+        assert!((result - 0.5).abs() < 1e-15);
     }
 }

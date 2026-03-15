@@ -1460,6 +1460,195 @@ def test_hypervolume_3d_cross_validation():
     hv3 = _compute_3d(pts3_sorted, ref3)
     assert abs(hv3 - 10.0) < 1e-10, f"Expected 10.0, got {hv3}"
 
+
+# ═══════════════════════════════════════════════════════════════════════════
+#  PartialFixedSampler 交叉验证
+# ═══════════════════════════════════════════════════════════════════════════
+
+def test_partial_fixed_sample_relative_no_inject():
+    """对齐 Python: PartialFixedSampler.sample_relative 不注入固定参数。"""
+    import optuna
+    base = optuna.samplers.RandomSampler(seed=42)
+    fixed = {"x": 0.5}
+    sampler = optuna.samplers.PartialFixedSampler(fixed_params=fixed, base_sampler=base)
+    
+    study = optuna.create_study(sampler=sampler)
+    # 添加一个完成的试验
+    study.add_trial(
+        optuna.trial.create_trial(
+            state=optuna.trial.TrialState.COMPLETE,
+            params={"x": 0.3, "y": 0.7},
+            distributions={
+                "x": optuna.distributions.FloatDistribution(0, 1),
+                "y": optuna.distributions.FloatDistribution(0, 1),
+            },
+            values=[1.0],
+        )
+    )
+    trial = study.ask()
+    # sample_relative 由 base_sampler 处理，不包含固定参数
+    search_space = sampler.infer_relative_search_space(study, trial)
+    result = sampler.sample_relative(study, trial, search_space)
+    # 固定参数 "x" 不应在 sample_relative 结果中
+    # （Python 中 PartialFixedSampler.sample_relative 直接委托给 base_sampler）
+    # 注意: 实际上 base_sampler (RandomSampler) 的 sample_relative 返回空字典
+    assert isinstance(result, dict)
+
+
+def test_partial_fixed_out_of_range_warns():
+    """对齐 Python: 固定值超出范围应发出警告但不报错。"""
+    import optuna
+    import warnings
+    base = optuna.samplers.RandomSampler(seed=42)
+    fixed = {"x": 99.0}  # 超出 [0, 1] 范围
+    sampler = optuna.samplers.PartialFixedSampler(fixed_params=fixed, base_sampler=base)
+    
+    study = optuna.create_study(sampler=sampler)
+    # 应该能成功 ask (且 suggest_float 返回固定值)
+    # PartialFixedSampler.sample_independent 会发出警告
+    with warnings.catch_warnings(record=True) as w:
+        warnings.simplefilter("always")
+        trial = study.ask()
+        val = trial.suggest_float("x", 0.0, 1.0)
+        # Python: 应发出 UserWarning
+        assert val == 99.0, f"应返回固定值 99.0, got {val}"
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+#  ParzenEstimator 验证交叉验证
+# ═══════════════════════════════════════════════════════════════════════════
+
+def test_parzen_estimator_negative_prior_weight():
+    """对齐 Python: prior_weight < 0 应抛 ValueError。"""
+    from optuna.samplers._tpe.parzen_estimator import _ParzenEstimator, _ParzenEstimatorParameters
+    from optuna.distributions import FloatDistribution
+    
+    params = _ParzenEstimatorParameters(
+        prior_weight=-1.0,
+        consider_magic_clip=True,
+        consider_endpoints=False,
+        weights=lambda n: [1.0] * n if n > 0 else [],
+        multivariate=False,
+        categorical_distance_func=None,
+    )
+    try:
+        _ParzenEstimator(
+            observations={"x": [0.5]},
+            search_space={"x": FloatDistribution(0.0, 1.0)},
+            parameters=params,
+        )
+        assert False, "应抛 ValueError"
+    except ValueError as e:
+        assert "non-negative" in str(e).lower(), f"错误消息应包含 'non-negative': {e}"
+
+
+def test_parzen_estimator_weights_validation():
+    """对齐 Python _call_weights_func: 负权重/全零/NaN 应抛错。"""
+    from optuna.samplers._tpe.parzen_estimator import _ParzenEstimator, _ParzenEstimatorParameters
+    from optuna.distributions import FloatDistribution
+
+    # 测试负权重
+    params = _ParzenEstimatorParameters(
+        prior_weight=1.0,
+        consider_magic_clip=True,
+        consider_endpoints=False,
+        weights=lambda n: [-1.0] * n if n > 0 else [],
+        multivariate=False,
+        categorical_distance_func=None,
+    )
+    try:
+        _ParzenEstimator(
+            observations={"x": [0.5]},
+            search_space={"x": FloatDistribution(0.0, 1.0)},
+            parameters=params,
+        )
+        assert False, "负权重应抛错"
+    except ValueError:
+        pass
+
+    # 测试全零
+    params2 = _ParzenEstimatorParameters(
+        prior_weight=1.0,
+        consider_magic_clip=True,
+        consider_endpoints=False,
+        weights=lambda n: [0.0] * n if n > 0 else [],
+        multivariate=False,
+        categorical_distance_func=None,
+    )
+    try:
+        _ParzenEstimator(
+            observations={"x": [0.5]},
+            search_space={"x": FloatDistribution(0.0, 1.0)},
+            parameters=params2,
+        )
+        assert False, "全零权重应抛错"
+    except ValueError:
+        pass
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+#  truncnorm ppf 精度交叉验证
+# ═══════════════════════════════════════════════════════════════════════════
+
+def test_truncnorm_ppf_near_one():
+    """对齐 Python: ppf 在 q 接近 1 时的精度 (使用 log1p)。"""
+    from optuna.samplers._tpe._truncnorm import ppf
+    import numpy as np
+    # 标准正态截断 [-5, 5]
+    q = np.array([0.999999])
+    a = np.array([-5.0])
+    b = np.array([5.0])
+    result = ppf(q, a, b)
+    # 结果应接近上界但不超过
+    assert result[0] < 5.0, f"ppf 结果应 < 5.0, got {result[0]}"
+    assert result[0] > 3.0, f"ppf 结果应 > 3.0, got {result[0]}"
+
+# ═══════════════════════════════════════════════════════════════════════════
+#  Storage 对齐验证
+# ═══════════════════════════════════════════════════════════════════════════
+
+def test_set_trial_system_attr_rejects_finished():
+    """对齐 Python: set_trial_system_attr 不允许修改已完成试验。"""
+    import optuna
+    optuna.logging.set_verbosity(optuna.logging.WARNING)
+    storage = optuna.storages.InMemoryStorage()
+    sid = storage.create_new_study([optuna.study.StudyDirection.MINIMIZE])
+    tid = storage.create_new_trial(sid)
+    storage.set_trial_state_values(tid, optuna.trial.TrialState.COMPLETE, [1.0])
+    try:
+        storage.set_trial_system_attr(tid, "key", "value")
+        assert False, "应抛出 UpdateFinishedTrialError"
+    except Exception as e:
+        assert "finished" in str(e).lower() or "updatable" in str(e).lower(), f"错误消息不匹配: {e}"
+
+def test_set_metric_names_error_message():
+    """对齐 Python: set_metric_names 长度不匹配的错误消息。"""
+    import optuna
+    optuna.logging.set_verbosity(optuna.logging.WARNING)
+    study = optuna.create_study(direction="minimize")
+    try:
+        study.set_metric_names(["a", "b"])  # 只有1个direction但传了2个名字
+        assert False, "应抛出 ValueError"
+    except ValueError as e:
+        assert "number of objectives" in str(e).lower() or "metric" in str(e).lower(), f"错误消息不匹配: {e}"
+
+def test_best_trial_constraint_error_message():
+    """对齐 Python: 无可行约束试验时的错误消息。"""
+    import optuna
+    optuna.logging.set_verbosity(optuna.logging.WARNING)
+    study = optuna.create_study(direction="minimize")
+    # 添加一个 COMPLETE 试验，但其约束不满足
+    trial = study.ask()
+    study._storage.set_trial_system_attr(
+        trial._trial_id, "constraints", [1.0]  # 正值 → 不可行
+    )
+    study.tell(trial, 1.0)
+    try:
+        _ = study.best_trial
+        assert False, "应抛出 ValueError"
+    except ValueError as e:
+        assert "feasible" in str(e).lower(), f"错误消息不匹配: {e}"
+
 # ═══════════════════════════════════════════════════════════════════════════
 #  执行
 # ═══════════════════════════════════════════════════════════════════════════

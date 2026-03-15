@@ -153,7 +153,7 @@ impl Study {
 
         if feasible.is_empty() {
             return Err(OptunaError::ValueError(
-                "No feasible (constraint-satisfying) completed trials.".into(),
+                "No feasible trials are completed yet.".into(),
             ));
         }
 
@@ -281,11 +281,9 @@ impl Study {
     pub fn set_metric_names(&self, metric_names: &[&str]) -> Result<()> {
         let names: Vec<String> = metric_names.iter().map(|s| s.to_string()).collect();
         if names.len() != self.directions.len() {
-            return Err(OptunaError::ValueError(format!(
-                "metric_names 长度 ({}) 必须与 directions 长度 ({}) 一致",
-                names.len(),
-                self.directions.len()
-            )));
+            return Err(OptunaError::ValueError(
+                "The number of objectives must match the length of the metric names.".into(),
+            ));
         }
         self.storage.set_study_system_attr(
             self.study_id,
@@ -2205,5 +2203,58 @@ mod tests {
         // 应使用最后中间值 (step=1, value=0.3)
         assert!(frozen.values.is_some(), "PRUNED 应自动使用最后中间值");
         assert!((frozen.values.as_ref().unwrap()[0] - 0.3).abs() < 1e-12);
+    }
+
+    /// 对齐 Python: set_metric_names 长度不匹配错误消息
+    #[test]
+    fn test_set_metric_names_length_mismatch_error() {
+        let study = create_study(
+            None, None, None, None,
+            Some(StudyDirection::Minimize), None, false,
+        ).unwrap();
+        let result = study.set_metric_names(&["a", "b"]);
+        assert!(result.is_err());
+        let err_msg = result.unwrap_err().to_string();
+        assert!(err_msg.contains("number of objectives"), "错误消息应包含 'number of objectives', got: {}", err_msg);
+    }
+
+    /// 对齐 Python: 约束场景下无可行试验的错误消息
+    #[test]
+    fn test_best_trial_no_feasible_constraint_error() {
+        let study = create_study(
+            None, None, None, None,
+            Some(StudyDirection::Minimize), None, false,
+        ).unwrap();
+        // 添加一个 COMPLETE 试验，但约束不满足
+        let trial = study.ask(None).unwrap();
+        let tid = trial.trial_id();
+        // 在 tell 之前设置约束（trial 还在 RUNNING）
+        study.storage.set_trial_system_attr(
+            tid,
+            crate::multi_objective::CONSTRAINTS_KEY,
+            serde_json::json!([1.0]), // 正值 = 不可行
+        ).unwrap();
+        study.tell(tid, TrialState::Complete, Some(&[1.0])).unwrap();
+
+        let result = study.best_trial();
+        assert!(result.is_err());
+        let err_msg = result.unwrap_err().to_string();
+        assert!(err_msg.contains("feasible"), "错误消息应包含 'feasible', got: {}", err_msg);
+    }
+
+    /// 对齐 Python: set_trial_system_attr 拒绝已完成试验
+    #[test]
+    fn test_storage_system_attr_rejects_finished() {
+        let study = create_study(
+            None, None, None, None,
+            Some(StudyDirection::Minimize), None, false,
+        ).unwrap();
+        let trial = study.ask(None).unwrap();
+        let tid = trial.trial_id();
+        study.tell(tid, TrialState::Complete, Some(&[1.0])).unwrap();
+        let result = study.storage.set_trial_system_attr(tid, "key", serde_json::json!("val"));
+        assert!(result.is_err());
+        let err_msg = result.unwrap_err().to_string();
+        assert!(err_msg.contains("finished"), "错误消息应包含 'finished', got: {}", err_msg);
     }
 }

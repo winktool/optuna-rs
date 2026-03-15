@@ -84,17 +84,31 @@ impl NSGAIISampler {
         child_generation_strategy: Option<ChildGenerationStrategy>,
         after_trial_strategy: Option<AfterTrialStrategy>,
     ) -> Self {
+        let pop_size = population_size.unwrap_or(50);
+        // 对齐 Python: population_size >= 2
+        assert!(
+            pop_size >= 2,
+            "`population_size` must be greater than or equal to 2."
+        );
         let rng = match seed {
             Some(s) => ChaCha8Rng::seed_from_u64(s),
             None => ChaCha8Rng::from_entropy(),
         };
+        let crossover_box = crossover.unwrap_or_else(|| {
+            // 对应 Python: if crossover is None: crossover = UniformCrossover(swapping_prob)
+            Box::new(UniformCrossover::new(swapping_prob))
+        });
+        // 对齐 Python: population_size >= crossover.n_parents
+        assert!(
+            pop_size >= crossover_box.n_parents(),
+            "population_size ({}) must be >= crossover.n_parents ({})",
+            pop_size,
+            crossover_box.n_parents()
+        );
         Self {
             directions,
-            population_size: population_size.unwrap_or(50),
-            crossover: crossover.unwrap_or_else(|| {
-                // 对应 Python: if crossover is None: crossover = UniformCrossover(swapping_prob)
-                Box::new(UniformCrossover::new(swapping_prob))
-            }),
+            population_size: pop_size,
+            crossover: crossover_box,
             crossover_prob: crossover_prob.unwrap_or(0.9),
             swapping_prob: swapping_prob.unwrap_or(0.5),
             mutation_prob,
@@ -305,14 +319,17 @@ impl Sampler for NSGAIISampler {
             parents[0].clone()
         };
 
-        // Mutation: with mutation_prob, randomize each dimension
+        // Mutation: 对齐 Python — 被 mutate 的参数从返回结果中排除，
+        // 由 sample_independent 重新采样（保证分布约束）
         let mutation_prob = self
             .mutation_prob
             .unwrap_or_else(|| 1.0 / n_dims.max(1) as f64);
-        for v in &mut child {
+        let mut mutated = vec![false; n_dims];
+        for (i, m) in mutated.iter_mut().enumerate() {
             if rng.r#gen::<f64>() < mutation_prob {
-                *v = rng.r#gen::<f64>();
+                *m = true;
             }
+            let _ = i; // suppress unused warning
         }
 
         // Clamp to [0,1]
@@ -325,7 +342,11 @@ impl Sampler for NSGAIISampler {
         // Untransform back to parameter space
         let decoded = transform.untransform(&child)?;
         let mut result = HashMap::new();
-        for (name, dist) in &ordered_space {
+        for (i, (name, dist)) in ordered_space.iter().enumerate() {
+            // 对齐 Python: 被 mutate 的参数不加入结果, 由 sample_independent 处理
+            if mutated[i] {
+                continue;
+            }
             if let Some(pv) = decoded.get(name) {
                 let internal = dist.to_internal_repr(pv)?;
                 result.insert(name.clone(), internal);
@@ -610,5 +631,15 @@ mod tests {
         // Check that best_trials returns a Pareto front
         let best = study.best_trials().unwrap();
         assert!(!best.is_empty());
+    }
+
+    /// 对齐 Python: population_size < 2 应 panic
+    #[test]
+    #[should_panic(expected = "population_size")]
+    fn test_population_size_too_small() {
+        NSGAIISampler::new(
+            vec![StudyDirection::Minimize, StudyDirection::Minimize],
+            Some(1), None, None, None, None, None, None, None, None, None,
+        );
     }
 }

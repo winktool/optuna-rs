@@ -500,8 +500,11 @@ impl Storage for InMemoryStorage {
         let mut inner = self.inner.lock();
         let (study_id, trial_number) = Self::resolve_trial(&inner, trial_id)?;
 
-        // 对齐 Python: system_attrs 不检查 updatable，
-        // GA 采样器等需要在已完成试验上设置代际信息。
+        // 对齐 Python: check_trial_is_updatable
+        let study = Self::get_study(&inner, study_id)?;
+        let trial = &study.trials[trial_number as usize];
+        Self::check_updatable(trial)?;
+
         let study = Self::get_study_mut(&mut inner, study_id)?;
         let trial = &mut study.trials[trial_number as usize];
         trial.system_attrs.insert(key.to_string(), value);
@@ -1101,5 +1104,33 @@ mod tests {
         assert!(result.is_err());
         let err_msg = result.unwrap_err().to_string();
         assert!(err_msg.contains("dynamic value space"));
+    }
+
+    /// 对齐 Python: set_trial_system_attr 在已完成试验上应报错
+    #[test]
+    fn test_set_trial_system_attr_rejects_finished_trial() {
+        let storage = InMemoryStorage::new();
+        let sid = storage.create_new_study(&[StudyDirection::Minimize], None).unwrap();
+        let tid = storage.create_new_trial(sid, None).unwrap();
+        // WAITING → RUNNING → COMPLETE
+        storage.set_trial_state_values(tid, TrialState::Running, None).unwrap();
+        storage.set_trial_state_values(tid, TrialState::Complete, Some(&[1.0])).unwrap();
+        // 在已完成试验上 set_trial_system_attr 应报 UpdateFinishedTrialError
+        let result = storage.set_trial_system_attr(tid, "key", serde_json::json!("val"));
+        assert!(result.is_err());
+        let err_msg = result.unwrap_err().to_string();
+        assert!(err_msg.contains("already finished"));
+    }
+
+    /// 对齐 Python: set_trial_system_attr 在 RUNNING 试验上正常工作
+    #[test]
+    fn test_set_trial_system_attr_running_ok() {
+        let storage = InMemoryStorage::new();
+        let sid = storage.create_new_study(&[StudyDirection::Minimize], None).unwrap();
+        let tid = storage.create_new_trial(sid, None).unwrap();
+        storage.set_trial_state_values(tid, TrialState::Running, None).unwrap();
+        storage.set_trial_system_attr(tid, "test_key", serde_json::json!(42)).unwrap();
+        let trial = storage.get_trial(tid).unwrap();
+        assert_eq!(trial.system_attrs["test_key"], serde_json::json!(42));
     }
 }

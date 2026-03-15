@@ -153,7 +153,8 @@ pub fn ppf(q: f64, a: f64, b: f64) -> f64 {
         // Right case: work with upper tail for numerical stability.
         // Phi(-x) = Phi(-b) + (1-q) * (Phi(b) - Phi(a))
         let log_phi_neg_b = log_ndtr(-b);
-        let log_1mq_mass = (1.0 - q).ln() + lm;
+        // 对齐 Python: 使用 log1p(-q) 替代 (1-q).ln() 提高 q 接近 1 时的精度
+        let log_1mq_mass = (-q).ln_1p() + lm;
         let log_phi_neg_x = logaddexp(log_phi_neg_b, log_1mq_mass);
         -ndtri_exp(log_phi_neg_x)
     }

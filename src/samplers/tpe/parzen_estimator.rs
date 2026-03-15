@@ -97,6 +97,28 @@ enum ParamKernels {
 }
 
 impl ParzenEstimator {
+    /// 对齐 Python _call_weights_func: 验证权重向量有效性
+    fn validate_weights(weights: &[f64]) {
+        // 先检查 NaN/Inf（否则后续比较会因 NaN 语义产生误导性消息）
+        assert!(
+            weights.iter().all(|w| w.is_finite()),
+            "Weights must be finite. Got {:?}",
+            weights
+        );
+        // 检查负权重
+        assert!(
+            !weights.iter().any(|&w| w < 0.0),
+            "Weights must be non-negative. Got {:?}",
+            weights
+        );
+        // 检查全零
+        assert!(
+            weights.iter().any(|&w| w > 0.0),
+            "At least one weight must be positive. Got {:?}",
+            weights
+        );
+    }
+
     /// Build a Parzen estimator from observations and search space.
     ///
     /// `observations`: param_name → Vec<f64> of internal repr values.
@@ -112,6 +134,13 @@ impl ParzenEstimator {
         predetermined_weights: Option<&[f64]>,
         weights_func: Option<&dyn Fn(usize) -> Vec<f64>>,
     ) -> Self {
+        // 对齐 Python: prior_weight < 0 时 raise ValueError
+        assert!(
+            params.prior_weight >= 0.0,
+            "A non-negative value must be specified for `prior_weight`. Got {}.",
+            params.prior_weight
+        );
+
         let n_obs = search_space
             .keys()
             .next()
@@ -127,12 +156,23 @@ impl ParzenEstimator {
             // 对齐 Python _call_weights_func: 调用自定义权重函数并截断到 n_obs
             let w = wf(n_obs);
             let w: Vec<f64> = w.into_iter().take(n_obs).collect();
-            // 对齐 Python: 验证权重无负值、非全零、无 NaN/Inf
-            // （此处不抛错，仅确保健壮性；Python 版会 raise ValueError）
+            // 对齐 Python _call_weights_func: 验证权重有效性
+            Self::validate_weights(&w);
             w
         } else {
             default_weights(n_obs)
         };
+
+        // 对齐 Python: predetermined_weights 长度验证
+        if let Some(pw) = predetermined_weights {
+            assert_eq!(
+                pw.len(),
+                n_obs,
+                "predetermined_weights length ({}) != observations length ({})",
+                pw.len(),
+                n_obs
+            );
+        }
 
         if weights.is_empty() {
             weights = vec![1.0];
@@ -846,5 +886,84 @@ mod tests {
         for &lp in &log_pdf_vals {
             assert!(lp.is_finite(), "log_pdf 返回非有限值: {}", lp);
         }
+    }
+
+    // ========================================================================
+    // 验证对齐 Python 的校验逻辑
+    // ========================================================================
+
+    /// prior_weight < 0 应 panic（对齐 Python ValueError）
+    #[test]
+    #[should_panic(expected = "non-negative")]
+    fn test_negative_prior_weight_panics() {
+        let ss = IndexMap::new();
+        let obs = HashMap::new();
+        let mut params = ParzenEstimatorParameters::default();
+        params.prior_weight = -1.0;
+        let _pe = ParzenEstimator::new(&obs, &ss, &params, None, None);
+    }
+
+    /// 自定义权重函数返回负权重应 panic
+    #[test]
+    #[should_panic(expected = "non-negative")]
+    fn test_weights_func_negative_panics() {
+        let mut ss = IndexMap::new();
+        ss.insert(
+            "x".to_string(),
+            Distribution::FloatDistribution(FloatDistribution::new(0.0, 1.0, false, None).unwrap()),
+        );
+        let mut obs = HashMap::new();
+        obs.insert("x".to_string(), vec![0.5]);
+        let params = ParzenEstimatorParameters::default();
+        let bad_weights = |_n: usize| vec![-1.0];
+        let _pe = ParzenEstimator::new(&obs, &ss, &params, None, Some(&bad_weights));
+    }
+
+    /// 自定义权重函数返回全零权重应 panic
+    #[test]
+    #[should_panic(expected = "positive")]
+    fn test_weights_func_all_zero_panics() {
+        let mut ss = IndexMap::new();
+        ss.insert(
+            "x".to_string(),
+            Distribution::FloatDistribution(FloatDistribution::new(0.0, 1.0, false, None).unwrap()),
+        );
+        let mut obs = HashMap::new();
+        obs.insert("x".to_string(), vec![0.5]);
+        let params = ParzenEstimatorParameters::default();
+        let zero_weights = |_n: usize| vec![0.0];
+        let _pe = ParzenEstimator::new(&obs, &ss, &params, None, Some(&zero_weights));
+    }
+
+    /// 自定义权重函数返回 NaN 应 panic
+    #[test]
+    #[should_panic(expected = "finite")]
+    fn test_weights_func_nan_panics() {
+        let mut ss = IndexMap::new();
+        ss.insert(
+            "x".to_string(),
+            Distribution::FloatDistribution(FloatDistribution::new(0.0, 1.0, false, None).unwrap()),
+        );
+        let mut obs = HashMap::new();
+        obs.insert("x".to_string(), vec![0.5]);
+        let params = ParzenEstimatorParameters::default();
+        let nan_weights = |_n: usize| vec![f64::NAN];
+        let _pe = ParzenEstimator::new(&obs, &ss, &params, None, Some(&nan_weights));
+    }
+
+    /// predetermined_weights 长度不匹配应 panic
+    #[test]
+    #[should_panic(expected = "predetermined_weights length")]
+    fn test_predetermined_weights_length_mismatch() {
+        let mut ss = IndexMap::new();
+        ss.insert(
+            "x".to_string(),
+            Distribution::FloatDistribution(FloatDistribution::new(0.0, 1.0, false, None).unwrap()),
+        );
+        let mut obs = HashMap::new();
+        obs.insert("x".to_string(), vec![0.5, 0.3]);
+        let params = ParzenEstimatorParameters::default();
+        // 2 observations but 3 weights
+        let _pe = ParzenEstimator::new(&obs, &ss, &params, Some(&[1.0, 1.0, 1.0]), None);
     }
 }

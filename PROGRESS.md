@@ -2,9 +2,33 @@
 
 ## 总览
 
-- **Rust 测试基线**: 647 default / 730 all-features
-- **Python 交叉验证**: 110 tests (全部通过)
-- **最新提交**: Session 30 on gitlab/main
+- **Rust 测试基线**: 745 all-features (含 2 ignored)
+- **Python 交叉验证**: 118 tests (全部通过)
+- **最新提交**: Session 32 on gitlab/main
+
+## Session 32 修复摘要
+
+### Bug 修复 (12 项)
+1. **[CRITICAL] storage/in_memory.rs**: `set_trial_system_attr` 添加 `check_updatable` 验证 (Python 对齐)
+2. **[CRITICAL] study/core.rs**: `best_trial` 约束错误消息改为 "No feasible trials are completed yet."
+3. **[CRITICAL] study/core.rs**: `set_metric_names` 错误消息改为英文 (对齐 Python)
+4. **[HIGH] samplers/nsgaii/sampler.rs**: mutation 语义修复 — 被 mutate 的参数从结果中排除 (由 sample_independent 重采样)
+5. **[HIGH] samplers/nsgaiii/sampler.rs**: 同 NSGA-II mutation 语义修复
+6. **[HIGH] samplers/nsgaii/sampler.rs**: 添加 `population_size >= 2` 验证
+7. **[HIGH] samplers/nsgaii/sampler.rs**: 添加 `population_size >= crossover.n_parents` 验证
+8. **[HIGH] samplers/nsgaiii/sampler.rs**: 添加 population_size 验证 (同 NSGA-II)
+9. **[HIGH] samplers/cmaes.rs**: 添加 4 项参数冲突验证 (source_trials vs x0/sigma0, separable vs margin, lr_adapt vs separable/margin)
+10. **[HIGH] samplers/ga.rs**: 修复 GA 测试中 trial 生命周期 (先 RUNNING 再设 generation → Complete)
+11. **[MEDIUM] tests/test_cross_validation.py**: 修复 truncnorm ppf API 调用 (3 参数, 非 5 参数)
+12. **[MEDIUM] samplers/tpe/parzen_estimator.rs**: validate_weights 检查顺序修正 (先 finite 再 positive)
+
+### 新增测试 (15 项)
+- storage/in_memory.rs: +2 (set_trial_system_attr 拒绝已完成试验, RUNNING 正常)
+- study/core.rs: +3 (set_metric_names 错误消息, 约束错误消息, storage system_attr 拒绝)
+- samplers/nsgaii/sampler.rs: +1 (population_size < 2 panic)
+- samplers/cmaes.rs: +2 (separable+margin 冲突, lr_adapt+separable 冲突)
+- tests/test_cross_validation.py: +3 (storage system_attr 拒绝, metric_names 错误, 约束错误)
+- 上一 Session 遗留: +7 (Session 31 的 partial_fixed + parzen_estimator + truncnorm 测试)
 
 ## 功能对齐状态 (对比 Python optuna)
 

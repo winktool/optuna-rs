@@ -823,6 +823,23 @@ impl CmaEsSamplerBuilder {
 
     /// Build the [`CmaEsSampler`].
     pub fn build(self) -> CmaEsSampler {
+        // 对齐 Python: 参数冲突验证
+        assert!(
+            self.source_trials.is_none() || (self.x0.is_none() && self.sigma0.is_none()),
+            "It is prohibited to pass `source_trials` argument when x0 or sigma0 is specified."
+        );
+        assert!(
+            self.source_trials.is_none() || !self.use_separable_cma,
+            "It is prohibited to pass `source_trials` argument when using separable CMA-ES."
+        );
+        assert!(
+            !self.lr_adapt || (!self.use_separable_cma && !self.with_margin),
+            "It is prohibited to pass `use_separable_cma` or `with_margin` argument when using `lr_adapt`."
+        );
+        assert!(
+            !self.use_separable_cma || !self.with_margin,
+            "Currently, we do not support `use_separable_cma=True` and `with_margin=True`."
+        );
         CmaEsSampler::new(
             self.direction,
             self.sigma0,
@@ -998,17 +1015,31 @@ mod tests {
             .n_startup_trials(5)
             .popsize(10)
             .consider_pruned_trials(true)
-            .use_separable_cma(true)
-            .with_margin(true)
-            .lr_adapt(true)
             .seed(123)
             .build();
         assert_eq!(sampler.n_startup_trials, 5);
         assert_eq!(sampler.popsize, Some(10));
         assert!(sampler.consider_pruned_trials);
-        assert!(sampler.use_separable_cma);
-        assert!(sampler.with_margin);
-        assert!(sampler.lr_adapt);
+    }
+
+    /// 对齐 Python: use_separable_cma 和 with_margin 不能同时使用
+    #[test]
+    #[should_panic(expected = "use_separable_cma")]
+    fn test_builder_separable_with_margin_conflict() {
+        CmaEsSamplerBuilder::new(StudyDirection::Minimize)
+            .use_separable_cma(true)
+            .with_margin(true)
+            .build();
+    }
+
+    /// 对齐 Python: lr_adapt 和 use_separable_cma 不能同时使用
+    #[test]
+    #[should_panic(expected = "lr_adapt")]
+    fn test_builder_lr_adapt_separable_conflict() {
+        CmaEsSamplerBuilder::new(StudyDirection::Minimize)
+            .lr_adapt(true)
+            .use_separable_cma(true)
+            .build();
     }
 
     /// 对齐 Python: default_popsize

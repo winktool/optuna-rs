@@ -245,46 +245,43 @@ mod tests {
     #[test]
     fn test_get_trial_generation() {
         let (storage, sid, sampler) = setup(0, 2);
-        // 创建第 1 个 trial → gen 0
+        // 对齐 Python: get_trial_generation 在 trial 为 RUNNING 时调用
+        // 创建第 1 个 trial → RUNNING → gen 0 → Complete
         let t1 = storage.create_new_trial(sid, None).unwrap();
-        storage
-            .set_trial_state_values(t1, TrialState::Complete, Some(&[1.0]))
-            .unwrap();
+        storage.set_trial_state_values(t1, TrialState::Running, None).unwrap();
         let trial1 = storage.get_trial(t1).unwrap();
         let g1 = sampler.get_trial_generation(&*storage, sid, &trial1).unwrap();
         assert_eq!(g1, 0);
+        storage.set_trial_state_values(t1, TrialState::Complete, Some(&[1.0])).unwrap();
 
         // 创建第 2 个 trial → gen 0（pop_size=2 未满）
         let t2 = storage.create_new_trial(sid, None).unwrap();
-        storage
-            .set_trial_state_values(t2, TrialState::Complete, Some(&[2.0]))
-            .unwrap();
+        storage.set_trial_state_values(t2, TrialState::Running, None).unwrap();
         let trial2 = storage.get_trial(t2).unwrap();
         let g2 = sampler.get_trial_generation(&*storage, sid, &trial2).unwrap();
         assert_eq!(g2, 0);
+        storage.set_trial_state_values(t2, TrialState::Complete, Some(&[2.0])).unwrap();
 
         // 创建第 3 个 trial → gen 1（pop_size=2 已满，进入下一代）
         let t3 = storage.create_new_trial(sid, None).unwrap();
-        storage
-            .set_trial_state_values(t3, TrialState::Complete, Some(&[3.0]))
-            .unwrap();
+        storage.set_trial_state_values(t3, TrialState::Running, None).unwrap();
         let trial3 = storage.get_trial(t3).unwrap();
         let g3 = sampler.get_trial_generation(&*storage, sid, &trial3).unwrap();
         assert_eq!(g3, 1);
+        storage.set_trial_state_values(t3, TrialState::Complete, Some(&[3.0])).unwrap();
     }
 
     /// 对齐 Python: get_population 筛选正确
     #[test]
     fn test_get_population() {
         let (storage, sid, sampler) = setup(0, 2);
-        // gen 0 两个 trial
+        // gen 0 两个 trial: RUNNING → set generation → Complete
         for i in 0..2 {
             let tid = storage.create_new_trial(sid, None).unwrap();
-            storage
-                .set_trial_state_values(tid, TrialState::Complete, Some(&[i as f64]))
-                .unwrap();
+            storage.set_trial_state_values(tid, TrialState::Running, None).unwrap();
             let trial = storage.get_trial(tid).unwrap();
             sampler.get_trial_generation(&*storage, sid, &trial).unwrap();
+            storage.set_trial_state_values(tid, TrialState::Complete, Some(&[i as f64])).unwrap();
         }
         let pop0 = sampler.get_population(&*storage, sid, 0).unwrap();
         assert_eq!(pop0.len(), 2);
@@ -296,14 +293,13 @@ mod tests {
     #[test]
     fn test_parent_population_caching() {
         let (storage, sid, sampler) = setup(0, 2);
-        // gen 0: 2 trial
+        // gen 0: 2 trial, RUNNING → generation → Complete
         for i in 0..2 {
             let tid = storage.create_new_trial(sid, None).unwrap();
-            storage
-                .set_trial_state_values(tid, TrialState::Complete, Some(&[i as f64]))
-                .unwrap();
+            storage.set_trial_state_values(tid, TrialState::Running, None).unwrap();
             let trial = storage.get_trial(tid).unwrap();
             sampler.get_trial_generation(&*storage, sid, &trial).unwrap();
+            storage.set_trial_state_values(tid, TrialState::Complete, Some(&[i as f64])).unwrap();
         }
         // gen 1 的父代 = gen 0 的 select_parent 结果
         let parents1 = sampler.get_parent_population(&*storage, sid, 1).unwrap();
@@ -318,11 +314,9 @@ mod tests {
     fn test_generation_cached_in_system_attrs() {
         let (storage, sid, sampler) = setup(0, 10);
         let tid = storage.create_new_trial(sid, None).unwrap();
-        storage
-            .set_trial_state_values(tid, TrialState::Complete, Some(&[1.0]))
-            .unwrap();
+        storage.set_trial_state_values(tid, TrialState::Running, None).unwrap();
         let trial = storage.get_trial(tid).unwrap();
-        // 第一次计算并写入
+        // 第一次计算并写入（RUNNING 状态）
         let g1 = sampler.get_trial_generation(&*storage, sid, &trial).unwrap();
         // 读回 trial，system_attrs 应有 generation
         let trial2 = storage.get_trial(tid).unwrap();

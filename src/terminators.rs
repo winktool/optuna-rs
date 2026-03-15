@@ -609,7 +609,8 @@ impl ImprovementEvaluator for RegretBoundEvaluator {
         if n == 0 { return f64::MAX; }
 
         // 选择 top-N 试验
-        let top_n = (n as f64 * self.top_trials_ratio).round() as usize;
+        // 对齐 Python: int() 截断（非四舍五入），即 floor 正数
+        let top_n = (n as f64 * self.top_trials_ratio) as usize;
         let top_n = top_n.max(self.min_n_trials).min(n);
 
         // 按值排序取 top_n（降序，最大化指标）
@@ -784,8 +785,9 @@ impl ImprovementEvaluator for EMMREvaluator {
         let (_, var_t_theta_t1_star) = gpr_t.posterior(theta_t1_star);
         let cov_t = compute_gp_posterior_cov(&gpr_t, theta_t_star, theta_t1_star);
 
-        // 用 gpr_{t-1} 在第 t 个观测 (x_t) 处的后验
-        let (mu_t1_x_t, var_t1_x_t) = gpr_t1.posterior(x_t);
+        // 对齐 Python: 用 gpr_t（而非 gpr_{t-1}）在第 t 个观测 (x_t) 处计算后验
+        // Python 注释: "Use gpr_t instead of gpr_t1 because KL Div. requires the same prior for both posterior."
+        let (mu_t1_x_t, var_t1_x_t) = gpr_t.posterior(x_t);
         let (mu_t1_theta_t1_star, _) = gpr_t1.posterior(theta_t1_star);
 
         // === 计算四项 ===

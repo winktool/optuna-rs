@@ -168,7 +168,9 @@ impl TpeSampler {
             },
             rng: Mutex::new(rng),
             random_sampler: RandomSampler::new(seed.map(|s| s.wrapping_add(1))),
-            search_space: Mutex::new(IntersectionSearchSpace::new(false)),
+            // 对齐 Python: IntersectionSearchSpace(include_pruned=True)
+            // 在多变量模式下，也考虑 PRUNED 试验的参数来计算搜索空间交集
+            search_space: Mutex::new(IntersectionSearchSpace::new(true)),
             group_search_space: Mutex::new(SearchSpaceGroup::new()),
             categorical_distance_func,
             warn_independent_sampling,
@@ -251,21 +253,25 @@ impl TpeSampler {
 
         // Sort pruned by (-last_step, direction-aware intermediate_value).
         // 对齐 Python _get_pruned_trial_score：Maximize 时对中间值取负
+        // 对齐 Python: NaN 中间值映射为 inf，确保排在同步骤试验的最后
         pruned.sort_by(|a, b| {
             let sa = a.last_step().unwrap_or(i64::MIN);
             let sb = b.last_step().unwrap_or(i64::MIN);
             match sb.cmp(&sa) {
                 std::cmp::Ordering::Equal => {
+                    // 对齐 Python: if math.isnan(intermediate_value): return (-step, float("inf"))
                     let va = a
                         .intermediate_values
                         .get(&sa)
                         .copied()
                         .unwrap_or(f64::INFINITY);
+                    let va = if va.is_nan() { f64::INFINITY } else { va };
                     let vb = b
                         .intermediate_values
                         .get(&sb)
                         .copied()
                         .unwrap_or(f64::INFINITY);
+                    let vb = if vb.is_nan() { f64::INFINITY } else { vb };
                     // Minimize: 小值优先(升序)；Maximize: 大值优先(降序)
                     match self.direction {
                         StudyDirection::Maximize => {
@@ -319,6 +325,12 @@ impl TpeSampler {
 
         // Running trials always go to above.
         above.extend(running);
+
+        // 对齐 Python: 按 trial.number 排序，确保权重按时间顺序分配
+        // Python: below_trials.sort(key=lambda trial: trial.number)
+        //         above_trials.sort(key=lambda trial: trial.number)
+        below.sort_by_key(|t| t.number);
+        above.sort_by_key(|t| t.number);
 
         (below, above)
     }
@@ -383,10 +395,14 @@ impl TpeSampler {
         let obs_below = Self::get_observations(&below, search_space);
         let obs_above = Self::get_observations(&above, search_space);
 
+        // 对齐 Python: 将自定义 weights 函数传递给 ParzenEstimator
+        let weights_ref = self.weights.clone();
         let pe_below =
-            ParzenEstimator::new(&obs_below, search_space, &self.pe_params, None);
+            ParzenEstimator::new(&obs_below, search_space, &self.pe_params, None,
+                                 Some(&|n| weights_ref(n)));
         let pe_above =
-            ParzenEstimator::new(&obs_above, search_space, &self.pe_params, None);
+            ParzenEstimator::new(&obs_above, search_space, &self.pe_params, None,
+                                 Some(&|n| weights_ref(n)));
 
         // Sample candidates from l(x).
         let mut rng = self.rng.lock();
@@ -446,17 +462,27 @@ impl Sampler for TpeSampler {
                     gs.add_distributions(&trial.distributions);
                 }
             }
-            // Return the union as the relative space
+            // Return the union as the relative space, filtering out single() distributions
+            // 对齐 Python: if distribution.single(): continue
             let mut result = HashMap::new();
             for space in gs.search_spaces() {
                 for (k, v) in space.iter() {
-                    result.insert(k.clone(), v.clone());
+                    if !v.single() {
+                        result.insert(k.clone(), v.clone());
+                    }
                 }
             }
             result
         } else {
             let mut ss = self.search_space.lock();
-            ss.calculate(trials).clone()
+            // 对齐 Python: filter out single() distributions
+            // Python: for name, distribution in search_space.items():
+            //            if distribution.single(): continue
+            ss.calculate(trials)
+                .iter()
+                .filter(|(_, d)| !d.single())
+                .map(|(k, v)| (k.clone(), v.clone()))
+                .collect()
         }
     }
 
@@ -1008,5 +1034,121 @@ mod tests {
         assert!((w30[4] - 1.0).abs() < 1e-12);
         // flat 部分全 1.0
         assert!(w30[5..].iter().all(|x| (*x - 1.0).abs() < 1e-12));
+    }
+
+    #[test]
+    fn test_split_trials_sorted_by_number() {
+        // 对齐 Python: split_trials 后 below/above 按 trial.number 排序
+        // 确保权重按时间顺序（recency）分配，而非按目标值质量
+        let sampler = TpeSampler::with_defaults(StudyDirection::Minimize, Some(42));
+        let mut trials = Vec::new();
+        // 创建乱序 number 的试验: number=[3,0,2,1] values=[0.1,0.2,0.3,0.4]
+        for (number, value) in [(3i64, 0.1), (0, 0.2), (2, 0.3), (1, 0.4)] {
+            let mut params = HashMap::new();
+            params.insert("x".to_string(), ParamValue::Float(value));
+            trials.push(make_complete_trial(number, value, params));
+        }
+        let (below, above) = sampler.split_trials(&trials);
+        // gamma(4) = min(ceil(0.4), 25) = 1 → below 有 1 个
+        assert_eq!(below.len(), 1);
+        assert_eq!(above.len(), 3);
+        // above 应按 number 升序: [0, 1, 2]
+        let above_numbers: Vec<i64> = above.iter().map(|t| t.number).collect();
+        let mut sorted = above_numbers.clone();
+        sorted.sort();
+        assert_eq!(above_numbers, sorted, "above 应按 trial.number 排序");
+    }
+
+    #[test]
+    fn test_split_trials_nan_intermediate_sort() {
+        // 对齐 Python: NaN 中间值映射为 inf，排在同步骤试验最后
+        let sampler = TpeSampler::with_defaults(StudyDirection::Minimize, Some(42));
+        let now = chrono::Utc::now();
+
+        // 创建完成的试验（占 below）
+        let mut complete_trials: Vec<FrozenTrial> = (0..5).map(|i| {
+            let mut params = HashMap::new();
+            params.insert("x".to_string(), ParamValue::Float(i as f64));
+            make_complete_trial(i, i as f64, params)
+        }).collect();
+
+        // 创建3个 pruned 试验: step=10, values = [1.0, NaN, 2.0]
+        for (idx, val) in [(5i64, 1.0), (6, f64::NAN), (7, 2.0)] {
+            let mut iv = HashMap::new();
+            iv.insert(10i64, val);
+            complete_trials.push(FrozenTrial {
+                number: idx,
+                state: TrialState::Pruned,
+                values: None,
+                datetime_start: Some(now),
+                datetime_complete: Some(now),
+                params: HashMap::from([("x".to_string(), ParamValue::Float(0.0))]),
+                distributions: HashMap::from([(
+                    "x".to_string(),
+                    Distribution::FloatDistribution(FloatDistribution::new(-10.0, 10.0, false, None).unwrap()),
+                )]),
+                user_attrs: HashMap::new(),
+                system_attrs: HashMap::new(),
+                intermediate_values: iv,
+                trial_id: idx,
+            });
+        }
+
+        let (below, above) = sampler.split_trials(&complete_trials);
+        // 验证两组都已按 number 排序
+        for group in [&below, &above] {
+            let numbers: Vec<i64> = group.iter().map(|t| t.number).collect();
+            let mut sorted = numbers.clone();
+            sorted.sort();
+            assert_eq!(numbers, sorted, "应按 trial.number 排序");
+        }
+    }
+
+    #[test]
+    fn test_infer_relative_search_space_filters_single() {
+        // 对齐 Python: single() 分布不应出现在相对搜索空间中
+        let sampler = TpeSamplerBuilder::new(StudyDirection::Minimize)
+            .multivariate(true)
+            .n_startup_trials(0) // 立即启用 TPE
+            .seed(42)
+            .build();
+        let now = chrono::Utc::now();
+
+        // 创建试验 with x=[0..5] and y=5.0 (single distribution: low==high)
+        let mut trials = Vec::new();
+        for i in 0..5 {
+            trials.push(FrozenTrial {
+                number: i,
+                state: TrialState::Complete,
+                values: Some(vec![i as f64]),
+                datetime_start: Some(now),
+                datetime_complete: Some(now),
+                params: HashMap::from([
+                    ("x".to_string(), ParamValue::Float(i as f64)),
+                    ("y".to_string(), ParamValue::Float(5.0)),
+                ]),
+                distributions: HashMap::from([
+                    ("x".to_string(), Distribution::FloatDistribution(
+                        FloatDistribution::new(0.0, 10.0, false, None).unwrap()
+                    )),
+                    ("y".to_string(), Distribution::FloatDistribution(
+                        FloatDistribution::new(5.0, 5.0, false, None).unwrap() // single!
+                    )),
+                ]),
+                user_attrs: HashMap::new(),
+                system_attrs: HashMap::new(),
+                intermediate_values: HashMap::new(),
+                trial_id: i,
+            });
+        }
+
+        let search_space = sampler.infer_relative_search_space(&trials);
+        // y 是 single 分布，应被过滤掉
+        assert!(
+            !search_space.contains_key("y"),
+            "single() 分布应被过滤: {:?}", search_space.keys().collect::<Vec<_>>()
+        );
+        // x 应保留
+        assert!(search_space.contains_key("x"));
     }
 }

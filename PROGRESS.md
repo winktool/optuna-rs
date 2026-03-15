@@ -2,9 +2,9 @@
 
 ## 总览
 
-- **Rust 测试基线**: 629 default / 705 all-features
-- **Python 交叉验证**: 90 tests (全部通过)
-- **最新提交**: Session 28 on gitlab/main
+- **Rust 测试基线**: 647 default / 723 all-features
+- **Python 交叉验证**: 103 tests (全部通过)
+- **最新提交**: Session 29 on gitlab/main
 
 ## 功能对齐状态 (对比 Python optuna)
 
@@ -63,6 +63,20 @@
 - 新增 19 个 Rust 内联测试 (610→629)
 - 新增 9 个 Python 交叉验证测试 (81→90)
 
+### Session 29
+- [CRITICAL] check_distribution_compatibility 过度严格: 移除 Float/Int step 检查 (对齐 Python 仅检查 log)
+- [HIGH] create_trial() 跳过 validate() + 静默取 value 忽略 values → 改用 FrozenTrial::new() 内部校验
+- [CRITICAL] TPE split_trials 缺少按 trial.number 重排序 → 添加排序 (对齐 Python 权重按时间序分配)
+- [HIGH] TPE IntersectionSearchSpace include_pruned=false → true (对齐 Python)
+- [HIGH] TPE infer_relative_search_space 未过滤 single() 分布 → 添加过滤
+- [HIGH] TPE custom weights 函数未传递给 ParzenEstimator → 添加 weights_func 参数
+- [MEDIUM] TPE pruned trial NaN 中间值未映射为 inf → 添加 NaN→inf 映射 (对齐 Python _get_pruned_trial_score)
+- [HIGH] EMMR KL 散度用错 GP 模型 (gpr_t1 → gpr_t) → 修复 (对齐 Python 注释)
+- [MEDIUM] RegretBound top_n 四舍五入 → 截断 (对齐 Python int() 语义)
+- 深度审计: distributions, trial, samplers/tpe, callbacks, importance, terminators
+- 新增 18 个 Rust 内联测试 (629→647)
+- 新增 13 个 Python 交叉验证测试 (90→103)
+
 ## 测试覆盖
 
 ### 高覆盖文件 (>10 tests)
@@ -72,11 +86,14 @@
 - trial/frozen.rs: 24 tests
 - search_space/transform.rs: 21 tests
 - distributions/float.rs: 16 tests
+- distributions/mod.rs: 20 tests (含 check_distribution_compatibility)
 - trial/handle.rs: 16 tests
+- trial/mod.rs: 12 tests (含 create_trial validate)
 - storage/journal.rs: 12 tests
 - random.rs: 14 tests
 - callbacks/mod.rs: 11 tests
 - distributions/int.rs, categorical.rs: 合计 ~25 tests
+- samplers/tpe/sampler.rs: 15 tests (含 split_trials/single/weights)
 
 ### 中覆盖文件 (4-10 tests)
 - samplers/brute_force.rs: 9 tests

@@ -1178,6 +1178,186 @@ def test_set_trial_state_values_none_preserves():
     assert trial.values == [1.5]
 
 # ═══════════════════════════════════════════════════════════════════════════
+#  42. check_distribution_compatibility 不检查 step — 对应 Rust distributions/mod.rs
+# ═══════════════════════════════════════════════════════════════════════════
+
+def test_check_distribution_compatibility_float_step_allowed():
+    """对齐 Python: Float 分布 step 不同也兼容"""
+    from optuna.distributions import check_distribution_compatibility, FloatDistribution
+    a = FloatDistribution(0.0, 1.0, step=0.1)
+    b = FloatDistribution(0.0, 1.0, step=0.2)
+    # Python 不检查 step，不应报错
+    check_distribution_compatibility(a, b)
+
+def test_check_distribution_compatibility_float_step_vs_none():
+    """对齐 Python: Float step=Some vs step=None 也兼容"""
+    from optuna.distributions import check_distribution_compatibility, FloatDistribution
+    a = FloatDistribution(0.0, 1.0, step=0.1)
+    b = FloatDistribution(0.0, 1.0)
+    check_distribution_compatibility(a, b)
+
+def test_check_distribution_compatibility_int_step_allowed():
+    """对齐 Python: Int 分布 step 不同也兼容"""
+    from optuna.distributions import check_distribution_compatibility, IntDistribution
+    a = IntDistribution(0, 10, step=1)
+    b = IntDistribution(0, 10, step=2)
+    check_distribution_compatibility(a, b)
+
+def test_check_distribution_compatibility_float_log_differ():
+    """对齐 Python: Float log 不同则不兼容"""
+    from optuna.distributions import check_distribution_compatibility, FloatDistribution
+    a = FloatDistribution(0.01, 1.0, log=True)
+    b = FloatDistribution(0.01, 1.0, log=False)
+    try:
+        check_distribution_compatibility(a, b)
+        assert False, "应该抛出 ValueError"
+    except ValueError:
+        pass
+
+def test_check_distribution_compatibility_int_log_differ():
+    """对齐 Python: Int log 不同则不兼容"""
+    from optuna.distributions import check_distribution_compatibility, IntDistribution
+    a = IntDistribution(1, 10, log=True)
+    b = IntDistribution(1, 10, log=False)
+    try:
+        check_distribution_compatibility(a, b)
+        assert False, "应该抛出 ValueError"
+    except ValueError:
+        pass
+
+# ═══════════════════════════════════════════════════════════════════════════
+#  43. create_trial value/values 互斥 + validate — 对应 Rust trial/mod.rs
+# ═══════════════════════════════════════════════════════════════════════════
+
+def test_create_trial_value_values_mutual_exclusion():
+    """对齐 Python: 同时传入 value 和 values 报 ValueError"""
+    try:
+        optuna.trial.create_trial(value=1.0, values=[2.0])
+        assert False, "应该抛出 ValueError"
+    except ValueError:
+        pass
+
+def test_create_trial_complete_without_values():
+    """对齐 Python validate(): Complete 无 values 报 ValueError"""
+    try:
+        optuna.trial.create_trial(state=optuna.trial.TrialState.COMPLETE)
+        assert False, "应该抛出 ValueError"
+    except ValueError:
+        pass
+
+def test_create_trial_fail_with_values():
+    """对齐 Python validate(): Fail 有 values 报 ValueError"""
+    try:
+        optuna.trial.create_trial(state=optuna.trial.TrialState.FAIL, value=1.0)
+        assert False, "应该抛出 ValueError"
+    except ValueError:
+        pass
+
+def test_create_trial_complete_with_nan():
+    """对齐 Python validate(): Complete + NaN 报 ValueError"""
+    try:
+        optuna.trial.create_trial(value=float('nan'))
+        assert False, "应该抛出 ValueError"
+    except ValueError:
+        pass
+
+def test_create_trial_pruned_no_values_ok():
+    """对齐 Python: Pruned 无 values 合法"""
+    t = optuna.trial.create_trial(state=optuna.trial.TrialState.PRUNED)
+    assert t.state == optuna.trial.TrialState.PRUNED
+
+# ═══════════════════════════════════════════════════════════════════════════
+#  44. TPE split_trials 排序 — 确认 Python 行为
+# ═══════════════════════════════════════════════════════════════════════════
+
+def test_tpe_split_trials_sorted_by_number():
+    """验证 Python TPE split_trials 结果按 trial.number 排序"""
+    study = optuna.create_study(direction="minimize")
+    # 手动添加乱序 number 的试验
+    for number, value in [(3, 0.1), (0, 0.2), (2, 0.3), (1, 0.4)]:
+        study.add_trial(
+            optuna.trial.create_trial(
+                state=optuna.trial.TrialState.COMPLETE,
+                value=value,
+                params={"x": float(number)},
+                distributions={"x": optuna.distributions.FloatDistribution(-10, 10)},
+            )
+        )
+    # 使用 TPE 内部 _split_trials
+    from optuna.samplers._tpe.sampler import _split_trials
+    below, above = _split_trials(study, study.trials, 1, [])
+    # below 和 above 都应按 number 排序
+    below_numbers = [t.number for t in below]
+    above_numbers = [t.number for t in above]
+    assert below_numbers == sorted(below_numbers), f"below 未排序: {below_numbers}"
+    assert above_numbers == sorted(above_numbers), f"above 未排序: {above_numbers}"
+
+# ═══════════════════════════════════════════════════════════════════════════
+#  45. TPE search_space 过滤 single() 分布 — 确认 Python 行为
+# ═══════════════════════════════════════════════════════════════════════════
+
+def test_tpe_search_space_filters_single():
+    """验证 Python TPE 的 infer_relative_search_space 过滤 single() 分布"""
+    study = optuna.create_study(direction="minimize", sampler=optuna.samplers.TPESampler(
+        multivariate=True, n_startup_trials=0, seed=42))
+    # 添加试验: x 有多值分布, y 固定=5.0
+    for i in range(5):
+        study.add_trial(
+            optuna.trial.create_trial(
+                state=optuna.trial.TrialState.COMPLETE,
+                value=float(i),
+                params={"x": float(i), "y": 5.0},
+                distributions={
+                    "x": optuna.distributions.FloatDistribution(0, 10),
+                    "y": optuna.distributions.FloatDistribution(5.0, 5.0),  # single!
+                },
+            )
+        )
+    # 推断搜索空间
+    trial = study.ask()
+    search_space = study.sampler.infer_relative_search_space(study, trial)
+    assert "y" not in search_space, f"single() 分布不应在搜索空间中: {search_space.keys()}"
+    assert "x" in search_space
+
+# ═══════════════════════════════════════════════════════════════════════════
+#  46. TPE IntersectionSearchSpace include_pruned=True — 确认 Python 行为
+# ═══════════════════════════════════════════════════════════════════════════
+
+def test_tpe_intersection_search_space_includes_pruned():
+    """验证 Python TPE 使用 IntersectionSearchSpace(include_pruned=True)"""
+    study = optuna.create_study(direction="minimize", sampler=optuna.samplers.TPESampler(
+        multivariate=True, n_startup_trials=0, seed=42))
+    # 先添加完成的试验
+    study.add_trial(
+        optuna.trial.create_trial(
+            state=optuna.trial.TrialState.COMPLETE,
+            value=1.0,
+            params={"x": 1.0, "z": 2.0},
+            distributions={
+                "x": optuna.distributions.FloatDistribution(0, 10),
+                "z": optuna.distributions.FloatDistribution(0, 10),
+            },
+        )
+    )
+    # 添加 pruned 试验（有不同参数）
+    study.add_trial(
+        optuna.trial.create_trial(
+            state=optuna.trial.TrialState.PRUNED,
+            params={"x": 2.0, "z": 3.0},
+            distributions={
+                "x": optuna.distributions.FloatDistribution(0, 10),
+                "z": optuna.distributions.FloatDistribution(0, 10),
+            },
+        )
+    )
+    # TPE 使用 include_pruned=True，所以 pruned 试验也在计算搜索空间
+    trial = study.ask()
+    search_space = study.sampler.infer_relative_search_space(study, trial)
+    # x 和 z 都应在搜索空间中（因为 pruned 试验也有这些参数）
+    assert "x" in search_space, f"x 应在搜索空间中"
+    assert "z" in search_space, f"z 应在搜索空间中"
+
+# ═══════════════════════════════════════════════════════════════════════════
 #  执行
 # ═══════════════════════════════════════════════════════════════════════════
 

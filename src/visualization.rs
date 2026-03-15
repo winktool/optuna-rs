@@ -2249,7 +2249,7 @@ mod tests {
             Some(vec![1.0]),
             None, None, None, None,
             Some([(0i64, 0.5), (1, 0.3)].into_iter().collect()),
-        );
+        ).unwrap();
         study.add_trial(&trial).unwrap();
         let plot = plot_intermediate_values(&study).unwrap();
         let html = plot.to_html();

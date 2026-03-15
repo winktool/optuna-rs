@@ -1743,7 +1743,7 @@ mod tests {
             None,
             None,
             None,
-        );
+        ).unwrap();
 
         assert_eq!(trial.state, TrialState::Complete);
         assert_eq!(trial.values.as_ref().unwrap()[0], 0.25);

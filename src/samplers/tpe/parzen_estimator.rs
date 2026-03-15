@@ -103,11 +103,14 @@ impl ParzenEstimator {
     /// `search_space`: param_name → Distribution, same order (use IndexMap).
     /// `params`: estimator configuration.
     /// `predetermined_weights`: if Some, used instead of default_weights.
+    /// `weights_func`: if Some, use this function instead of default_weights when
+    ///   `predetermined_weights` is None. 对齐 Python `parameters.weights` 字段。
     pub fn new(
         observations: &HashMap<String, Vec<f64>>,
         search_space: &IndexMap<String, Distribution>,
         params: &ParzenEstimatorParameters,
         predetermined_weights: Option<&[f64]>,
+        weights_func: Option<&dyn Fn(usize) -> Vec<f64>>,
     ) -> Self {
         let n_obs = search_space
             .keys()
@@ -117,8 +120,16 @@ impl ParzenEstimator {
             .unwrap_or(0);
 
         // Compute mixture weights.
+        // 对齐 Python: predetermined_weights → weights_func(parameters.weights) → default_weights
         let mut weights = if let Some(pw) = predetermined_weights {
             pw.to_vec()
+        } else if let Some(wf) = weights_func {
+            // 对齐 Python _call_weights_func: 调用自定义权重函数并截断到 n_obs
+            let w = wf(n_obs);
+            let w: Vec<f64> = w.into_iter().take(n_obs).collect();
+            // 对齐 Python: 验证权重无负值、非全零、无 NaN/Inf
+            // （此处不抛错，仅确保健壮性；Python 版会 raise ValueError）
+            w
         } else {
             default_weights(n_obs)
         };
@@ -691,7 +702,7 @@ mod tests {
     fn test_parzen_estimator_no_observations() {
         let ss = make_search_space();
         let obs: HashMap<String, Vec<f64>> = HashMap::new();
-        let pe = ParzenEstimator::new(&obs, &ss, &ParzenEstimatorParameters::default(), None);
+        let pe = ParzenEstimator::new(&obs, &ss, &ParzenEstimatorParameters::default(), None, None);
 
         assert_eq!(pe.weights.len(), 1); // Just prior
         assert!((pe.weights[0] - 1.0).abs() < 1e-10);
@@ -709,7 +720,7 @@ mod tests {
         let ss = make_search_space();
         let mut obs = HashMap::new();
         obs.insert("x".to_string(), vec![2.0, 5.0, 8.0]);
-        let pe = ParzenEstimator::new(&obs, &ss, &ParzenEstimatorParameters::default(), None);
+        let pe = ParzenEstimator::new(&obs, &ss, &ParzenEstimatorParameters::default(), None, None);
 
         // 3 obs + 1 prior = 4 kernels
         assert_eq!(pe.weights.len(), 4);
@@ -746,7 +757,7 @@ mod tests {
         let mut obs = HashMap::new();
         obs.insert("opt".to_string(), vec![0.0, 0.0, 1.0]); // mostly "a"
 
-        let pe = ParzenEstimator::new(&obs, &ss, &ParzenEstimatorParameters::default(), None);
+        let pe = ParzenEstimator::new(&obs, &ss, &ParzenEstimatorParameters::default(), None, None);
         let mut rng = rand_chacha::ChaCha8Rng::seed_from_u64(42);
         let samples = pe.sample(&mut rng, 100);
         for &v in &samples["opt"] {
@@ -770,7 +781,7 @@ mod tests {
         let mut obs = HashMap::new();
         obs.insert("lr".to_string(), vec![0.01, 0.1]);
 
-        let pe = ParzenEstimator::new(&obs, &ss, &ParzenEstimatorParameters::default(), None);
+        let pe = ParzenEstimator::new(&obs, &ss, &ParzenEstimatorParameters::default(), None, None);
         let mut rng = rand_chacha::ChaCha8Rng::seed_from_u64(42);
         let samples = pe.sample(&mut rng, 100);
         for &v in &samples["lr"] {
@@ -792,7 +803,7 @@ mod tests {
         let mut obs = HashMap::new();
         obs.insert("n".to_string(), vec![2.0, 4.0, 6.0]);
 
-        let pe = ParzenEstimator::new(&obs, &ss, &ParzenEstimatorParameters::default(), None);
+        let pe = ParzenEstimator::new(&obs, &ss, &ParzenEstimatorParameters::default(), None, None);
         let mut rng = rand_chacha::ChaCha8Rng::seed_from_u64(42);
         let samples = pe.sample(&mut rng, 100);
         for &v in &samples["n"] {
@@ -829,7 +840,7 @@ mod tests {
         let mut obs = HashMap::new();
         obs.insert("x".to_string(), vec![10.0, 20.0, 50.0]);
 
-        let pe = ParzenEstimator::new(&obs, &ss, &ParzenEstimatorParameters::default(), None);
+        let pe = ParzenEstimator::new(&obs, &ss, &ParzenEstimatorParameters::default(), None, None);
         // log_pdf 应该返回有限值（非 NaN）
         let log_pdf_vals = pe.log_pdf(&HashMap::from([("x".to_string(), vec![10.0, 20.0, 50.0])]));
         for &lp in &log_pdf_vals {

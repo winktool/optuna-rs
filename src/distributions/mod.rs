@@ -96,17 +96,19 @@ pub fn json_to_distribution(json: &str) -> Result<Distribution> {
 /// 检查两个分布是否兼容。
 ///
 /// 对应 Python `optuna.distributions.check_distribution_compatibility()`。
-/// 兼容规则：
-/// - 同一类型的分布（Float/Int/Categorical）兼容（允许 range 不同）
-/// - Float: log 属性必须相同，step 的 Some/None 状态必须相同
-/// - Int: log 属性必须相同，step 值必须相同
+/// 兼容规则（严格对齐 Python）：
+/// - 同一类型的分布（Float/Int/Categorical）兼容（允许 range/step 不同）
+/// - Float/Int: 仅检查 log 属性必须相同
 /// - Categorical: choices 必须完全相同
 /// - 不同类型的分布不兼容
+/// 
+/// 注意：Python 不检查 step 是否一致，仅检查 log。
 pub fn check_distribution_compatibility(
     dist_a: &Distribution,
     dist_b: &Distribution,
 ) -> Result<()> {
     match (dist_a, dist_b) {
+        // 对齐 Python: Float 仅检查 log，不检查 step
         (Distribution::FloatDistribution(a), Distribution::FloatDistribution(b)) => {
             if a.log != b.log {
                 return Err(OptunaError::ValueError(format!(
@@ -114,24 +116,14 @@ pub fn check_distribution_compatibility(
                     a.log, b.log
                 )));
             }
-            if a.step.is_some() != b.step.is_some() {
-                return Err(OptunaError::ValueError(
-                    "Cannot use both discrete and continuous distributions for the same parameter".into()
-                ));
-            }
             Ok(())
         }
+        // 对齐 Python: Int 仅检查 log，不检查 step
         (Distribution::IntDistribution(a), Distribution::IntDistribution(b)) => {
             if a.log != b.log {
                 return Err(OptunaError::ValueError(format!(
                     "Cannot set different `log` values for the same parameter: {} vs {}",
                     a.log, b.log
-                )));
-            }
-            if a.step != b.step {
-                return Err(OptunaError::ValueError(format!(
-                    "Cannot set different `step` values for the same parameter: {} vs {}",
-                    a.step, b.step
                 )));
             }
             Ok(())
@@ -238,5 +230,90 @@ mod tests {
         );
         let val = ParamValue::Categorical(CategoricalChoice::Str("oops".into()));
         assert!(dist.to_internal_repr(&val).is_err());
+    }
+
+    // === check_distribution_compatibility 对齐 Python 测试 ===
+
+    #[test]
+    fn test_compat_float_same_log() {
+        // 对齐 Python: 同类型同 log 属性即兼容，range 不同也 OK
+        let a = Distribution::FloatDistribution(FloatDistribution::new(0.0, 1.0, false, None).unwrap());
+        let b = Distribution::FloatDistribution(FloatDistribution::new(0.0, 10.0, false, None).unwrap());
+        assert!(check_distribution_compatibility(&a, &b).is_ok());
+    }
+
+    #[test]
+    fn test_compat_float_different_log() {
+        // log 不同则不兼容
+        let a = Distribution::FloatDistribution(FloatDistribution::new(0.01, 1.0, true, None).unwrap());
+        let b = Distribution::FloatDistribution(FloatDistribution::new(0.01, 1.0, false, None).unwrap());
+        assert!(check_distribution_compatibility(&a, &b).is_err());
+    }
+
+    #[test]
+    fn test_compat_float_different_step_ok() {
+        // 对齐 Python: Float 的 step 不同也兼容（Python 不检查 step）
+        let a = Distribution::FloatDistribution(FloatDistribution::new(0.0, 1.0, false, Some(0.1)).unwrap());
+        let b = Distribution::FloatDistribution(FloatDistribution::new(0.0, 1.0, false, Some(0.2)).unwrap());
+        assert!(check_distribution_compatibility(&a, &b).is_ok());
+    }
+
+    #[test]
+    fn test_compat_float_step_vs_none_ok() {
+        // 对齐 Python: step=Some vs step=None 也兼容（Python 不检查 step）
+        let a = Distribution::FloatDistribution(FloatDistribution::new(0.0, 1.0, false, Some(0.1)).unwrap());
+        let b = Distribution::FloatDistribution(FloatDistribution::new(0.0, 1.0, false, None).unwrap());
+        assert!(check_distribution_compatibility(&a, &b).is_ok());
+    }
+
+    #[test]
+    fn test_compat_int_same_log() {
+        let a = Distribution::IntDistribution(IntDistribution::new(0, 10, false, 1).unwrap());
+        let b = Distribution::IntDistribution(IntDistribution::new(0, 100, false, 1).unwrap());
+        assert!(check_distribution_compatibility(&a, &b).is_ok());
+    }
+
+    #[test]
+    fn test_compat_int_different_step_ok() {
+        // 对齐 Python: Int 的 step 不同也兼容（Python 不检查 step）
+        let a = Distribution::IntDistribution(IntDistribution::new(0, 10, false, 1).unwrap());
+        let b = Distribution::IntDistribution(IntDistribution::new(0, 10, false, 2).unwrap());
+        assert!(check_distribution_compatibility(&a, &b).is_ok());
+    }
+
+    #[test]
+    fn test_compat_int_different_log() {
+        let a = Distribution::IntDistribution(IntDistribution::new(1, 10, true, 1).unwrap());
+        let b = Distribution::IntDistribution(IntDistribution::new(1, 10, false, 1).unwrap());
+        assert!(check_distribution_compatibility(&a, &b).is_err());
+    }
+
+    #[test]
+    fn test_compat_categorical_same() {
+        let a = Distribution::CategoricalDistribution(
+            CategoricalDistribution::new(vec![CategoricalChoice::Str("a".into())]).unwrap(),
+        );
+        let b = Distribution::CategoricalDistribution(
+            CategoricalDistribution::new(vec![CategoricalChoice::Str("a".into())]).unwrap(),
+        );
+        assert!(check_distribution_compatibility(&a, &b).is_ok());
+    }
+
+    #[test]
+    fn test_compat_categorical_different() {
+        let a = Distribution::CategoricalDistribution(
+            CategoricalDistribution::new(vec![CategoricalChoice::Str("a".into())]).unwrap(),
+        );
+        let b = Distribution::CategoricalDistribution(
+            CategoricalDistribution::new(vec![CategoricalChoice::Str("b".into())]).unwrap(),
+        );
+        assert!(check_distribution_compatibility(&a, &b).is_err());
+    }
+
+    #[test]
+    fn test_compat_different_types() {
+        let a = Distribution::FloatDistribution(FloatDistribution::new(0.0, 1.0, false, None).unwrap());
+        let b = Distribution::IntDistribution(IntDistribution::new(0, 1, false, 1).unwrap());
+        assert!(check_distribution_compatibility(&a, &b).is_err());
     }
 }

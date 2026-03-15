@@ -4,6 +4,7 @@
 //! Port of Python optuna's `_ParzenEstimator`.
 
 use std::collections::HashMap;
+use std::sync::Arc;
 
 use indexmap::IndexMap;
 use rand::Rng;
@@ -14,13 +15,43 @@ use super::truncnorm;
 
 const EPS: f64 = 1e-12;
 
+/// 分类参数距离函数类型。
+/// 对应 Python `categorical_distance_func` 中的 value: (choice_a, choice_b) -> distance。
+pub type CategoricalDistanceFn = Arc<dyn Fn(&str, usize, usize) -> f64 + Send + Sync>;
+
 /// Parameters for the Parzen estimator.
-#[derive(Debug, Clone)]
 pub struct ParzenEstimatorParameters {
     pub prior_weight: f64,
     pub consider_magic_clip: bool,
     pub consider_endpoints: bool,
     pub multivariate: bool,
+    /// 分类参数距离函数映射: param_name -> distance_fn(choice_i, choice_j) -> dist。
+    /// 对应 Python `_ParzenEstimatorParameters.categorical_distance_func`。
+    pub categorical_distance_func: HashMap<String, CategoricalDistanceFn>,
+}
+
+impl std::fmt::Debug for ParzenEstimatorParameters {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ParzenEstimatorParameters")
+            .field("prior_weight", &self.prior_weight)
+            .field("consider_magic_clip", &self.consider_magic_clip)
+            .field("consider_endpoints", &self.consider_endpoints)
+            .field("multivariate", &self.multivariate)
+            .field("categorical_distance_func_keys", &self.categorical_distance_func.keys().collect::<Vec<_>>())
+            .finish()
+    }
+}
+
+impl Clone for ParzenEstimatorParameters {
+    fn clone(&self) -> Self {
+        Self {
+            prior_weight: self.prior_weight,
+            consider_magic_clip: self.consider_magic_clip,
+            consider_endpoints: self.consider_endpoints,
+            multivariate: self.multivariate,
+            categorical_distance_func: self.categorical_distance_func.clone(),
+        }
+    }
 }
 
 impl Default for ParzenEstimatorParameters {
@@ -30,6 +61,7 @@ impl Default for ParzenEstimatorParameters {
             consider_magic_clip: true,
             consider_endpoints: false,
             multivariate: false,
+            categorical_distance_func: HashMap::new(),
         }
     }
 }
@@ -116,7 +148,7 @@ impl ParzenEstimator {
             let obs = observations.get(name).cloned().unwrap_or_default();
             let kernels = match dist {
                 Distribution::CategoricalDistribution(cd) => {
-                    Self::build_categorical_kernels(&obs, cd.choices.len(), n_kernels, params)
+                    Self::build_categorical_kernels(name, &obs, cd.choices.len(), n_kernels, params)
                 }
                 Distribution::FloatDistribution(fd) => Self::build_numerical_kernels(
                     &obs,
@@ -281,6 +313,7 @@ impl ParzenEstimator {
     }
 
     fn build_categorical_kernels(
+        param_name: &str,
         obs: &[f64],
         n_choices: usize,
         n_kernels: usize,
@@ -298,11 +331,47 @@ impl ParzenEstimator {
         let base_weight = params.prior_weight / n_kernels as f64;
         let mut cat_weights = vec![vec![base_weight; n_choices]; n_kernels];
 
-        // Each observation kernel gets +1 for its observed category.
-        for (i, &v) in obs.iter().enumerate() {
-            let idx = v as usize;
-            if idx < n_choices {
-                cat_weights[i][idx] += 1.0;
+        if let Some(dist_fn) = params.categorical_distance_func.get(param_name) {
+            // 使用距离函数计算分类权重。
+            // 对应 Python `_calculate_categorical_distributions` 中 categorical_distance_func 分支。
+            // 1. 收集唯一的 observed 索引和 reverse 映射
+            let observed_indices: Vec<usize> = obs.iter().map(|&v| v as usize).collect();
+            let mut unique_indices: Vec<usize> = observed_indices.clone();
+            unique_indices.sort();
+            unique_indices.dedup();
+
+            // 2. 计算距离矩阵: unique_indices × n_choices
+            let mut dists: Vec<Vec<f64>> = Vec::with_capacity(unique_indices.len());
+            for &ui in &unique_indices {
+                let row: Vec<f64> = (0..n_choices)
+                    .map(|c| dist_fn(param_name, ui, c))
+                    .collect();
+                dists.push(row);
+            }
+
+            // 3. 归一化 + 指数衰减: coef = ln(n_kernels/prior_weight) * ln(n_choices) / ln(6)
+            let coef = (n_kernels as f64 / params.prior_weight).ln()
+                * (n_choices as f64).ln()
+                / 6.0_f64.ln();
+
+            for (i, &oi) in observed_indices.iter().enumerate() {
+                // 找到 oi 在 unique_indices 中的位置
+                let ui_pos = unique_indices.iter().position(|&u| u == oi).unwrap();
+                let row = &dists[ui_pos];
+                let max_d = row.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
+                let max_d = if max_d < 1e-14 { 1.0 } else { max_d };
+                for c in 0..n_choices {
+                    let norm_d = row[c] / max_d;
+                    cat_weights[i][c] = (-norm_d * norm_d * coef).exp();
+                }
+            }
+        } else {
+            // 默认: 每个观测 kernel 对其观测类别 +1
+            for (i, &v) in obs.iter().enumerate() {
+                let idx = v as usize;
+                if idx < n_choices {
+                    cat_weights[i][idx] += 1.0;
+                }
             }
         }
 
@@ -446,21 +515,28 @@ impl ParzenEstimator {
                     for (si, &x) in xs.iter().enumerate() {
                         for k in 0..n_kernels {
                             let lp = if let Some(st) = step {
-                                // Discrete: log probability mass in [x - step/2, x + step/2]
-                                let x_val = if *log { x.max(EPS).ln() } else { x };
-                                let st_t = if *log {
-                                    // In log space, step is approximate
-                                    st.max(EPS)
+                                // 离散分布: 计算 [x - step/2, x + step/2] 区间的概率质量
+                                if *log {
+                                    // 离散 log-normal: 原始空间 [x-step/2, x+step/2]
+                                    // 映射到 log 空间 [ln(x-step/2), ln(x+step/2)]
+                                    let a_log = (x - st / 2.0).max(EPS).ln();
+                                    let b_log = (x + st / 2.0).max(EPS).ln();
+                                    let a_norm = (a_log - mus[k]) / sigmas[k];
+                                    let b_norm = (b_log - mus[k]) / sigmas[k];
+                                    let mass = truncnorm::log_gauss_mass(a_norm, b_norm);
+                                    let total_a = (*low - mus[k]) / sigmas[k];
+                                    let total_b = (*high - mus[k]) / sigmas[k];
+                                    let total = truncnorm::log_gauss_mass(total_a, total_b);
+                                    mass - total
                                 } else {
-                                    *st
-                                };
-                                let a_norm = (x_val - st_t / 2.0 - mus[k]) / sigmas[k];
-                                let b_norm = (x_val + st_t / 2.0 - mus[k]) / sigmas[k];
-                                let mass = truncnorm::log_gauss_mass(a_norm, b_norm);
-                                let total_a = (*low - mus[k]) / sigmas[k];
-                                let total_b = (*high - mus[k]) / sigmas[k];
-                                let total = truncnorm::log_gauss_mass(total_a, total_b);
-                                mass - total
+                                    let a_norm = (x - st / 2.0 - mus[k]) / sigmas[k];
+                                    let b_norm = (x + st / 2.0 - mus[k]) / sigmas[k];
+                                    let mass = truncnorm::log_gauss_mass(a_norm, b_norm);
+                                    let total_a = (*low - mus[k]) / sigmas[k];
+                                    let total_b = (*high - mus[k]) / sigmas[k];
+                                    let total = truncnorm::log_gauss_mass(total_a, total_b);
+                                    mass - total
+                                }
                             } else {
                                 let x_val = if *log { x.max(EPS).ln() } else { x };
                                 truncnorm::logpdf(x_val, *low, *high, mus[k], sigmas[k])
@@ -519,6 +595,7 @@ impl ParzenEstimator {
 }
 
 /// Default weights function: uniform for n < 25, linear ramp + flat for n >= 25.
+/// 对齐 Python: `np.linspace(1.0/n, 1.0, num=n-25)` + `np.ones(25)`
 pub fn default_weights(n: usize) -> Vec<f64> {
     if n == 0 {
         return vec![];
@@ -528,8 +605,15 @@ pub fn default_weights(n: usize) -> Vec<f64> {
     }
     let ramp_len = n - 25;
     let mut weights = Vec::with_capacity(n);
-    for i in 0..ramp_len {
-        weights.push((i as f64 + 1.0) / n as f64);
+    // 对齐 Python np.linspace(1.0/n, 1.0, num=ramp_len)
+    if ramp_len == 1 {
+        weights.push(1.0 / n as f64);
+    } else {
+        let start = 1.0 / n as f64;
+        let step = (1.0 - start) / (ramp_len as f64 - 1.0);
+        for i in 0..ramp_len {
+            weights.push(start + step * i as f64);
+        }
     }
     weights.extend(std::iter::repeat_n(1.0, 25));
     weights
@@ -581,10 +665,18 @@ mod tests {
     fn test_default_weights_large() {
         let w = default_weights(30);
         assert_eq!(w.len(), 30);
-        // First 5 are ramp: 1/30, 2/30, 3/30, 4/30, 5/30
+        // First element: 1/30, last ramp element: 1.0 (linspace)
         assert!((w[0] - 1.0 / 30.0).abs() < 1e-10);
+        // Ramp length = 5, last ramp = w[4] = 1.0
+        assert!((w[4] - 1.0).abs() < 1e-10);
         // Last 25 are 1.0
         assert!((w[29] - 1.0).abs() < 1e-10);
+
+        // n=100: ramp = linspace(1/100, 1.0, 75), last ramp = 1.0
+        let w100 = default_weights(100);
+        assert_eq!(w100.len(), 100);
+        assert!((w100[0] - 0.01).abs() < 1e-10);
+        assert!((w100[74] - 1.0).abs() < 1e-10); // 对齐 Python: 旜坡最后一个=1.0
     }
 
     #[test]
@@ -716,5 +808,32 @@ mod tests {
     fn test_logsumexp() {
         assert!((logsumexp(&[0.0, 0.0]) - 2.0_f64.ln()).abs() < 1e-10);
         assert!((logsumexp(&[-1000.0, -1000.0]) - (-1000.0 + 2.0_f64.ln())).abs() < 1e-10);
+    }
+
+    #[test]
+    fn test_log_pdf_discrete_log_normal() {
+        // 验证离散 log-normal 分布的 log_pdf 使用 ln(x ± step/2) 而非 ln(x) ± step/2
+        // 数学性质: ln(x - s/2) ≠ ln(x) - s/2
+        // 例: x=10, s=2 → ln(9) ≈ 2.197 vs ln(10) - 1.0 ≈ 1.303
+        use crate::distributions::IntDistribution;
+        let ss = {
+            let mut m = IndexMap::new();
+            m.insert(
+                "x".to_string(),
+                Distribution::IntDistribution(
+                    IntDistribution::new(1, 100, true, 1).unwrap(),
+                ),
+            );
+            m
+        };
+        let mut obs = HashMap::new();
+        obs.insert("x".to_string(), vec![10.0, 20.0, 50.0]);
+
+        let pe = ParzenEstimator::new(&obs, &ss, &ParzenEstimatorParameters::default(), None);
+        // log_pdf 应该返回有限值（非 NaN）
+        let log_pdf_vals = pe.log_pdf(&HashMap::from([("x".to_string(), vec![10.0, 20.0, 50.0])]));
+        for &lp in &log_pdf_vals {
+            assert!(lp.is_finite(), "log_pdf 返回非有限值: {}", lp);
+        }
     }
 }

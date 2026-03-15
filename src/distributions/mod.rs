@@ -93,6 +93,68 @@ pub fn json_to_distribution(json: &str) -> Result<Distribution> {
         .map_err(|e| OptunaError::StorageInternalError(format!("JSON deserialization failed: {e}")))
 }
 
+/// 检查两个分布是否兼容。
+///
+/// 对应 Python `optuna.distributions.check_distribution_compatibility()`。
+/// 兼容规则：
+/// - 同一类型的分布（Float/Int/Categorical）兼容（允许 range 不同）
+/// - Float: log 属性必须相同，step 的 Some/None 状态必须相同
+/// - Int: log 属性必须相同，step 值必须相同
+/// - Categorical: choices 必须完全相同
+/// - 不同类型的分布不兼容
+pub fn check_distribution_compatibility(
+    dist_a: &Distribution,
+    dist_b: &Distribution,
+) -> Result<()> {
+    match (dist_a, dist_b) {
+        (Distribution::FloatDistribution(a), Distribution::FloatDistribution(b)) => {
+            if a.log != b.log {
+                return Err(OptunaError::ValueError(format!(
+                    "Cannot set different `log` values for the same parameter: {} vs {}",
+                    a.log, b.log
+                )));
+            }
+            if a.step.is_some() != b.step.is_some() {
+                return Err(OptunaError::ValueError(
+                    "Cannot use both discrete and continuous distributions for the same parameter".into()
+                ));
+            }
+            Ok(())
+        }
+        (Distribution::IntDistribution(a), Distribution::IntDistribution(b)) => {
+            if a.log != b.log {
+                return Err(OptunaError::ValueError(format!(
+                    "Cannot set different `log` values for the same parameter: {} vs {}",
+                    a.log, b.log
+                )));
+            }
+            if a.step != b.step {
+                return Err(OptunaError::ValueError(format!(
+                    "Cannot set different `step` values for the same parameter: {} vs {}",
+                    a.step, b.step
+                )));
+            }
+            Ok(())
+        }
+        (Distribution::CategoricalDistribution(a), Distribution::CategoricalDistribution(b)) => {
+            if a.choices != b.choices {
+                return Err(OptunaError::ValueError(format!(
+                    "Cannot set different `choices` for the same parameter: {:?} vs {:?}",
+                    a.choices, b.choices
+                )));
+            }
+            Ok(())
+        }
+        _ => {
+            Err(OptunaError::ValueError(format!(
+                "Cannot use different distribution types for the same parameter: {:?} vs {:?}",
+                std::mem::discriminant(dist_a),
+                std::mem::discriminant(dist_b),
+            )))
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -1,6 +1,23 @@
+mod cached;
+pub mod heartbeat;
 mod in_memory;
+pub mod journal;
+#[cfg(feature = "rdb")]
+pub mod rdb;
+#[cfg(feature = "redis-storage")]
+pub mod redis_backend;
+#[cfg(feature = "grpc")]
+pub mod grpc;
 
+pub use cached::CachedStorage;
 pub use in_memory::InMemoryStorage;
+pub use journal::{JournalBackend, JournalFileBackend, JournalFileStorage, JournalStorage};
+#[cfg(feature = "rdb")]
+pub use rdb::RdbStorage;
+#[cfg(feature = "redis-storage")]
+pub use redis_backend::JournalRedisBackend;
+#[cfg(feature = "grpc")]
+pub use grpc::{GrpcStorageProxy, run_grpc_proxy_server};
 
 use std::collections::HashMap;
 

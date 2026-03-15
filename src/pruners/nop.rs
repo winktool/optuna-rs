@@ -15,7 +15,7 @@ impl NopPruner {
 }
 
 impl Pruner for NopPruner {
-    fn prune(&self, _study_trials: &[FrozenTrial], _trial: &FrozenTrial) -> Result<bool> {
+    fn prune(&self, _study_trials: &[FrozenTrial], _trial: &FrozenTrial, _storage: Option<&dyn crate::storage::Storage>) -> Result<bool> {
         Ok(false)
     }
 }

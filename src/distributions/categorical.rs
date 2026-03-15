@@ -16,12 +16,21 @@ pub enum CategoricalChoice {
 }
 
 impl PartialEq for CategoricalChoice {
+    /// NaN-safe 比较。
+    /// 对应 Python `_categorical_choice_equal(v1, v2)`:
+    /// `math.isnan(v1) and math.isnan(v2)` → True
     fn eq(&self, other: &Self) -> bool {
         match (self, other) {
             (Self::None, Self::None) => true,
             (Self::Bool(a), Self::Bool(b)) => a == b,
             (Self::Int(a), Self::Int(b)) => a == b,
-            (Self::Float(a), Self::Float(b)) => a == b,
+            (Self::Float(a), Self::Float(b)) => {
+                // NaN == NaN → true (对应 Python 行为)
+                if a.is_nan() && b.is_nan() {
+                    return true;
+                }
+                a == b
+            }
             (Self::Str(a), Self::Str(b)) => a == b,
             _ => false,
         }
@@ -152,5 +161,86 @@ mod tests {
                 .unwrap()
                 .single()
         );
+        assert!(
+            !CategoricalDistribution::new(vec![
+                CategoricalChoice::Str("a".into()),
+                CategoricalChoice::Str("b".into()),
+            ])
+            .unwrap()
+            .single()
+        );
+    }
+
+    /// 对应 Python `_categorical_choice_equal` 中 NaN == NaN 的行为。
+    /// Python: `math.isnan(v1) and math.isnan(v2)` → True
+    #[test]
+    fn test_nan_equality() {
+        let nan1 = CategoricalChoice::Float(f64::NAN);
+        let nan2 = CategoricalChoice::Float(f64::NAN);
+        assert_eq!(nan1, nan2, "NaN should equal NaN for categorical choices");
+    }
+
+    /// NaN 在分类选项中应可被正确索引
+    #[test]
+    fn test_nan_to_internal_repr() {
+        let d = CategoricalDistribution::new(vec![
+            CategoricalChoice::Float(f64::NAN),
+            CategoricalChoice::Float(1.0),
+        ])
+        .unwrap();
+        let idx = d.to_internal_repr(&CategoricalChoice::Float(f64::NAN)).unwrap();
+        assert_eq!(idx, 0.0, "NaN should be found at index 0");
+    }
+
+    /// NaN 不应与普通浮点数相等
+    #[test]
+    fn test_nan_not_equal_to_number() {
+        assert_ne!(CategoricalChoice::Float(f64::NAN), CategoricalChoice::Float(1.0));
+        assert_ne!(CategoricalChoice::Float(f64::NAN), CategoricalChoice::Float(0.0));
+    }
+
+    /// None 选项测试
+    #[test]
+    fn test_none_choice() {
+        let d = CategoricalDistribution::new(vec![
+            CategoricalChoice::None,
+            CategoricalChoice::Str("x".into()),
+        ])
+        .unwrap();
+        let idx = d.to_internal_repr(&CategoricalChoice::None).unwrap();
+        assert_eq!(idx, 0.0);
+        let ext = d.to_external_repr(0.0).unwrap();
+        assert_eq!(ext, CategoricalChoice::None);
+    }
+
+    /// Bool 选项测试
+    #[test]
+    fn test_bool_choice() {
+        let d = CategoricalDistribution::new(vec![
+            CategoricalChoice::Bool(true),
+            CategoricalChoice::Bool(false),
+        ])
+        .unwrap();
+        assert_eq!(d.to_internal_repr(&CategoricalChoice::Bool(false)).unwrap(), 1.0);
+    }
+
+    /// to_internal_repr 找不到值时应报错
+    #[test]
+    fn test_to_internal_repr_not_found() {
+        let d = CategoricalDistribution::new(vec![
+            CategoricalChoice::Str("a".into()),
+        ])
+        .unwrap();
+        assert!(d.to_internal_repr(&CategoricalChoice::Str("z".into())).is_err());
+    }
+
+    /// to_external_repr 索引越界应报错
+    #[test]
+    fn test_to_external_repr_out_of_range() {
+        let d = CategoricalDistribution::new(vec![
+            CategoricalChoice::Int(1),
+        ])
+        .unwrap();
+        assert!(d.to_external_repr(5.0).is_err());
     }
 }

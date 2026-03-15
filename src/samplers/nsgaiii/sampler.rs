@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::sync::Arc;
 use indexmap::IndexMap;
 use parking_lot::Mutex;
 use rand::Rng;
@@ -7,13 +8,31 @@ use rand_chacha::ChaCha8Rng;
 
 use crate::distributions::Distribution;
 use crate::error::Result;
-use crate::multi_objective::fast_non_dominated_sort;
+use crate::multi_objective::{constrained_fast_non_dominated_sort, fast_non_dominated_sort};
 use crate::samplers::nsgaii::crossover::{Crossover, UniformCrossover};
 use crate::samplers::random::RandomSampler;
 use crate::samplers::Sampler;
 use crate::search_space::{IntersectionSearchSpace, SearchSpaceTransform};
 use crate::study::StudyDirection;
 use crate::trial::{FrozenTrial, TrialState};
+
+/// Type alias for constraint evaluation function.
+pub type ConstraintsFn = Arc<dyn Fn(&FrozenTrial) -> Vec<f64> + Send + Sync>;
+
+/// 精英种群选择策略。
+/// 对应 Python `NSGAIIIElitePopulationSelectionStrategy`。
+pub type EliteSelectionStrategy =
+    Arc<dyn Fn(&[FrozenTrial], &[StudyDirection], usize) -> Vec<FrozenTrial> + Send + Sync>;
+
+/// 子代生成策略。
+/// 对应 Python `NSGAIIChildGenerationStrategy`。
+pub type ChildGenerationStrategy =
+    Arc<dyn Fn(&HashMap<String, Distribution>, &[FrozenTrial]) -> HashMap<String, f64> + Send + Sync>;
+
+/// after_trial 回调策略。
+/// 对应 Python `NSGAIIAfterTrialStrategy`。
+pub type AfterTrialStrategy =
+    Arc<dyn Fn(&[FrozenTrial], &FrozenTrial, TrialState, Option<&[f64]>) + Send + Sync>;
 
 /// NSGA-III sampler for many-objective optimization.
 ///
@@ -23,11 +42,20 @@ pub struct NSGAIIISampler {
     population_size: usize,
     crossover: Box<dyn Crossover>,
     crossover_prob: f64,
+    swapping_prob: f64,
     mutation_prob: Option<f64>,
     reference_points: Vec<Vec<f64>>,
     rng: Mutex<ChaCha8Rng>,
     random_sampler: RandomSampler,
     search_space: Mutex<IntersectionSearchSpace>,
+    /// Constraints function for constrained optimization.
+    constraints_func: Option<ConstraintsFn>,
+    /// 精英种群选择策略。
+    elite_population_selection_strategy: Option<EliteSelectionStrategy>,
+    /// 子代生成策略。
+    child_generation_strategy: Option<ChildGenerationStrategy>,
+    /// after_trial 回调策略。
+    after_trial_strategy: Option<AfterTrialStrategy>,
 }
 
 impl std::fmt::Debug for NSGAIIISampler {
@@ -84,10 +112,15 @@ impl NSGAIIISampler {
         population_size: Option<usize>,
         crossover: Option<Box<dyn Crossover>>,
         crossover_prob: Option<f64>,
+        swapping_prob: Option<f64>,
         mutation_prob: Option<f64>,
         dividing_parameter: Option<usize>,
         reference_points: Option<Vec<Vec<f64>>>,
         seed: Option<u64>,
+        constraints_func: Option<ConstraintsFn>,
+        elite_population_selection_strategy: Option<EliteSelectionStrategy>,
+        child_generation_strategy: Option<ChildGenerationStrategy>,
+        after_trial_strategy: Option<AfterTrialStrategy>,
     ) -> Self {
         let n_obj = directions.len();
         let divs = dividing_parameter.unwrap_or(3);
@@ -102,13 +135,21 @@ impl NSGAIIISampler {
         Self {
             directions,
             population_size: pop_size,
-            crossover: crossover.unwrap_or_else(|| Box::new(UniformCrossover::default())),
+            crossover: crossover.unwrap_or_else(|| {
+                // 对应 Python: if crossover is None: crossover = UniformCrossover(swapping_prob)
+                Box::new(UniformCrossover::new(swapping_prob))
+            }),
             crossover_prob: crossover_prob.unwrap_or(0.9),
+            swapping_prob: swapping_prob.unwrap_or(0.5),
             mutation_prob,
             reference_points: ref_pts,
             rng: Mutex::new(rng),
             random_sampler: RandomSampler::new(seed),
             search_space: Mutex::new(IntersectionSearchSpace::new(false)),
+            constraints_func,
+            elite_population_selection_strategy,
+            child_generation_strategy,
+            after_trial_strategy,
         }
     }
 
@@ -254,7 +295,32 @@ impl Sampler for NSGAIIISampler {
             return self.random_sampler.sample_relative(trials, search_space);
         }
 
-        // Build ordered search space
+        // ── 步骤1: 精英种群选择 ──
+        // 对应 Python `select_parent()` → `self._elite_population_selection_strategy(...)`
+        let parent_trials: Vec<FrozenTrial> = if let Some(ref strategy) = self.elite_population_selection_strategy {
+            let all_trials: Vec<FrozenTrial> = complete.iter().map(|t| (*t).clone()).collect();
+            strategy(&all_trials, &self.directions, self.population_size)
+        } else {
+            // 默认: 取最后 population_size 个完成试验
+            let start = if complete.len() > self.population_size {
+                complete.len() - self.population_size
+            } else {
+                0
+            };
+            complete[start..].iter().map(|t| (*t).clone()).collect()
+        };
+
+        if parent_trials.is_empty() {
+            return self.random_sampler.sample_relative(trials, search_space);
+        }
+
+        // ── 步骤2: 子代生成 ──
+        // 对应 Python `sample_relative()` → `self._child_generation_strategy(...)`
+        if let Some(ref strategy) = self.child_generation_strategy {
+            return Ok(strategy(search_space, &parent_trials));
+        }
+
+        // 默认子代生成: tournament + crossover + mutation
         let mut ordered_space = IndexMap::new();
         let mut param_names: Vec<String> = search_space.keys().cloned().collect();
         param_names.sort();
@@ -265,17 +331,15 @@ impl Sampler for NSGAIIISampler {
         let transform = SearchSpaceTransform::new(ordered_space.clone(), true, true, true);
         let n_dims = transform.n_encoded();
 
-        // Parent generation
-        let start = if complete.len() > self.population_size {
-            complete.len() - self.population_size
-        } else {
-            0
-        };
-        let parent_gen = &complete[start..];
+        let parent_refs: Vec<&FrozenTrial> = parent_trials.iter().collect();
 
         // Non-dominated sort
-        let fronts = fast_non_dominated_sort(parent_gen, &self.directions);
-        let mut ranks = vec![0usize; parent_gen.len()];
+        let fronts = if self.constraints_func.is_some() {
+            constrained_fast_non_dominated_sort(&parent_refs, &self.directions)
+        } else {
+            fast_non_dominated_sort(&parent_refs, &self.directions)
+        };
+        let mut ranks = vec![0usize; parent_refs.len()];
         for (rank, front) in fronts.iter().enumerate() {
             for &idx in front {
                 ranks[idx] = rank;
@@ -283,23 +347,22 @@ impl Sampler for NSGAIIISampler {
         }
 
         // Normalize values and compute niche counts
-        let normalized = Self::normalize_values(parent_gen, &self.directions);
+        let normalized = Self::normalize_values(&parent_refs, &self.directions);
         let mut niche_counts = vec![0usize; self.reference_points.len()];
-        let mut trial_niches = vec![0usize; parent_gen.len()];
+        let mut trial_niches = vec![0usize; parent_refs.len()];
         for (i, nv) in normalized.iter().enumerate() {
             let niche = self.associate_to_reference_point(nv);
             trial_niches[i] = niche;
             niche_counts[niche] += 1;
         }
 
-        // Use niche counts per individual for selection
         let individual_niche_counts: Vec<usize> = trial_niches
             .iter()
             .map(|&niche| niche_counts[niche])
             .collect();
 
         // Transform parents
-        let parent_vecs: Vec<Vec<f64>> = parent_gen
+        let parent_vecs: Vec<Vec<f64>> = parent_refs
             .iter()
             .map(|t| {
                 let mut params = IndexMap::new();
@@ -368,12 +431,33 @@ impl Sampler for NSGAIIISampler {
 
     fn sample_independent(
         &self,
+        trials: &[FrozenTrial],
         trial: &FrozenTrial,
         param_name: &str,
         distribution: &Distribution,
     ) -> Result<f64> {
         self.random_sampler
-            .sample_independent(trial, param_name, distribution)
+            .sample_independent(trials, trial, param_name, distribution)
+    }
+
+    fn after_trial(
+        &self,
+        _trials: &[FrozenTrial],
+        trial: &FrozenTrial,
+        state: TrialState,
+        _values: Option<&[f64]>,
+    ) {
+        // 如果设置了自定义 after_trial_strategy，优先使用
+        if let Some(ref strategy) = self.after_trial_strategy {
+            strategy(_trials, trial, state, _values);
+            return;
+        }
+        // 默认行为: 评估约束函数
+        if let Some(ref cf) = self.constraints_func {
+            if state == TrialState::Complete || state == TrialState::Pruned {
+                let _constraints = cf(trial);
+            }
+        }
     }
 }
 
@@ -399,10 +483,15 @@ pub struct NSGAIIISamplerBuilder {
     population_size: Option<usize>,
     crossover: Option<Box<dyn Crossover>>,
     crossover_prob: Option<f64>,
+    swapping_prob: Option<f64>,
     mutation_prob: Option<f64>,
     dividing_parameter: Option<usize>,
     reference_points: Option<Vec<Vec<f64>>>,
     seed: Option<u64>,
+    constraints_func: Option<ConstraintsFn>,
+    elite_population_selection_strategy: Option<EliteSelectionStrategy>,
+    child_generation_strategy: Option<ChildGenerationStrategy>,
+    after_trial_strategy: Option<AfterTrialStrategy>,
 }
 
 impl NSGAIIISamplerBuilder {
@@ -413,10 +502,15 @@ impl NSGAIIISamplerBuilder {
             population_size: None,
             crossover: None,
             crossover_prob: None,
+            swapping_prob: None,
             mutation_prob: None,
             dividing_parameter: None,
             reference_points: None,
             seed: None,
+            constraints_func: None,
+            elite_population_selection_strategy: None,
+            child_generation_strategy: None,
+            after_trial_strategy: None,
         }
     }
 
@@ -462,6 +556,36 @@ impl NSGAIIISamplerBuilder {
         self
     }
 
+    /// Set the constraints function for constrained optimization.
+    pub fn constraints_func(mut self, func: ConstraintsFn) -> Self {
+        self.constraints_func = Some(func);
+        self
+    }
+
+    /// 设置 swapping 概率（uniform 交叉时使用）。
+    pub fn swapping_prob(mut self, prob: f64) -> Self {
+        self.swapping_prob = Some(prob);
+        self
+    }
+
+    /// 设置精英种群选择策略。
+    pub fn elite_population_selection_strategy(mut self, strategy: EliteSelectionStrategy) -> Self {
+        self.elite_population_selection_strategy = Some(strategy);
+        self
+    }
+
+    /// 设置子代生成策略。
+    pub fn child_generation_strategy(mut self, strategy: ChildGenerationStrategy) -> Self {
+        self.child_generation_strategy = Some(strategy);
+        self
+    }
+
+    /// 设置 after_trial 策略。
+    pub fn after_trial_strategy(mut self, strategy: AfterTrialStrategy) -> Self {
+        self.after_trial_strategy = Some(strategy);
+        self
+    }
+
     /// Build the [`NSGAIIISampler`].
     pub fn build(self) -> NSGAIIISampler {
         NSGAIIISampler::new(
@@ -469,10 +593,15 @@ impl NSGAIIISamplerBuilder {
             self.population_size,
             self.crossover,
             self.crossover_prob,
+            self.swapping_prob,
             self.mutation_prob,
             self.dividing_parameter,
             self.reference_points,
             self.seed,
+            self.constraints_func,
+            self.elite_population_selection_strategy,
+            self.child_generation_strategy,
+            self.after_trial_strategy,
         )
     }
 }
@@ -521,9 +650,14 @@ mod tests {
             None,
             None,
             None,
+            None,
             Some(3),
             None,
             Some(42),
+            None,
+            None,
+            None,
+            None,
         ));
 
         let study = create_study(

@@ -53,7 +53,7 @@ impl PercentilePruner {
 }
 
 impl Pruner for PercentilePruner {
-    fn prune(&self, study_trials: &[FrozenTrial], trial: &FrozenTrial) -> Result<bool> {
+    fn prune(&self, study_trials: &[FrozenTrial], trial: &FrozenTrial, _storage: Option<&dyn crate::storage::Storage>) -> Result<bool> {
         let completed: Vec<&FrozenTrial> = study_trials
             .iter()
             .filter(|t| t.state == TrialState::Complete)
@@ -76,7 +76,7 @@ impl Pruner for PercentilePruner {
             return Ok(false);
         }
 
-        if !is_first_in_interval_step(
+        if !super::is_first_in_interval_step(
             step,
             &trial.intermediate_values,
             self.n_warmup_steps,
@@ -128,6 +128,8 @@ fn get_best_intermediate_result_over_steps(trial: &FrozenTrial, direction: Study
 }
 
 /// Get the percentile of intermediate values at a given step across completed trials.
+///
+/// 对齐 Python: n_min_trials 计数包括 NaN 值，但 percentile 计算忽略 NaN。
 fn get_percentile_intermediate_result_over_trials(
     completed_trials: &[&FrozenTrial],
     direction: StudyDirection,
@@ -135,14 +137,21 @@ fn get_percentile_intermediate_result_over_trials(
     percentile: f64,
     n_min_trials: usize,
 ) -> f64 {
-    let mut values: Vec<f64> = completed_trials
+    // 收集所有试验在该 step 的中间值（包括 NaN）
+    let all_values: Vec<f64> = completed_trials
         .iter()
         .filter_map(|t| t.intermediate_values.get(&step))
         .copied()
-        .filter(|v| !v.is_nan())
         .collect();
 
-    if values.len() < n_min_trials {
+    // 对齐 Python: n_min_trials 检查在 NaN 过滤之前
+    if all_values.len() < n_min_trials {
+        return f64::NAN;
+    }
+
+    // 过滤 NaN 后排序（对应 np.nanpercentile）
+    let mut values: Vec<f64> = all_values.into_iter().filter(|v| !v.is_nan()).collect();
+    if values.is_empty() {
         return f64::NAN;
     }
 
@@ -178,25 +187,7 @@ fn nan_percentile(sorted: &[f64], p: f64) -> f64 {
     }
 }
 
-/// Check if this step is the first reported step at or after a pruning checkpoint.
-fn is_first_in_interval_step(
-    step: i64,
-    intermediate_values: &std::collections::HashMap<i64, f64>,
-    n_warmup_steps: i64,
-    interval_steps: i64,
-) -> bool {
-    let nearest_lower_pruning_step =
-        (step - n_warmup_steps) / interval_steps * interval_steps + n_warmup_steps;
-
-    let second_last_step = intermediate_values
-        .keys()
-        .filter(|&&s| s < step)
-        .max()
-        .copied()
-        .unwrap_or(-1);
-
-    second_last_step < nearest_lower_pruning_step
-}
+// is_first_in_interval_step 已移至 pruners/mod.rs 作为模块共享函数
 
 #[cfg(test)]
 mod tests {
@@ -251,7 +242,7 @@ mod tests {
             make_complete_trial(1, vec![(0, 2.0)]),
         ];
         let trial = make_running_trial(2, vec![(0, 100.0)]);
-        assert!(!pruner.prune(&completed, &trial).unwrap());
+        assert!(!pruner.prune(&completed, &trial, None).unwrap());
     }
 
     #[test]
@@ -262,7 +253,7 @@ mod tests {
             make_complete_trial(1, vec![(0, 2.0)]),
         ];
         let trial = make_running_trial(2, vec![(2, 100.0)]);
-        assert!(!pruner.prune(&completed, &trial).unwrap());
+        assert!(!pruner.prune(&completed, &trial, None).unwrap());
     }
 
     #[test]
@@ -275,7 +266,7 @@ mod tests {
         ];
         // Trial with very high value should be pruned (minimize)
         let trial = make_running_trial(3, vec![(0, 100.0)]);
-        assert!(pruner.prune(&completed, &trial).unwrap());
+        assert!(pruner.prune(&completed, &trial, None).unwrap());
     }
 
     #[test]
@@ -288,7 +279,7 @@ mod tests {
         ];
         // Trial with low value should be kept (minimize)
         let trial = make_running_trial(3, vec![(0, 0.5)]);
-        assert!(!pruner.prune(&completed, &trial).unwrap());
+        assert!(!pruner.prune(&completed, &trial, None).unwrap());
     }
 
     #[test]
@@ -301,7 +292,7 @@ mod tests {
         ];
         // Trial with low value should be pruned (maximize)
         let trial = make_running_trial(3, vec![(0, 1.0)]);
-        assert!(pruner.prune(&completed, &trial).unwrap());
+        assert!(pruner.prune(&completed, &trial, None).unwrap());
     }
 
     #[test]
@@ -309,7 +300,7 @@ mod tests {
         let pruner = PercentilePruner::new(50.0, 0, 0, 1, 1, StudyDirection::Minimize);
         let completed = vec![make_complete_trial(0, vec![(0, 1.0)])];
         let trial = make_running_trial(1, vec![]);
-        assert!(!pruner.prune(&completed, &trial).unwrap());
+        assert!(!pruner.prune(&completed, &trial, None).unwrap());
     }
 
     #[test]
@@ -321,7 +312,7 @@ mod tests {
             make_complete_trial(1, vec![(0, 2.0)]),
         ];
         let trial = make_running_trial(2, vec![(0, 100.0)]);
-        assert!(!pruner.prune(&completed, &trial).unwrap());
+        assert!(!pruner.prune(&completed, &trial, None).unwrap());
     }
 
     #[test]
@@ -333,12 +324,12 @@ mod tests {
         // Step 1 is not at an interval boundary (interval=3, warmup=0)
         // The first pruning steps are at 0, 3, 6, ...
         let trial_at_step_1 = make_running_trial(1, vec![(0, 100.0), (1, 100.0)]);
-        assert!(!pruner.prune(&completed, &trial_at_step_1).unwrap());
+        assert!(!pruner.prune(&completed, &trial_at_step_1, None).unwrap());
 
         // Step 3 IS at an interval boundary
         let trial_at_step_3 =
             make_running_trial(1, vec![(0, 100.0), (1, 100.0), (2, 100.0), (3, 100.0)]);
-        assert!(pruner.prune(&completed, &trial_at_step_3).unwrap());
+        assert!(pruner.prune(&completed, &trial_at_step_3, None).unwrap());
     }
 
     #[test]

@@ -1,20 +1,25 @@
 mod brute_force;
 mod cmaes;
+pub mod ga;
+pub(crate) mod gp;
+#[cfg(feature = "gp-lbfgsb")]
+pub mod gp_lbfgsb;
 mod grid;
 pub mod nsgaii;
 pub mod nsgaiii;
 mod partial_fixed;
-mod qmc;
+pub mod qmc;
 pub(crate) mod random;
 mod tpe;
 
 pub use brute_force::BruteForceSampler;
 pub use cmaes::{CmaEsSampler, CmaEsSamplerBuilder};
+pub use gp::GpSampler;
 pub use grid::GridSampler;
 pub use nsgaii::{NSGAIISampler, NSGAIISamplerBuilder};
 pub use nsgaiii::{NSGAIIISampler, NSGAIIISamplerBuilder};
 pub use partial_fixed::PartialFixedSampler;
-pub use qmc::QmcSampler;
+pub use qmc::{QmcSampler, QmcType};
 pub use random::RandomSampler;
 pub use tpe::{TpeSampler, TpeSamplerBuilder};
 
@@ -53,8 +58,12 @@ pub trait Sampler: Send + Sync {
     }
 
     /// Sample a single parameter independently.
+    ///
+    /// 对齐 Python `BaseSampler.sample_independent(study, trial, param_name, param_distribution)`。
+    /// `trials` 为当前 study 的所有历史试验，用于基于历史信息的采样（如 TPE）。
     fn sample_independent(
         &self,
+        trials: &[FrozenTrial],
         trial: &FrozenTrial,
         param_name: &str,
         distribution: &Distribution,

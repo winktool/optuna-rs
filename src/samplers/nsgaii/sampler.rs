@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::sync::Arc;
 use indexmap::IndexMap;
 use parking_lot::Mutex;
 use rand::Rng;
@@ -7,7 +8,9 @@ use rand_chacha::ChaCha8Rng;
 
 use crate::distributions::Distribution;
 use crate::error::Result;
-use crate::multi_objective::{crowding_distance, fast_non_dominated_sort};
+use crate::multi_objective::{
+    constrained_fast_non_dominated_sort, crowding_distance, fast_non_dominated_sort,
+};
 use crate::samplers::random::RandomSampler;
 use crate::samplers::Sampler;
 use crate::search_space::{IntersectionSearchSpace, SearchSpaceTransform};
@@ -15,6 +18,23 @@ use crate::study::StudyDirection;
 use crate::trial::{FrozenTrial, TrialState};
 
 use super::crossover::{Crossover, UniformCrossover};
+
+/// Type alias for constraint evaluation function.
+pub type ConstraintsFn = Arc<dyn Fn(&FrozenTrial) -> Vec<f64> + Send + Sync>;
+
+/// Type alias for elite population selection strategy.
+pub type EliteSelectionStrategy =
+    Arc<dyn Fn(&[FrozenTrial], &[StudyDirection], usize) -> Vec<FrozenTrial> + Send + Sync>;
+
+/// Type alias for child generation strategy.
+pub type ChildGenerationStrategy =
+    Arc<dyn Fn(&HashMap<String, Distribution>, &[FrozenTrial]) -> HashMap<String, f64> + Send + Sync>;
+
+/// after_trial 回调策略。
+/// 对应 Python `NSGAIIAfterTrialStrategy`。
+/// 参数: (trials, trial, state, values)
+pub type AfterTrialStrategy =
+    Arc<dyn Fn(&[FrozenTrial], &FrozenTrial, TrialState, Option<&[f64]>) + Send + Sync>;
 
 /// NSGA-II sampler for multi-objective optimization.
 ///
@@ -24,10 +44,20 @@ pub struct NSGAIISampler {
     population_size: usize,
     crossover: Box<dyn Crossover>,
     crossover_prob: f64,
+    swapping_prob: f64,
     mutation_prob: Option<f64>,
     rng: Mutex<ChaCha8Rng>,
     random_sampler: RandomSampler,
     search_space: Mutex<IntersectionSearchSpace>,
+    /// Constraints function for constrained optimization.
+    constraints_func: Option<ConstraintsFn>,
+    /// Custom elite population selection strategy.
+    elite_population_selection_strategy: Option<EliteSelectionStrategy>,
+    /// Custom child generation strategy.
+    child_generation_strategy: Option<ChildGenerationStrategy>,
+    /// Custom after-trial strategy.
+    /// 对应 Python `after_trial_strategy` 参数。
+    after_trial_strategy: Option<AfterTrialStrategy>,
 }
 
 impl std::fmt::Debug for NSGAIISampler {
@@ -40,13 +70,19 @@ impl std::fmt::Debug for NSGAIISampler {
 }
 
 impl NSGAIISampler {
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         directions: Vec<StudyDirection>,
         population_size: Option<usize>,
         crossover: Option<Box<dyn Crossover>>,
         crossover_prob: Option<f64>,
+        swapping_prob: Option<f64>,
         mutation_prob: Option<f64>,
         seed: Option<u64>,
+        constraints_func: Option<ConstraintsFn>,
+        elite_population_selection_strategy: Option<EliteSelectionStrategy>,
+        child_generation_strategy: Option<ChildGenerationStrategy>,
+        after_trial_strategy: Option<AfterTrialStrategy>,
     ) -> Self {
         let rng = match seed {
             Some(s) => ChaCha8Rng::seed_from_u64(s),
@@ -55,12 +91,20 @@ impl NSGAIISampler {
         Self {
             directions,
             population_size: population_size.unwrap_or(50),
-            crossover: crossover.unwrap_or_else(|| Box::new(UniformCrossover::default())),
+            crossover: crossover.unwrap_or_else(|| {
+                // 对应 Python: if crossover is None: crossover = UniformCrossover(swapping_prob)
+                Box::new(UniformCrossover::new(swapping_prob))
+            }),
             crossover_prob: crossover_prob.unwrap_or(0.9),
+            swapping_prob: swapping_prob.unwrap_or(0.5),
             mutation_prob,
             rng: Mutex::new(rng),
             random_sampler: RandomSampler::new(seed),
             search_space: Mutex::new(IntersectionSearchSpace::new(false)),
+            constraints_func,
+            elite_population_selection_strategy,
+            child_generation_strategy,
+            after_trial_strategy,
         }
     }
 
@@ -127,7 +171,34 @@ impl Sampler for NSGAIISampler {
             return self.random_sampler.sample_relative(trials, search_space);
         }
 
-        // Build ordered search space for transform
+        // ── 步骤1: 精英种群选择 ──
+        // 对应 Python `select_parent()` → `self._elite_population_selection_strategy(...)`
+        let parent_trials: Vec<FrozenTrial> = if let Some(ref strategy) = self.elite_population_selection_strategy {
+            // 使用自定义精英选择策略
+            let all_trials: Vec<FrozenTrial> = complete.iter().map(|t| (*t).clone()).collect();
+            strategy(&all_trials, &self.directions, self.population_size)
+        } else {
+            // 默认: 取最后 population_size 个完成试验，NSGA-II 非支配排序 + 拥挤距离
+            let start = if complete.len() > self.population_size {
+                complete.len() - self.population_size
+            } else {
+                0
+            };
+            complete[start..].iter().map(|t| (*t).clone()).collect()
+        };
+
+        if parent_trials.is_empty() {
+            return self.random_sampler.sample_relative(trials, search_space);
+        }
+
+        // ── 步骤2: 子代生成 ──
+        // 对应 Python `sample_relative()` → `self._child_generation_strategy(...)`
+        if let Some(ref strategy) = self.child_generation_strategy {
+            // 使用自定义子代生成策略
+            return Ok(strategy(search_space, &parent_trials));
+        }
+
+        // 默认子代生成: tournament + crossover + mutation
         let mut ordered_space = IndexMap::new();
         let mut param_names: Vec<String> = search_space.keys().cloned().collect();
         param_names.sort();
@@ -138,22 +209,19 @@ impl Sampler for NSGAIISampler {
         let transform = SearchSpaceTransform::new(ordered_space.clone(), true, true, true);
         let n_dims = transform.n_encoded();
 
-        // Get the last `population_size` complete trials as the parent generation
-        let start = if complete.len() > self.population_size {
-            complete.len() - self.population_size
+        let parent_refs: Vec<&FrozenTrial> = parent_trials.iter().collect();
+
+        // Non-dominated sort + crowding distance
+        let fronts = if self.constraints_func.is_some() {
+            constrained_fast_non_dominated_sort(&parent_refs, &self.directions)
         } else {
-            0
+            fast_non_dominated_sort(&parent_refs, &self.directions)
         };
-        let parent_gen = &complete[start..];
+        let ranks = Self::compute_ranks(&fronts, parent_refs.len());
 
-        // Non-dominated sort + crowding distance on parent generation
-        let fronts = fast_non_dominated_sort(parent_gen, &self.directions);
-        let ranks = Self::compute_ranks(&fronts, parent_gen.len());
-
-        // Compute crowding distance per front
-        let mut crowd_dist = vec![0.0_f64; parent_gen.len()];
+        let mut crowd_dist = vec![0.0_f64; parent_refs.len()];
         for front in &fronts {
-            let front_trials: Vec<&FrozenTrial> = front.iter().map(|&i| parent_gen[i]).collect();
+            let front_trials: Vec<&FrozenTrial> = front.iter().map(|&i| parent_refs[i]).collect();
             let front_cd = crowding_distance(&front_trials, &self.directions);
             for (fi, &idx) in front.iter().enumerate() {
                 crowd_dist[idx] = front_cd[fi];
@@ -161,7 +229,7 @@ impl Sampler for NSGAIISampler {
         }
 
         // Transform parent params to [0,1] space
-        let parent_vecs: Vec<Vec<f64>> = parent_gen
+        let parent_vecs: Vec<Vec<f64>> = parent_refs
             .iter()
             .map(|t| {
                 let mut params = IndexMap::new();
@@ -170,7 +238,6 @@ impl Sampler for NSGAIISampler {
                         params.insert(name.clone(), pv.clone());
                     }
                 }
-                // If trial doesn't have all params, fill with 0.5
                 if params.len() == ordered_space.len() {
                     transform.transform(&params)
                 } else {
@@ -232,12 +299,33 @@ impl Sampler for NSGAIISampler {
 
     fn sample_independent(
         &self,
+        trials: &[FrozenTrial],
         trial: &FrozenTrial,
         param_name: &str,
         distribution: &Distribution,
     ) -> Result<f64> {
         self.random_sampler
-            .sample_independent(trial, param_name, distribution)
+            .sample_independent(trials, trial, param_name, distribution)
+    }
+
+    fn after_trial(
+        &self,
+        _trials: &[FrozenTrial],
+        trial: &FrozenTrial,
+        state: TrialState,
+        _values: Option<&[f64]>,
+    ) {
+        // 如果设置了自定义 after_trial_strategy，优先使用
+        if let Some(ref strategy) = self.after_trial_strategy {
+            strategy(_trials, trial, state, _values);
+            return;
+        }
+        // 默认行为: 评估约束函数
+        if let Some(ref cf) = self.constraints_func {
+            if state == TrialState::Complete || state == TrialState::Pruned {
+                let _constraints = cf(trial);
+            }
+        }
     }
 }
 
@@ -261,8 +349,13 @@ pub struct NSGAIISamplerBuilder {
     population_size: Option<usize>,
     crossover: Option<Box<dyn Crossover>>,
     crossover_prob: Option<f64>,
+    swapping_prob: Option<f64>,
     mutation_prob: Option<f64>,
     seed: Option<u64>,
+    constraints_func: Option<ConstraintsFn>,
+    elite_population_selection_strategy: Option<EliteSelectionStrategy>,
+    child_generation_strategy: Option<ChildGenerationStrategy>,
+    after_trial_strategy: Option<AfterTrialStrategy>,
 }
 
 impl NSGAIISamplerBuilder {
@@ -273,8 +366,13 @@ impl NSGAIISamplerBuilder {
             population_size: None,
             crossover: None,
             crossover_prob: None,
+            swapping_prob: None,
             mutation_prob: None,
             seed: None,
+            constraints_func: None,
+            elite_population_selection_strategy: None,
+            child_generation_strategy: None,
+            after_trial_strategy: None,
         }
     }
 
@@ -296,6 +394,12 @@ impl NSGAIISamplerBuilder {
         self
     }
 
+    /// Set the swapping probability for uniform crossover.
+    pub fn swapping_prob(mut self, prob: f64) -> Self {
+        self.swapping_prob = Some(prob);
+        self
+    }
+
     /// Set the mutation probability.
     pub fn mutation_prob(mut self, prob: f64) -> Self {
         self.mutation_prob = Some(prob);
@@ -308,6 +412,31 @@ impl NSGAIISamplerBuilder {
         self
     }
 
+    /// Set the constraints function for constrained optimization.
+    pub fn constraints_func(mut self, func: ConstraintsFn) -> Self {
+        self.constraints_func = Some(func);
+        self
+    }
+
+    /// Set a custom elite population selection strategy.
+    pub fn elite_population_selection_strategy(mut self, strategy: EliteSelectionStrategy) -> Self {
+        self.elite_population_selection_strategy = Some(strategy);
+        self
+    }
+
+    /// Set a custom child generation strategy.
+    pub fn child_generation_strategy(mut self, strategy: ChildGenerationStrategy) -> Self {
+        self.child_generation_strategy = Some(strategy);
+        self
+    }
+
+    /// 设置自定义 after_trial 策略。
+    /// 对应 Python `after_trial_strategy` 参数。
+    pub fn after_trial_strategy(mut self, strategy: AfterTrialStrategy) -> Self {
+        self.after_trial_strategy = Some(strategy);
+        self
+    }
+
     /// Build the [`NSGAIISampler`].
     pub fn build(self) -> NSGAIISampler {
         NSGAIISampler::new(
@@ -315,8 +444,13 @@ impl NSGAIISamplerBuilder {
             self.population_size,
             self.crossover,
             self.crossover_prob,
+            self.swapping_prob,
             self.mutation_prob,
             self.seed,
+            self.constraints_func,
+            self.elite_population_selection_strategy,
+            self.child_generation_strategy,
+            self.after_trial_strategy,
         )
     }
 }
@@ -335,7 +469,12 @@ mod tests {
             None,
             None,
             None,
+            None,
             Some(42),
+            None,
+            None,
+            None,
+            None,
         );
         assert_eq!(sampler.population_size, 10);
         assert!((sampler.crossover_prob - 0.9).abs() < 1e-10);
@@ -349,7 +488,12 @@ mod tests {
             None,
             None,
             None,
+            None,
             Some(42),
+            None,
+            None,
+            None,
+            None,
         ));
 
         let study = create_study(
@@ -389,7 +533,12 @@ mod tests {
             None,
             None,
             None,
+            None,
             Some(42),
+            None,
+            None,
+            None,
+            None,
         ));
 
         let study = create_study(

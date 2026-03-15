@@ -93,6 +93,10 @@ impl FixedTrial {
     }
 
     /// Core suggest logic: look up the fixed value and validate it.
+    ///
+    /// 对齐 Python FixedTrial._suggest():
+    /// - 值越界时发出 warning 但仍然返回该值（不报错）
+    /// - 重复 suggest 同名参数时检查分布兼容性
     fn suggest(&mut self, name: &str, dist: &Distribution) -> Result<ParamValue> {
         let value = self
             .params
@@ -104,11 +108,18 @@ impl FixedTrial {
             })?
             .clone();
 
+        // 对齐 Python: 值越界时仅 warn 不报错
         let internal = dist.to_internal_repr(&value)?;
         if !dist.contains(internal) {
-            return Err(OptunaError::ValueError(format!(
-                "fixed param '{name}' value is out of the distribution range"
-            )));
+            crate::optuna_warn!(
+                "Fixed param '{}' value is out of the distribution range.",
+                name
+            );
+        }
+
+        // 对齐 Python: 重复 suggest 时检查分布兼容性
+        if let Some(existing_dist) = self.distributions.get(name) {
+            crate::distributions::check_distribution_compatibility(existing_dist, dist)?;
         }
 
         self.suggested_params.insert(name.to_string(), value.clone());
@@ -210,15 +221,62 @@ mod tests {
 
     #[test]
     fn test_out_of_range() {
+        // 对齐 Python: 值越界时不报错，只 warn，仍然返回该值
         let mut params = HashMap::new();
         params.insert("x".into(), ParamValue::Float(2.0));
         let mut trial = FixedTrial::new(params, 0);
-        assert!(trial.suggest_float("x", 0.0, 1.0, false, None).is_err());
+        let result = trial.suggest_float("x", 0.0, 1.0, false, None);
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap(), 2.0); // 返回越界的值
     }
 
     #[test]
     fn test_should_prune_always_false() {
         let trial = FixedTrial::new(HashMap::new(), 0);
         assert!(!trial.should_prune());
+    }
+
+    #[test]
+    fn test_distribution_compatibility_check() {
+        // 重复 suggest 同名参数但分布兼容（同类型不同范围 ok）
+        let mut params = HashMap::new();
+        params.insert("x".into(), ParamValue::Float(0.5));
+        let mut trial = FixedTrial::new(params, 0);
+        assert!(trial.suggest_float("x", 0.0, 1.0, false, None).is_ok());
+        // 再次 suggest 同名参数，不同 range 但同 type/log/step → 兼容
+        assert!(trial.suggest_float("x", 0.0, 2.0, false, None).is_ok());
+        // 不兼容：不同 log 设置
+        let result = trial.suggest_float("x", 0.0, 1.0, true, None);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_suggest_int_out_of_range_warns() {
+        let mut params = HashMap::new();
+        params.insert("n".into(), ParamValue::Int(20));
+        let mut trial = FixedTrial::new(params, 0);
+        // 越界只 warn 不报错
+        let result = trial.suggest_int("n", 1, 10, false, 1);
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap(), 20);
+    }
+
+    #[test]
+    fn test_report_noop() {
+        let trial = FixedTrial::new(HashMap::new(), 0);
+        trial.report(1.0, 0); // 不应 panic
+    }
+
+    #[test]
+    fn test_set_user_attr() {
+        let mut trial = FixedTrial::new(HashMap::new(), 0);
+        trial.set_user_attr("key".into(), serde_json::json!(42));
+        assert_eq!(trial.user_attrs()["key"], serde_json::json!(42));
+    }
+
+    #[test]
+    fn test_number() {
+        let trial = FixedTrial::new(HashMap::new(), 7);
+        assert_eq!(trial.number(), 7);
     }
 }

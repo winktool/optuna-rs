@@ -373,12 +373,12 @@ impl Storage for InMemoryStorage {
         let study = Self::get_study(&inner, study_id)?;
         let trial = &study.trials[trial_number as usize];
 
-        // Silently reject Running on non-Waiting trials
+        // 对齐 Python: 先检查是否已完成（报错），再检查 RUNNING→非WAITING（返回 false）
+        Self::check_updatable(trial)?;
+
         if state == TrialState::Running && trial.state != TrialState::Waiting {
             return Ok(false);
         }
-
-        Self::check_updatable(trial)?;
 
         let study = Self::get_study_mut(&mut inner, study_id)?;
         let trial = &mut study.trials[trial_number as usize];

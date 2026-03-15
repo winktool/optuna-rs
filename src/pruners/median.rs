@@ -50,8 +50,9 @@ impl crate::pruners::Pruner for MedianPruner {
         &self,
         study_trials: &[crate::trial::FrozenTrial],
         trial: &crate::trial::FrozenTrial,
+        storage: Option<&dyn crate::storage::Storage>,
     ) -> crate::error::Result<bool> {
-        self.inner.prune(study_trials, trial)
+        self.inner.prune(study_trials, trial, storage)
     }
 }
 
@@ -97,11 +98,11 @@ mod tests {
         ];
         // Trial worse than median (2.0): should prune
         let bad = make_trial(3, TrialState::Running, vec![(0, 10.0)]);
-        assert!(pruner.prune(&completed, &bad).unwrap());
+        assert!(pruner.prune(&completed, &bad, None).unwrap());
 
         // Trial better than median: should keep
         let good = make_trial(3, TrialState::Running, vec![(0, 0.5)]);
-        assert!(!pruner.prune(&completed, &good).unwrap());
+        assert!(!pruner.prune(&completed, &good, None).unwrap());
     }
 
     #[test]
@@ -114,6 +115,6 @@ mod tests {
         ];
         let trial = make_trial(2, TrialState::Running, vec![(0, 100.0)]);
         // Only 2 completed trials < 5 startup, so no pruning
-        assert!(!pruner.prune(&completed, &trial).unwrap());
+        assert!(!pruner.prune(&completed, &trial, None).unwrap());
     }
 }

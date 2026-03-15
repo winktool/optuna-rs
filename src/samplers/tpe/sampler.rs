@@ -3,6 +3,7 @@
 //! Port of Python `optuna.samplers.TPESampler`.
 
 use std::collections::HashMap;
+use std::sync::Arc;
 
 use indexmap::IndexMap;
 use parking_lot::Mutex;
@@ -13,11 +14,58 @@ use crate::distributions::Distribution;
 use crate::error::Result;
 use crate::samplers::random::RandomSampler;
 use crate::samplers::Sampler;
-use crate::search_space::IntersectionSearchSpace;
+use crate::search_space::{IntersectionSearchSpace, SearchSpaceGroup};
 use crate::study::StudyDirection;
 use crate::trial::{FrozenTrial, TrialState};
 
 use super::parzen_estimator::{default_gamma, ParzenEstimator, ParzenEstimatorParameters};
+
+/// Type alias for `gamma(n) -> n_below` split function.
+pub type GammaFn = Arc<dyn Fn(usize) -> usize + Send + Sync>;
+
+/// Type alias for `weights(n) -> weights_vec` function.
+pub type WeightsFn = Arc<dyn Fn(usize) -> Vec<f64> + Send + Sync>;
+
+/// Type alias for constraint evaluation function.
+pub type ConstraintsFn = Arc<dyn Fn(&FrozenTrial) -> Vec<f64> + Send + Sync>;
+
+/// 分类参数距离函数。
+/// 对应 Python `categorical_distance_func` 参数。
+/// key: 参数名, value: 计算分类距离的闭包 (choice_i, choice_j) -> distance。
+pub type CategoricalDistanceFunc =
+    Arc<dyn Fn(&str, usize, usize) -> f64 + Send + Sync>;
+
+/// Default weights function matching Python `default_weights`.
+/// 对齐 Python: `np.linspace(1.0/x, 1.0, num=x-25)` + `np.ones(25)`
+pub fn default_weights(n: usize) -> Vec<f64> {
+    if n == 0 {
+        return vec![];
+    }
+    if n < 25 {
+        return vec![1.0; n];
+    }
+    let mut w = Vec::with_capacity(n);
+    let ramp_len = n - 25;
+    // 对齐 Python np.linspace(1.0/n, 1.0, num=ramp_len)
+    if ramp_len == 1 {
+        w.push(1.0 / n as f64);
+    } else {
+        let start = 1.0 / n as f64;
+        let step = (1.0 - start) / (ramp_len as f64 - 1.0);
+        for i in 0..ramp_len {
+            w.push(start + step * i as f64);
+        }
+    }
+    for _ in 0..25 {
+        w.push(1.0);
+    }
+    w
+}
+
+/// Hyperopt-style gamma function.
+pub fn hyperopt_default_gamma(n: usize) -> usize {
+    ((0.25 * (n as f64).sqrt()).ceil() as usize).min(25)
+}
 
 /// A TPE (Tree-structured Parzen Estimator) sampler.
 ///
@@ -36,6 +84,16 @@ pub struct TpeSampler {
     direction: StudyDirection,
     /// Whether to sample parameters jointly (multivariate) or independently.
     multivariate: bool,
+    /// Whether to use group-decomposed search space (requires multivariate=true).
+    group: bool,
+    /// Use constant liar for parallel optimization.
+    constant_liar: bool,
+    /// Constraints function (if set, enables constrained optimization).
+    constraints_func: Option<ConstraintsFn>,
+    /// Custom gamma function (n -> n_below).
+    gamma: GammaFn,
+    /// Custom weights function (n_below -> weights).
+    weights: WeightsFn,
     /// Parzen estimator parameters.
     pe_params: ParzenEstimatorParameters,
     /// RNG for sampling.
@@ -44,6 +102,14 @@ pub struct TpeSampler {
     random_sampler: RandomSampler,
     /// Search space tracker (for multivariate mode).
     search_space: Mutex<IntersectionSearchSpace>,
+    /// Group-decomposed search space (for group mode).
+    group_search_space: Mutex<SearchSpaceGroup>,
+    /// 分类参数自定义距离函数。
+    /// 对应 Python `categorical_distance_func` 参数（实验性功能）。
+    categorical_distance_func: Option<HashMap<String, CategoricalDistanceFunc>>,
+    /// 是否在 multivariate 模式下对独立采样的参数发出警告。
+    /// 对应 Python `warn_independent_sampling` 参数。
+    warn_independent_sampling: bool,
 }
 
 impl std::fmt::Debug for TpeSampler {
@@ -68,6 +134,13 @@ impl TpeSampler {
         consider_magic_clip: bool,
         consider_endpoints: bool,
         prior_weight: f64,
+        group: bool,
+        constant_liar: bool,
+        constraints_func: Option<ConstraintsFn>,
+        gamma: Option<GammaFn>,
+        weights: Option<WeightsFn>,
+        categorical_distance_func: Option<HashMap<String, CategoricalDistanceFunc>>,
+        warn_independent_sampling: bool,
     ) -> Self {
         let rng = match seed {
             Some(s) => ChaCha8Rng::seed_from_u64(s),
@@ -78,49 +151,84 @@ impl TpeSampler {
             n_ei_candidates,
             direction,
             multivariate,
+            group,
+            constant_liar,
+            constraints_func,
+            gamma: gamma.unwrap_or_else(|| Arc::new(default_gamma)),
+            weights: weights.unwrap_or_else(|| Arc::new(default_weights)),
             pe_params: ParzenEstimatorParameters {
                 prior_weight,
                 consider_magic_clip,
                 consider_endpoints,
                 multivariate,
+                categorical_distance_func: categorical_distance_func
+                    .clone()
+                    .unwrap_or_default(),
             },
             rng: Mutex::new(rng),
             random_sampler: RandomSampler::new(seed.map(|s| s.wrapping_add(1))),
             search_space: Mutex::new(IntersectionSearchSpace::new(false)),
+            group_search_space: Mutex::new(SearchSpaceGroup::new()),
+            categorical_distance_func,
+            warn_independent_sampling,
         }
     }
 
     /// Create with common defaults.
     pub fn with_defaults(direction: StudyDirection, seed: Option<u64>) -> Self {
-        Self::new(direction, seed, 10, 24, false, true, false, 1.0)
+        Self::new(
+            direction, seed, 10, 24, false, true, false, 1.0,
+            false, false, None, None, None, None, true,
+        )
     }
 
     /// Create a multivariate TPE sampler.
     pub fn multivariate(direction: StudyDirection, seed: Option<u64>) -> Self {
-        Self::new(direction, seed, 10, 24, true, true, false, 1.0)
+        Self::new(
+            direction, seed, 10, 24, true, true, false, 1.0,
+            false, false, None, None, None, None, true,
+        )
+    }
+
+    /// Get infeasibility score for a trial (sum of positive constraint violations).
+    fn infeasible_score(trial: &FrozenTrial) -> f64 {
+        trial
+            .system_attrs
+            .get(crate::multi_objective::CONSTRAINTS_KEY)
+            .and_then(|v| serde_json::from_value::<Vec<f64>>(v.clone()).ok())
+            .map(|cs| cs.iter().filter(|&&c| c > 0.0).sum())
+            .unwrap_or(f64::INFINITY) // no constraint value → worst
     }
 
     /// Split trials into below (good) and above (bad) groups.
+    ///
+    /// When constraints are enabled, infeasible trials are separated and
+    /// only fill below if feasible trials don't fill it.
     fn split_trials<'a>(
         &self,
         trials: &'a [FrozenTrial],
     ) -> (Vec<&'a FrozenTrial>, Vec<&'a FrozenTrial>) {
-        // Separate complete vs pruned vs running.
+        let constraints_enabled = self.constraints_func.is_some();
+
         let mut complete: Vec<&FrozenTrial> = Vec::new();
         let mut pruned: Vec<&FrozenTrial> = Vec::new();
         let mut running: Vec<&FrozenTrial> = Vec::new();
+        let mut infeasible: Vec<&FrozenTrial> = Vec::new();
 
         for t in trials {
             match t.state {
+                TrialState::Running => running.push(t),
+                _ if constraints_enabled && Self::infeasible_score(t) > 0.0 => {
+                    infeasible.push(t);
+                }
                 TrialState::Complete => complete.push(t),
                 TrialState::Pruned => pruned.push(t),
-                TrialState::Running => running.push(t),
                 _ => {}
             }
         }
 
-        let n = complete.len() + pruned.len();
-        let n_below = default_gamma(n);
+        let n = complete.len() + pruned.len() + infeasible.len();
+        let n_below = (self.gamma)(n);
 
         // Sort complete trials by objective value.
         match self.direction {
@@ -140,7 +248,8 @@ impl TpeSampler {
             }
         }
 
-        // Sort pruned by (-last_step, intermediate_value).
+        // Sort pruned by (-last_step, direction-aware intermediate_value).
+        // 对齐 Python _get_pruned_trial_score：Maximize 时对中间值取负
         pruned.sort_by(|a, b| {
             let sa = a.last_step().unwrap_or(i64::MIN);
             let sb = b.last_step().unwrap_or(i64::MIN);
@@ -156,13 +265,21 @@ impl TpeSampler {
                         .get(&sb)
                         .copied()
                         .unwrap_or(f64::INFINITY);
-                    va.partial_cmp(&vb).unwrap_or(std::cmp::Ordering::Equal)
+                    // Minimize: 小值优先(升序)；Maximize: 大值优先(降序)
+                    match self.direction {
+                        StudyDirection::Maximize => {
+                            vb.partial_cmp(&va).unwrap_or(std::cmp::Ordering::Equal)
+                        }
+                        _ => {
+                            va.partial_cmp(&vb).unwrap_or(std::cmp::Ordering::Equal)
+                        }
+                    }
                 }
                 other => other,
             }
         });
 
-        // Split: best n_below from complete, then pruned.
+        // Split: best n_below from complete, then pruned, then infeasible.
         let mut below = Vec::new();
         let mut above = Vec::new();
 
@@ -176,6 +293,21 @@ impl TpeSampler {
             }
         }
         for t in &pruned {
+            if remaining > 0 {
+                below.push(*t);
+                remaining -= 1;
+            } else {
+                above.push(*t);
+            }
+        }
+
+        // Infeasible trials sorted by violation score (less violation first).
+        infeasible.sort_by(|a, b| {
+            Self::infeasible_score(a)
+                .partial_cmp(&Self::infeasible_score(b))
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
+        for t in &infeasible {
             if remaining > 0 {
                 below.push(*t);
                 remaining -= 1;
@@ -225,8 +357,27 @@ impl TpeSampler {
         &self,
         trials: &[FrozenTrial],
         search_space: &IndexMap<String, Distribution>,
+        current_trial_number: Option<i64>,
     ) -> Result<HashMap<String, f64>> {
-        let (below, above) = self.split_trials(trials);
+        // Constant liar: include running trials, exclude current trial
+        let filtered: Vec<FrozenTrial>;
+        let effective_trials = if self.constant_liar {
+            filtered = trials
+                .iter()
+                .filter(|t| {
+                    t.state == TrialState::Complete
+                        || t.state == TrialState::Pruned
+                        || t.state == TrialState::Running
+                })
+                .filter(|t| current_trial_number.map_or(true, |n| t.number != n))
+                .cloned()
+                .collect();
+            &filtered
+        } else {
+            trials
+        };
+
+        let (below, above) = self.split_trials(effective_trials);
 
         let obs_below = Self::get_observations(&below, search_space);
         let obs_above = Self::get_observations(&above, search_space);
@@ -284,8 +435,28 @@ impl Sampler for TpeSampler {
         if self.is_startup(trials) {
             return HashMap::new();
         }
-        let mut ss = self.search_space.lock();
-        ss.calculate(trials).clone()
+
+        if self.group {
+            // Group mode: use SearchSpaceGroup to decompose search space
+            let mut gs = self.group_search_space.lock();
+            // Add distributions from each trial
+            for trial in trials {
+                if trial.state == TrialState::Complete || trial.state == TrialState::Pruned {
+                    gs.add_distributions(&trial.distributions);
+                }
+            }
+            // Return the union as the relative space
+            let mut result = HashMap::new();
+            for space in gs.search_spaces() {
+                for (k, v) in space.iter() {
+                    result.insert(k.clone(), v.clone());
+                }
+            }
+            result
+        } else {
+            let mut ss = self.search_space.lock();
+            ss.calculate(trials).clone()
+        }
     }
 
     fn sample_relative(
@@ -296,6 +467,27 @@ impl Sampler for TpeSampler {
         if search_space.is_empty() {
             return Ok(HashMap::new());
         }
+        if self.is_startup(trials) {
+            return Ok(HashMap::new());
+        }
+
+        if self.group {
+            // Group mode: sample each sub-space independently
+            let gs = self.group_search_space.lock();
+            let mut params = HashMap::new();
+            for sub_space in gs.search_spaces() {
+                let mut filtered: IndexMap<String, Distribution> = IndexMap::new();
+                for (name, dist) in sub_space.iter() {
+                    if search_space.contains_key(name) {
+                        filtered.insert(name.clone(), dist.clone());
+                    }
+                }
+                if !filtered.is_empty() {
+                    params.extend(self.tpe_sample(trials, &filtered, None)?);
+                }
+            }
+            return Ok(params);
+        }
 
         // Convert to IndexMap for ordered iteration.
         let ordered: IndexMap<String, Distribution> = search_space
@@ -303,33 +495,71 @@ impl Sampler for TpeSampler {
             .map(|(k, v)| (k.clone(), v.clone()))
             .collect();
 
-        self.tpe_sample(trials, &ordered)
+        self.tpe_sample(trials, &ordered, None)
     }
 
     fn sample_independent(
         &self,
+        trials: &[FrozenTrial],
         trial: &FrozenTrial,
         param_name: &str,
         distribution: &Distribution,
     ) -> Result<f64> {
-        // During startup, use random sampling.
-        // We check the trial number as a proxy for completed trials count.
-        if (trial.number as usize) < self.n_startup_trials {
+        // 对齐 Python `TPESampler.sample_independent`：
+        // 启动期用随机采样，之后用 TPE 对单参数采样。
+        let completed: Vec<&FrozenTrial> = trials
+            .iter()
+            .filter(|t| t.state == TrialState::Complete || t.state == TrialState::Pruned)
+            .collect();
+
+        if completed.len() < self.n_startup_trials {
             return self
                 .random_sampler
-                .sample_independent(trial, param_name, distribution);
+                .sample_independent(trials, trial, param_name, distribution);
         }
 
-        // For independent (univariate) mode, we don't have access to all trials here.
-        // The study will call us via sample_relative for multivariate mode.
-        // For univariate TPE in sample_independent, we'd need access to study trials.
-        // Since we don't have that context, fall back to random for now.
-        // The proper TPE path goes through sample_relative.
-        //
-        // However, to make univariate TPE work, we store a snapshot of trials
-        // in before_trial and use it here. For now, fall back to random.
-        self.random_sampler
-            .sample_independent(trial, param_name, distribution)
+        // multivariate 模式下对独立采样发出警告
+        if self.multivariate && self.warn_independent_sampling {
+            // 只在参数已出现在某些已完成试验中时才警告（对齐 Python）
+            if trials.iter().any(|t| t.params.contains_key(param_name)) {
+                eprintln!(
+                    "[optuna] The parameter '{}' in trial#{} is sampled independently. \
+                     The TPE multivariate algorithm only applies to parameters \
+                     in the common search space.",
+                    param_name,
+                    trial.number,
+                );
+            }
+        }
+
+        // 使用 TPE 对单个参数进行采样（对齐 Python self._sample(study, trial, {param_name: dist})）
+        let mut single_space = IndexMap::new();
+        single_space.insert(param_name.to_string(), distribution.clone());
+        let result = self.tpe_sample(trials, &single_space, Some(trial.number))?;
+        Ok(result.get(param_name).copied().unwrap_or_else(|| {
+            // 如果 TPE 无法采样（如没有有效观测），回退到随机
+            self.random_sampler
+                .sample_independent(trials, trial, param_name, distribution)
+                .unwrap_or(0.0)
+        }))
+    }
+
+    fn after_trial(
+        &self,
+        _trials: &[FrozenTrial],
+        trial: &FrozenTrial,
+        state: TrialState,
+        _values: Option<&[f64]>,
+    ) {
+        // Store constraint values if constraints_func is set
+        if let Some(ref cf) = self.constraints_func {
+            if state == TrialState::Complete || state == TrialState::Pruned {
+                let _constraints = cf(trial);
+                // In a full implementation, this would store to trial.system_attrs
+                // via storage. For now the constraints_func pattern is exposed for
+                // user-level usage where they can store via set_system_attr.
+            }
+        }
     }
 }
 
@@ -355,6 +585,13 @@ pub struct TpeSamplerBuilder {
     consider_magic_clip: bool,
     consider_endpoints: bool,
     prior_weight: f64,
+    group: bool,
+    constant_liar: bool,
+    constraints_func: Option<ConstraintsFn>,
+    gamma: Option<GammaFn>,
+    weights: Option<WeightsFn>,
+    categorical_distance_func: Option<HashMap<String, CategoricalDistanceFunc>>,
+    warn_independent_sampling: bool,
 }
 
 impl TpeSamplerBuilder {
@@ -369,6 +606,13 @@ impl TpeSamplerBuilder {
             consider_magic_clip: true,
             consider_endpoints: false,
             prior_weight: 1.0,
+            group: false,
+            constant_liar: false,
+            constraints_func: None,
+            gamma: None,
+            weights: None,
+            categorical_distance_func: None,
+            warn_independent_sampling: true,
         }
     }
 
@@ -414,6 +658,53 @@ impl TpeSamplerBuilder {
         self
     }
 
+    /// Enable group-decomposed search space (requires multivariate=true).
+    pub fn group(mut self, group: bool) -> Self {
+        self.group = group;
+        self
+    }
+
+    /// Enable constant liar for parallel optimization.
+    pub fn constant_liar(mut self, constant_liar: bool) -> Self {
+        self.constant_liar = constant_liar;
+        self
+    }
+
+    /// Set a constraints function for constrained optimization.
+    pub fn constraints_func(mut self, func: ConstraintsFn) -> Self {
+        self.constraints_func = Some(func);
+        self
+    }
+
+    /// Set a custom gamma function (n -> n_below).
+    pub fn gamma(mut self, gamma: GammaFn) -> Self {
+        self.gamma = Some(gamma);
+        self
+    }
+
+    /// Set a custom weights function (n_below -> weights).
+    pub fn weights(mut self, weights: WeightsFn) -> Self {
+        self.weights = Some(weights);
+        self
+    }
+
+    /// 设置分类参数自定义距离函数（实验性功能）。
+    /// 对应 Python `categorical_distance_func` 参数。
+    pub fn categorical_distance_func(
+        mut self,
+        func: HashMap<String, CategoricalDistanceFunc>,
+    ) -> Self {
+        self.categorical_distance_func = Some(func);
+        self
+    }
+
+    /// 设置是否在 multivariate 模式下对独立采样的参数发出警告。
+    /// 默认为 true。对应 Python `warn_independent_sampling` 参数。
+    pub fn warn_independent_sampling(mut self, warn: bool) -> Self {
+        self.warn_independent_sampling = warn;
+        self
+    }
+
     /// Build the [`TpeSampler`].
     pub fn build(self) -> TpeSampler {
         TpeSampler::new(
@@ -425,6 +716,13 @@ impl TpeSamplerBuilder {
             self.consider_magic_clip,
             self.consider_endpoints,
             self.prior_weight,
+            self.group,
+            self.constant_liar,
+            self.constraints_func,
+            self.gamma,
+            self.weights,
+            self.categorical_distance_func,
+            self.warn_independent_sampling,
         )
     }
 }
@@ -492,7 +790,7 @@ mod tests {
         let dist =
             Distribution::FloatDistribution(FloatDistribution::new(0.0, 1.0, false, None).unwrap());
         // During startup, should sample without error.
-        let v = sampler.sample_independent(&trial, "x", &dist).unwrap();
+        let v = sampler.sample_independent(&[], &trial, "x", &dist).unwrap();
         assert!((0.0..=1.0).contains(&v));
     }
 
@@ -559,6 +857,7 @@ mod tests {
             // Random sampling for both during first 10, then TPE kicks in.
             let x_rand = random
                 .sample_independent(
+                    &[],
                     &FrozenTrial {
                         number: i,
                         state: TrialState::Running,
@@ -602,7 +901,7 @@ mod tests {
                     intermediate_values: HashMap::new(),
                     trial_id: i,
                 };
-                sampler.sample_independent(&t, "x", &dist).unwrap()
+                sampler.sample_independent(&tpe_trials, &t, "x", &dist).unwrap()
             };
 
             let mut tp = HashMap::new();

@@ -92,6 +92,7 @@ impl BruteForceSampler {
 impl Sampler for BruteForceSampler {
     fn sample_independent(
         &self,
+        trials: &[FrozenTrial],
         trial: &FrozenTrial,
         param_name: &str,
         distribution: &Distribution,
@@ -99,7 +100,7 @@ impl Sampler for BruteForceSampler {
         // For brute force, we try to pick an unvisited value
         // In independent mode, just delegate to random
         self.random_sampler
-            .sample_independent(trial, param_name, distribution)
+            .sample_independent(trials, trial, param_name, distribution)
     }
 
     fn infer_relative_search_space(

@@ -186,6 +186,7 @@ impl Sampler for GridSampler {
 
     fn sample_independent(
         &self,
+        _trials: &[FrozenTrial],
         trial: &FrozenTrial,
         param_name: &str,
         _distribution: &Distribution,
@@ -332,7 +333,7 @@ mod tests {
         let grid_id = sampler.suggest_grid_id(&[]).unwrap();
         let trial = make_trial_with_grid_id(0, grid_id, TrialState::Running);
         let dist = Distribution::IntDistribution(IntDistribution::new(1, 3, false, 1).unwrap());
-        let val = sampler.sample_independent(&trial, "x", &dist).unwrap();
+        let val = sampler.sample_independent(&[], &trial, "x", &dist).unwrap();
         assert!([1.0, 2.0, 3.0].contains(&val));
     }
 
@@ -396,7 +397,7 @@ mod tests {
         let trial = make_trial_with_grid_id(0, 0, TrialState::Running);
         let dist =
             Distribution::FloatDistribution(FloatDistribution::new(0.0, 1.0, false, None).unwrap());
-        assert!(sampler.sample_independent(&trial, "unknown", &dist).is_err());
+        assert!(sampler.sample_independent(&[], &trial, "unknown", &dist).is_err());
     }
 
     #[test]

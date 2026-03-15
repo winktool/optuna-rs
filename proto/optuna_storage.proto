@@ -1,0 +1,202 @@
+syntax = "proto3";
+
+package optuna.storage;
+
+/// gRPC Storage 代理服务。
+///
+/// 对应 Python `optuna.storages._grpc.api.proto`。
+/// 每个 RPC 方法映射到 `Storage` trait 的一个方法。
+service StorageService {
+    // ── Study CRUD ──
+    rpc CreateNewStudy (CreateStudyRequest) returns (CreateStudyReply);
+    rpc DeleteStudy (DeleteStudyRequest) returns (Empty);
+    rpc SetStudyUserAttribute (SetStudyAttributeRequest) returns (Empty);
+    rpc SetStudySystemAttribute (SetStudyAttributeRequest) returns (Empty);
+    rpc GetStudyIdFromName (GetStudyIdFromNameRequest) returns (StudyIdReply);
+    rpc GetStudyNameFromId (StudyIdRequest) returns (StudyNameReply);
+    rpc GetStudyDirections (StudyIdRequest) returns (StudyDirectionsReply);
+    rpc GetStudyUserAttributes (StudyIdRequest) returns (AttributesReply);
+    rpc GetStudySystemAttributes (StudyIdRequest) returns (AttributesReply);
+    rpc GetAllStudies (Empty) returns (GetAllStudiesReply);
+
+    // ── Trial CRUD ──
+    rpc CreateNewTrial (CreateTrialRequest) returns (TrialIdReply);
+    rpc SetTrialParameter (SetTrialParameterRequest) returns (Empty);
+    rpc GetTrialIdFromStudyIdTrialNumber (GetTrialIdRequest) returns (TrialIdReply);
+    rpc SetTrialStateValues (SetTrialStateValuesRequest) returns (TrialUpdatedReply);
+    rpc SetTrialIntermediateValue (SetTrialIntermediateValueRequest) returns (Empty);
+    rpc SetTrialUserAttribute (SetTrialAttributeRequest) returns (Empty);
+    rpc SetTrialSystemAttribute (SetTrialAttributeRequest) returns (Empty);
+    rpc GetTrial (TrialIdRequest) returns (TrialReply);
+    rpc GetAllTrials (GetAllTrialsRequest) returns (GetAllTrialsReply);
+}
+
+// ══════════════════════════════════════════════════════════════════════════
+// 枚举
+// ══════════════════════════════════════════════════════════════════════════
+
+enum StudyDirection {
+    STUDY_DIRECTION_NOT_SET = 0;
+    STUDY_DIRECTION_MINIMIZE = 1;
+    STUDY_DIRECTION_MAXIMIZE = 2;
+}
+
+enum TrialState {
+    TRIAL_STATE_RUNNING = 0;
+    TRIAL_STATE_COMPLETE = 1;
+    TRIAL_STATE_PRUNED = 2;
+    TRIAL_STATE_FAIL = 3;
+    TRIAL_STATE_WAITING = 4;
+}
+
+// ══════════════════════════════════════════════════════════════════════════
+// 消息
+// ══════════════════════════════════════════════════════════════════════════
+
+message Empty {}
+
+// ── Study 消息 ──
+
+message CreateStudyRequest {
+    repeated StudyDirection directions = 1;
+    string study_name = 2;
+    bool study_name_is_none = 3;
+}
+
+message CreateStudyReply {
+    int64 study_id = 1;
+}
+
+message DeleteStudyRequest {
+    int64 study_id = 1;
+}
+
+message SetStudyAttributeRequest {
+    int64 study_id = 1;
+    string key = 2;
+    string value_json = 3;
+}
+
+message GetStudyIdFromNameRequest {
+    string study_name = 1;
+}
+
+message StudyIdRequest {
+    int64 study_id = 1;
+}
+
+message StudyIdReply {
+    int64 study_id = 1;
+}
+
+message StudyNameReply {
+    string study_name = 1;
+}
+
+message StudyDirectionsReply {
+    repeated StudyDirection directions = 1;
+}
+
+message AttributesReply {
+    map<string, string> attributes = 1;
+}
+
+message StudyMessage {
+    int64 study_id = 1;
+    string study_name = 2;
+    repeated StudyDirection directions = 3;
+    map<string, string> user_attributes = 4;
+    map<string, string> system_attributes = 5;
+}
+
+message GetAllStudiesReply {
+    repeated StudyMessage studies = 1;
+}
+
+// ── Trial 消息 ──
+
+message CreateTrialRequest {
+    int64 study_id = 1;
+    TrialMessage template_trial = 2;
+    bool template_trial_is_none = 3;
+}
+
+message TrialIdRequest {
+    int64 trial_id = 1;
+}
+
+message TrialIdReply {
+    int64 trial_id = 1;
+}
+
+message SetTrialParameterRequest {
+    int64 trial_id = 1;
+    string param_name = 2;
+    double param_value_internal = 3;
+    string distribution_json = 4;
+}
+
+message GetTrialIdRequest {
+    int64 study_id = 1;
+    int64 trial_number = 2;
+}
+
+message SetTrialStateValuesRequest {
+    int64 trial_id = 1;
+    TrialState state = 2;
+    repeated double values = 3;
+    bool values_is_none = 4;
+}
+
+message TrialUpdatedReply {
+    bool trial_updated = 1;
+}
+
+message SetTrialIntermediateValueRequest {
+    int64 trial_id = 1;
+    int64 step = 2;
+    double intermediate_value = 3;
+}
+
+message SetTrialAttributeRequest {
+    int64 trial_id = 1;
+    string key = 2;
+    string value_json = 3;
+}
+
+message TrialMessage {
+    int64 trial_id = 1;
+    int64 number = 2;
+    TrialState state = 3;
+    repeated double values = 4;
+    bool values_is_none = 5;
+    string datetime_start = 6;
+    string datetime_complete = 7;
+    map<string, double> params = 8;
+    map<string, string> distributions = 9;
+    map<string, string> user_attributes = 10;
+    map<string, string> system_attributes = 11;
+    map<int64, double> intermediate_values = 12;
+}
+
+message TrialReply {
+    TrialMessage trial = 1;
+}
+
+message GetAllTrialsRequest {
+    int64 study_id = 1;
+    repeated TrialState states = 2;
+    bool states_is_none = 3;
+    // 增量同步: 只返回 trial_id 在此列表中的 trials。
+    // 对应 Python `_CachedStorage` 的 `included_trial_ids`。
+    repeated int64 included_trial_ids = 4;
+    // 增量同步: 只返回 trial_id > 此值的 trials。
+    // 对应 Python gRPC 的 `trial_id_greater_than`。
+    int64 trial_id_greater_than = 5;
+    // 是否使用 trial_id_greater_than 过滤 (区分 0 和 "未设置")。
+    bool use_trial_id_filter = 6;
+}
+
+message GetAllTrialsReply {
+    repeated TrialMessage trials = 1;
+}

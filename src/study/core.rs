@@ -13,6 +13,51 @@ use crate::study::StudyDirection;
 use crate::terminators::Terminator;
 use crate::trial::{FrozenTrial, Trial, TrialState};
 
+/// 全局 SIGINT 标志，用于优雅终止优化循环。
+/// 对应 Python `_optimize.py` 中的信号处理器。
+static SIGINT_RECEIVED: AtomicBool = AtomicBool::new(false);
+
+/// 安装 Ctrl+C (SIGINT) 信号处理器。
+/// 第一次 Ctrl+C 设置标志，第二次 Ctrl+C 强制退出进程。
+fn install_signal_handler(stop_flag: &Arc<AtomicBool>) {
+    let flag = Arc::clone(stop_flag);
+    let _ = ctrlc::set_handler(move || {
+        if SIGINT_RECEIVED.load(Ordering::SeqCst) {
+            // 第二次 Ctrl+C → 直接退出
+            std::process::exit(130);
+        }
+        SIGINT_RECEIVED.store(true, Ordering::SeqCst);
+        flag.store(true, Ordering::Release);
+        eprintln!("\nOptimization stopped by Ctrl+C. Finishing current trial...");
+    });
+}
+
+/// 判断错误是否应被 catch 列表捕获。
+/// 对应 Python `isinstance(func_err, catch)`。
+/// Rust 中通过错误变体名称字符串匹配:
+/// - "*" — 等同 Python 的 catch=(Exception,)，捕获所有异常
+/// - "ValueError" — 匹配 OptunaError::ValueError
+/// - "StorageInternalError" — 匹配 OptunaError::StorageInternalError
+/// - "InvalidDistribution" — 匹配 OptunaError::InvalidDistribution
+fn error_matches_catch(err: &OptunaError, catch: &[&str]) -> bool {
+    if catch.is_empty() {
+        return false;
+    }
+    if catch.contains(&"*") {
+        return true;
+    }
+    let variant = match err {
+        OptunaError::TrialPruned => "TrialPruned",
+        OptunaError::ValueError(_) => "ValueError",
+        OptunaError::StorageInternalError(_) => "StorageInternalError",
+        OptunaError::DuplicatedStudyError(_) => "DuplicatedStudyError",
+        OptunaError::UpdateFinishedTrialError(_) => "UpdateFinishedTrialError",
+        OptunaError::InvalidDistribution(_) => "InvalidDistribution",
+        OptunaError::NotImplemented(_) => "NotImplemented",
+    };
+    catch.contains(&variant)
+}
+
 /// An optimization study.
 ///
 /// Corresponds to Python `optuna.study.Study`.
@@ -23,7 +68,7 @@ pub struct Study {
     directions: Vec<StudyDirection>,
     sampler: Arc<dyn Sampler>,
     pruner: Arc<dyn Pruner>,
-    stop_flag: AtomicBool,
+    stop_flag: Arc<AtomicBool>,
 }
 
 impl Study {
@@ -43,7 +88,7 @@ impl Study {
             directions,
             sampler,
             pruner,
-            stop_flag: AtomicBool::new(false),
+            stop_flag: Arc::new(AtomicBool::new(false)),
         }
     }
 
@@ -76,17 +121,86 @@ impl Study {
     }
 
     /// Get the best trial for single-objective studies.
+    ///
+    /// 对应 Python `Study.best_trial`。
+    /// 支持约束优化：如果试验带有约束信息，只考虑可行试验。
     pub fn best_trial(&self) -> Result<FrozenTrial> {
-        self.storage.get_best_trial(self.study_id)
+        let trials = self
+            .storage
+            .get_all_trials(self.study_id, Some(&[TrialState::Complete]))?;
+        if trials.is_empty() {
+            return Err(OptunaError::ValueError("No completed trials.".into()));
+        }
+        let direction = self.direction()?;
+
+        // 检查是否有约束信息
+        let has_constraints = trials.iter().any(|t| {
+            t.system_attrs.contains_key("constraints")
+        });
+
+        // 筛选可行试验（如果存在约束）
+        // 对齐 Python: 无 constraints key 的试验视为不可行（unwrap_or(false)）
+        let feasible: Vec<&FrozenTrial> = if has_constraints {
+            trials.iter().filter(|t| {
+                t.system_attrs.get("constraints")
+                    .and_then(|v| serde_json::from_value::<Vec<f64>>(v.clone()).ok())
+                    .map(|cs| cs.iter().all(|c| *c <= 0.0))
+                    .unwrap_or(false)
+            }).collect()
+        } else {
+            trials.iter().collect()
+        };
+
+        if feasible.is_empty() {
+            return Err(OptunaError::ValueError(
+                "No feasible (constraint-satisfying) completed trials.".into(),
+            ));
+        }
+
+        let best = feasible
+            .iter()
+            .filter_map(|t| t.value().ok().flatten().map(|v| (t, v)))
+            .min_by(|(_, a), (_, b)| {
+                let (a, b) = match direction {
+                    StudyDirection::Minimize => (*a, *b),
+                    _ => (-*a, -*b),
+                };
+                a.partial_cmp(&b).unwrap_or(std::cmp::Ordering::Equal)
+            })
+            .map(|(t, _)| (*t).clone())
+            .ok_or_else(|| OptunaError::ValueError("No trial with a finite value.".into()))?;
+
+        Ok(best)
     }
 
     /// Get the Pareto-optimal trials for multi-objective studies.
+    ///
+    /// 对应 Python `Study.best_trials`。
+    /// 支持约束优化：只考虑可行试验。
     pub fn best_trials(&self) -> Result<Vec<FrozenTrial>> {
         let trials = self
             .storage
             .get_all_trials(self.study_id, Some(&[TrialState::Complete]))?;
+
+        // 检查是否有约束信息，过滤不可行试验
+        let has_constraints = trials.iter().any(|t| {
+            t.system_attrs.contains_key("constraints")
+        });
+
+        // 对齐 Python: 无 constraints key 的试验视为不可行（unwrap_or(false)）
+        let feasible: Vec<FrozenTrial> = if has_constraints {
+            trials.into_iter().filter(|t| {
+                t.system_attrs.get("constraints")
+                    .and_then(|v| serde_json::from_value::<Vec<f64>>(v.clone()).ok())
+                    .map(|cs| cs.iter().all(|c| *c <= 0.0))
+                    .unwrap_or(false)
+            }).collect()
+        } else {
+            trials
+        };
+
         Ok(crate::multi_objective::get_pareto_front_trials(
-            &trials,
+            &feasible,
             &self.directions,
         ))
     }
@@ -113,6 +227,27 @@ impl Study {
         self.storage.get_all_trials(self.study_id, states)
     }
 
+    /// 将试验数据转换为 polars DataFrame。
+    ///
+    /// 对应 Python `Study.trials_dataframe(attrs, multi_index)`。
+    /// 需要启用 `dataframe` feature。
+    ///
+    /// # 参数
+    /// * `metric_names` - 目标名（多目标场景）
+    /// * `attrs` - 要包含的列名。`None` 使用默认列。
+    /// * `multi_index` - 是否使用 MultiIndex 风格列名
+    #[cfg(feature = "dataframe")]
+    pub fn trials_dataframe(
+        &self,
+        metric_names: Option<&[String]>,
+        attrs: Option<&[&str]>,
+        multi_index: bool,
+    ) -> Result<polars::prelude::DataFrame> {
+        let trials = self.trials()?;
+        let multi_objective = self.directions().len() > 1;
+        super::dataframe::trials_to_dataframe(&trials, multi_objective, metric_names, attrs, multi_index)
+    }
+
     /// Get user attributes.
     pub fn user_attrs(&self) -> Result<HashMap<String, serde_json::Value>> {
         self.storage.get_study_user_attrs(self.study_id)
@@ -122,6 +257,56 @@ impl Study {
     pub fn set_user_attr(&self, key: &str, value: serde_json::Value) -> Result<()> {
         self.storage
             .set_study_user_attr(self.study_id, key, value)
+    }
+
+    /// 获取系统属性。
+    ///
+    /// 对应 Python `Study.system_attrs`。
+    pub fn system_attrs(&self) -> Result<HashMap<String, serde_json::Value>> {
+        self.storage.get_study_system_attrs(self.study_id)
+    }
+
+    /// 设置系统属性。
+    ///
+    /// 对应 Python `Study.set_system_attr()`。
+    pub fn set_system_attr(&self, key: &str, value: serde_json::Value) -> Result<()> {
+        self.storage
+            .set_study_system_attr(self.study_id, key, value)
+    }
+
+    /// 设置度量指标名称。
+    ///
+    /// 对应 Python `Study.set_metric_names()`。
+    /// 将度量名称存储在系统属性 `study:metric_names` 中。
+    pub fn set_metric_names(&self, metric_names: &[&str]) -> Result<()> {
+        let names: Vec<String> = metric_names.iter().map(|s| s.to_string()).collect();
+        if names.len() != self.directions.len() {
+            return Err(OptunaError::ValueError(format!(
+                "metric_names 长度 ({}) 必须与 directions 长度 ({}) 一致",
+                names.len(),
+                self.directions.len()
+            )));
+        }
+        self.storage.set_study_system_attr(
+            self.study_id,
+            "study:metric_names",
+            serde_json::json!(names),
+        )
+    }
+
+    /// 获取度量指标名称。
+    ///
+    /// 对应 Python `Study.metric_names`。
+    pub fn metric_names(&self) -> Result<Option<Vec<String>>> {
+        let attrs = self.storage.get_study_system_attrs(self.study_id)?;
+        match attrs.get("study:metric_names") {
+            Some(v) => {
+                let names: Vec<String> = serde_json::from_value(v.clone())
+                    .map_err(|e| OptunaError::StorageInternalError(e.to_string()))?;
+                Ok(Some(names))
+            }
+            None => Ok(None),
+        }
     }
 
     /// Signal the optimize loop to stop after the current trial.
@@ -171,7 +356,8 @@ impl Study {
         if let Some(fixed) = fixed_distributions {
             for (name, dist) in fixed {
                 if !relative_params.contains_key(name) {
-                    let v = self.sampler.sample_independent(&trial, name, dist)?;
+                    let all_trials = self.storage.get_all_trials(self.study_id, None)?;
+                    let v = self.sampler.sample_independent(&all_trials, &trial, name, dist)?;
                     relative_params.insert(name.clone(), v);
                 }
             }
@@ -184,43 +370,142 @@ impl Study {
             Arc::clone(&self.storage),
             Arc::clone(&self.sampler),
             Arc::clone(&self.pruner),
+            self.directions.clone(),
             relative_params,
         ))
     }
 
     /// Finalize a trial with a value/values and state.
     ///
-    /// This is the low-level tell; the optimize loop calls this internally.
+    /// 对应 Python `Study.tell()`。
+    /// `skip_if_finished` 为 true 时，若试验已结束则跳过。
     pub fn tell(
         &self,
         trial_id: i64,
         state: TrialState,
         values: Option<&[f64]>,
     ) -> Result<FrozenTrial> {
-        // Write to storage
-        self.storage
-            .set_trial_state_values(trial_id, state, values)?;
+        self.tell_with_options(trial_id, state, values, false)
+    }
 
-        // Run after_trial hook
-        let all_trials = self.storage.get_all_trials(self.study_id, None)?;
+    /// 带 skip_if_finished 选项的 tell。
+    ///
+    /// 对应 Python `Study.tell(skip_if_finished=True)`。
+    /// 完整对齐 Python `_tell_with_warning` 的验证逻辑：
+    /// 1. skip_if_finished 检查
+    /// 2. 非 RUNNING 试验不允许 tell
+    /// 3. state/values 一致性校验 (_check_state_and_values)
+    /// 4. values 可行性校验: NaN 检查、数量匹配 (_check_values_are_feasible)
+    /// 5. PRUNED 状态自动使用最后中间值
+    /// 6. after_trial 在 set_trial_state_values 之前执行
+    pub fn tell_with_options(
+        &self,
+        trial_id: i64,
+        state: TrialState,
+        values: Option<&[f64]>,
+        skip_if_finished: bool,
+    ) -> Result<FrozenTrial> {
         let frozen = self.storage.get_trial(trial_id)?;
-        self.sampler
-            .after_trial(&all_trials, &frozen, state, values);
 
-        Ok(frozen)
+        // 1. skip_if_finished 检查
+        if frozen.state.is_finished() && skip_if_finished {
+            return Ok(frozen);
+        }
+
+        // 2. 非 RUNNING 试验不允许 tell（对齐 Python）
+        if frozen.state != TrialState::Running {
+            return Err(OptunaError::ValueError(format!(
+                "Cannot tell a {} trial.",
+                frozen.state
+            )));
+        }
+
+        // 3. state/values 一致性校验（对齐 Python _check_state_and_values）
+        match state {
+            TrialState::Complete => {
+                if values.is_none() {
+                    return Err(OptunaError::ValueError(
+                        "No values were told. Values are required when state is TrialState.Complete.".into(),
+                    ));
+                }
+            }
+            TrialState::Pruned | TrialState::Fail => {
+                if values.is_some() {
+                    return Err(OptunaError::ValueError(
+                        "Values were told. Values cannot be specified when state is Pruned or Fail.".into(),
+                    ));
+                }
+            }
+            TrialState::Running | TrialState::Waiting => {
+                return Err(OptunaError::ValueError(format!(
+                    "Cannot tell with state {}.",
+                    state
+                )));
+            }
+        }
+
+        // 4. values 可行性校验（对齐 Python _check_values_are_feasible）
+        let final_values: Option<Vec<f64>>;
+        if state == TrialState::Complete {
+            let vals = values.unwrap(); // 已确保 Some
+            // NaN 检查
+            for v in vals {
+                if v.is_nan() {
+                    return Err(OptunaError::ValueError(format!(
+                        "The value {} is not acceptable",
+                        v
+                    )));
+                }
+            }
+            // values 数量与 directions 数量匹配
+            if vals.len() != self.directions.len() {
+                return Err(OptunaError::ValueError(format!(
+                    "The number of the values {} did not match the number of the objectives {}",
+                    vals.len(),
+                    self.directions.len()
+                )));
+            }
+            final_values = Some(vals.to_vec());
+        } else if state == TrialState::Pruned {
+            // 对齐 Python: PRUNED 状态自动使用最后中间值（如果可行）
+            if let Some(last_step) = frozen.last_step() {
+                let last_val = frozen.intermediate_values[&last_step];
+                if !last_val.is_nan() && self.directions.len() == 1 {
+                    final_values = Some(vec![last_val]);
+                } else {
+                    final_values = None;
+                }
+            } else {
+                final_values = None;
+            }
+        } else {
+            final_values = None;
+        }
+
+        // 5. after_trial 在 set_trial_state_values 之前执行（对齐 Python try/finally 顺序）
+        let all_trials = self.storage.get_all_trials(self.study_id, None)?;
+        self.sampler.after_trial(
+            &all_trials,
+            &frozen,
+            state,
+            final_values.as_deref(),
+        );
+
+        // 6. set_trial_state_values 放在 finally 等价位置
+        self.storage
+            .set_trial_state_values(trial_id, state, final_values.as_deref())?;
+
+        let result = self.storage.get_trial(trial_id)?;
+        Ok(result)
     }
 
     // ── Optimize loop ───────────────────────────────────────────────────
 
-    /// Run the optimization loop.
+    /// 运行优化循环（简化版）。
     ///
-    /// `func` is the objective function: given a `&mut Trial`, return the
-    /// objective value(s). For single-objective, return a single `f64`.
-    /// Raise `OptunaError::TrialPruned` to prune.
-    ///
-    /// `n_trials`: max number of trials to run (None = unlimited).
-    /// `timeout`: max duration (None = unlimited).
-    /// `callbacks`: optional callbacks run after each trial.
+    /// 对应 Python `optuna.Study.optimize()` 的最常见用法。
+    /// 如需 `n_jobs`/`catch`/`show_progress_bar`，请使用 `optimize_with_options()`。
+    /// 支持 Ctrl+C 优雅终止。
     pub fn optimize<F>(
         &self,
         func: F,
@@ -232,30 +517,168 @@ impl Study {
         F: Fn(&mut Trial) -> Result<f64>,
     {
         self.stop_flag.store(false, Ordering::Release);
+        SIGINT_RECEIVED.store(false, Ordering::SeqCst);
+        install_signal_handler(&self.stop_flag);
         let start = Instant::now();
-
         let mut i_trial: usize = 0;
         loop {
-            // Check stop conditions
-            if self.stop_flag.load(Ordering::Acquire) {
-                break;
-            }
-            if n_trials.is_some_and(|n| i_trial >= n) {
-                break;
-            }
-            if timeout.is_some_and(|t| start.elapsed() >= t) {
-                break;
-            }
-
+            if self.stop_flag.load(Ordering::Acquire) { break; }
+            if n_trials.is_some_and(|n| i_trial >= n) { break; }
+            if timeout.is_some_and(|t| start.elapsed() >= t) { break; }
             self.run_trial(&func, callbacks)?;
             i_trial += 1;
+        }
+        self.storage.remove_session();
+        Ok(())
+    }
+
+    /// 带完整选项的优化循环（对应 Python `optimize` 的所有参数）。
+    /// 支持 Ctrl+C 优雅终止。
+    pub fn optimize_with_options<F>(
+        &self,
+        func: F,
+        n_trials: Option<usize>,
+        timeout: Option<Duration>,
+        n_jobs: i32,
+        catch: &[&str],
+        callbacks: Option<&[&dyn Callback]>,
+        show_progress_bar: bool,
+    ) -> Result<()>
+    where
+        F: Fn(&mut Trial) -> Result<f64> + Send + Sync,
+    {
+        self.stop_flag.store(false, Ordering::Release);
+        SIGINT_RECEIVED.store(false, Ordering::SeqCst);
+        install_signal_handler(&self.stop_flag);
+        let start = Instant::now();
+
+        // 进度条支持
+        #[cfg(feature = "progress")]
+        let progress: Option<Arc<indicatif::ProgressBar>> = if show_progress_bar {
+            let pb = indicatif::ProgressBar::new(n_trials.unwrap_or(0) as u64);
+            pb.set_style(
+                indicatif::ProgressStyle::default_bar()
+                    .template("{spinner:.green} [{elapsed_precise}] [{bar:40.cyan/blue}] {pos}/{len} trials ({eta})")
+                    .unwrap_or_else(|_| indicatif::ProgressStyle::default_bar())
+                    .progress_chars("#>-"),
+            );
+            if n_trials.is_none() {
+                pb.set_length(0);
+                pb.set_style(
+                    indicatif::ProgressStyle::default_spinner()
+                        .template("{spinner:.green} [{elapsed_precise}] {pos} trials")
+                        .unwrap_or_else(|_| indicatif::ProgressStyle::default_spinner()),
+                );
+            }
+            Some(Arc::new(pb))
+        } else {
+            None
+        };
+        #[cfg(not(feature = "progress"))]
+        let _ = show_progress_bar;
+
+        // 确定实际线程数
+        let actual_jobs = if n_jobs == -1 {
+            std::thread::available_parallelism()
+                .map(|n| n.get() as i32)
+                .unwrap_or(1)
+        } else {
+            n_jobs.max(1)
+        };
+
+        if actual_jobs <= 1 {
+            // ── 串行模式 ──
+            let mut i_trial: usize = 0;
+            loop {
+                if self.stop_flag.load(Ordering::Acquire) {
+                    break;
+                }
+                if n_trials.is_some_and(|n| i_trial >= n) {
+                    break;
+                }
+                if timeout.is_some_and(|t| start.elapsed() >= t) {
+                    break;
+                }
+
+                match self.run_trial_with_catch(&func, callbacks, catch) {
+                    Ok(()) => {}
+                    Err(e) => {
+                        // catch 未匹配的异常向上传播
+                        self.storage.remove_session();
+                        return Err(e);
+                    }
+                }
+                i_trial += 1;
+
+                #[cfg(feature = "progress")]
+                if let Some(ref pb) = progress {
+                    pb.inc(1);
+                }
+            }
+        } else {
+            // ── 并行模式 (类似 Python ThreadPoolExecutor) ──
+            use std::sync::atomic::AtomicUsize;
+            let counter = Arc::new(AtomicUsize::new(0));
+            let func_ref = &func;
+            let catch_ref = catch;
+
+            std::thread::scope(|scope| -> Result<()> {
+                let mut handles = Vec::new();
+
+                // 启动 actual_jobs 个工作线程
+                for _ in 0..actual_jobs {
+                    let counter = counter.clone();
+                    #[cfg(feature = "progress")]
+                    let progress = progress.clone();
+                    let handle = scope.spawn(move || -> Result<()> {
+                        loop {
+                            // 原子递增计数器，检查是否超过 n_trials
+                            let idx = counter.fetch_add(1, Ordering::SeqCst);
+                            if n_trials.is_some_and(|n| idx >= n) {
+                                break;
+                            }
+                            if self.stop_flag.load(Ordering::Acquire) {
+                                break;
+                            }
+                            if timeout.is_some_and(|t| start.elapsed() >= t) {
+                                break;
+                            }
+
+                            match self.run_trial_with_catch(func_ref, callbacks, catch_ref) {
+                                Ok(()) => {}
+                                Err(e) => return Err(e),
+                            }
+
+                            #[cfg(feature = "progress")]
+                            if let Some(ref pb) = progress {
+                                pb.inc(1);
+                            }
+                        }
+                        Ok(())
+                    });
+                    handles.push(handle);
+                }
+
+                // 等待所有线程完成
+                for handle in handles {
+                    handle.join().map_err(|_| {
+                        OptunaError::StorageInternalError("Worker thread panicked".into())
+                    })??;
+                }
+                Ok(())
+            })?;
+        }
+
+        #[cfg(feature = "progress")]
+        if let Some(pb) = progress {
+            pb.finish_with_message("optimization complete");
         }
 
         self.storage.remove_session();
         Ok(())
     }
 
-    /// Run the optimization loop with a multi-objective function.
+    /// 运行多目标优化循环（简化版）。
     pub fn optimize_multi<F>(
         &self,
         func: F,
@@ -268,21 +691,126 @@ impl Study {
     {
         self.stop_flag.store(false, Ordering::Release);
         let start = Instant::now();
-
         let mut i_trial: usize = 0;
         loop {
-            if self.stop_flag.load(Ordering::Acquire) {
-                break;
-            }
-            if n_trials.is_some_and(|n| i_trial >= n) {
-                break;
-            }
-            if timeout.is_some_and(|t| start.elapsed() >= t) {
-                break;
-            }
-
+            if self.stop_flag.load(Ordering::Acquire) { break; }
+            if n_trials.is_some_and(|n| i_trial >= n) { break; }
+            if timeout.is_some_and(|t| start.elapsed() >= t) { break; }
             self.run_trial_multi(&func, callbacks)?;
             i_trial += 1;
+        }
+        self.storage.remove_session();
+        Ok(())
+    }
+
+    /// 带完整选项的多目标优化循环。
+    pub fn optimize_multi_with_options<F>(
+        &self,
+        func: F,
+        n_trials: Option<usize>,
+        timeout: Option<Duration>,
+        n_jobs: i32,
+        catch: &[&str],
+        callbacks: Option<&[&dyn Callback]>,
+        show_progress_bar: bool,
+    ) -> Result<()>
+    where
+        F: Fn(&mut Trial) -> Result<Vec<f64>> + Send + Sync,
+    {
+        self.stop_flag.store(false, Ordering::Release);
+        let start = Instant::now();
+
+        #[cfg(feature = "progress")]
+        let progress: Option<Arc<indicatif::ProgressBar>> = if show_progress_bar {
+            let pb = indicatif::ProgressBar::new(n_trials.unwrap_or(0) as u64);
+            if n_trials.is_none() {
+                pb.set_style(
+                    indicatif::ProgressStyle::default_spinner()
+                        .template("{spinner:.green} [{elapsed_precise}] {pos} trials")
+                        .unwrap_or_else(|_| indicatif::ProgressStyle::default_spinner()),
+                );
+            }
+            Some(Arc::new(pb))
+        } else {
+            None
+        };
+        #[cfg(not(feature = "progress"))]
+        let _ = show_progress_bar;
+
+        let actual_jobs = if n_jobs == -1 {
+            std::thread::available_parallelism()
+                .map(|n| n.get() as i32)
+                .unwrap_or(1)
+        } else {
+            n_jobs.max(1)
+        };
+
+        if actual_jobs <= 1 {
+            let mut i_trial: usize = 0;
+            loop {
+                if self.stop_flag.load(Ordering::Acquire) { break; }
+                if n_trials.is_some_and(|n| i_trial >= n) { break; }
+                if timeout.is_some_and(|t| start.elapsed() >= t) { break; }
+
+                match self.run_trial_multi_with_catch(&func, callbacks, catch) {
+                    Ok(()) => {}
+                    Err(e) => {
+                        self.storage.remove_session();
+                        return Err(e);
+                    }
+                }
+                i_trial += 1;
+
+                #[cfg(feature = "progress")]
+                if let Some(ref pb) = progress {
+                    pb.inc(1);
+                }
+            }
+        } else {
+            use std::sync::atomic::AtomicUsize;
+            let counter = Arc::new(AtomicUsize::new(0));
+            let func_ref = &func;
+            let catch_ref = catch;
+
+            std::thread::scope(|scope| -> Result<()> {
+                let mut handles = Vec::new();
+                for _ in 0..actual_jobs {
+                    let counter = counter.clone();
+                    #[cfg(feature = "progress")]
+                    let progress = progress.clone();
+                    let handle = scope.spawn(move || -> Result<()> {
+                        loop {
+                            let idx = counter.fetch_add(1, Ordering::SeqCst);
+                            if n_trials.is_some_and(|n| idx >= n) { break; }
+                            if self.stop_flag.load(Ordering::Acquire) { break; }
+                            if timeout.is_some_and(|t| start.elapsed() >= t) { break; }
+
+                            match self.run_trial_multi_with_catch(func_ref, callbacks, catch_ref) {
+                                Ok(()) => {}
+                                Err(e) => return Err(e),
+                            }
+
+                            #[cfg(feature = "progress")]
+                            if let Some(ref pb) = progress {
+                                pb.inc(1);
+                            }
+                        }
+                        Ok(())
+                    });
+                    handles.push(handle);
+                }
+                for handle in handles {
+                    handle.join().map_err(|_| {
+                        OptunaError::StorageInternalError("Worker thread panicked".into())
+                    })??;
+                }
+                Ok(())
+            })?;
+        }
+
+        #[cfg(feature = "progress")]
+        if let Some(pb) = progress {
+            pb.finish_with_message("optimization complete");
         }
 
         self.storage.remove_session();
@@ -372,7 +900,123 @@ impl Study {
         Ok(())
     }
 
-    /// Execute a single trial (single-objective).
+    /// 执行单次试验（单目标），支持 catch 异常捕获。
+    ///
+    /// 对应 Python `_run_trial()`。
+    /// `catch` 中列出的异常类型不会中断优化（试验标记为 Fail)。
+    /// 不在 `catch` 中的异常会向上传播。
+    fn run_trial_with_catch<F>(
+        &self,
+        func: &F,
+        callbacks: Option<&[&dyn Callback]>,
+        catch: &[&str],
+    ) -> Result<()>
+    where
+        F: Fn(&mut Trial) -> Result<f64>,
+    {
+        let mut trial = self.ask(None)?;
+        let trial_id = trial.trial_id();
+
+        // 保存异常信息用于后续 catch 判断
+        let mut func_err: Option<OptunaError> = None;
+
+        let (state, values) = match func(&mut trial) {
+            Ok(value) => {
+                if value.is_nan() {
+                    // NaN → FAIL（对齐 Python _tell_with_warning suppress_warning=True）
+                    (TrialState::Fail, None)
+                } else {
+                    (TrialState::Complete, Some(vec![value]))
+                }
+            }
+            Err(OptunaError::TrialPruned) => {
+                // Pruned: tell() 会自动提取最后中间值，不传 values
+                (TrialState::Pruned, None)
+            }
+            Err(e) => {
+                func_err = Some(e);
+                (TrialState::Fail, None)
+            }
+        };
+
+        let frozen = self.tell(trial_id, state, values.as_deref())?;
+
+        // 运行回调
+        if let Some(cbs) = callbacks {
+            for cb in cbs {
+                cb.on_trial_complete(self, &frozen);
+            }
+        }
+
+        // catch 判断: 如果异常不在 catch 列表中，则重新抛出
+        if state == TrialState::Fail {
+            if let Some(err) = func_err {
+                if !error_matches_catch(&err, catch) {
+                    return Err(err);
+                }
+                // 在 catch 列表中 → 静默吞掉，继续优化
+            }
+        }
+
+        Ok(())
+    }
+
+    /// 执行单次多目标试验，支持 catch 异常捕获。
+    fn run_trial_multi_with_catch<F>(
+        &self,
+        func: &F,
+        callbacks: Option<&[&dyn Callback]>,
+        catch: &[&str],
+    ) -> Result<()>
+    where
+        F: Fn(&mut Trial) -> Result<Vec<f64>>,
+    {
+        let mut trial = self.ask(None)?;
+        let trial_id = trial.trial_id();
+
+        let mut func_err: Option<OptunaError> = None;
+
+        let (state, values) = match func(&mut trial) {
+            Ok(vals) => {
+                if vals.iter().any(|v| v.is_nan())
+                    || vals.len() != self.directions.len()
+                {
+                    // NaN 或数量不匹配 → FAIL
+                    (TrialState::Fail, None)
+                } else {
+                    (TrialState::Complete, Some(vals))
+                }
+            }
+            Err(OptunaError::TrialPruned) => {
+                // Pruned: tell() 会自动提取最后中间值
+                (TrialState::Pruned, None)
+            }
+            Err(e) => {
+                func_err = Some(e);
+                (TrialState::Fail, None)
+            }
+        };
+
+        let frozen = self.tell(trial_id, state, values.as_deref())?;
+
+        if let Some(cbs) = callbacks {
+            for cb in cbs {
+                cb.on_trial_complete(self, &frozen);
+            }
+        }
+
+        if state == TrialState::Fail {
+            if let Some(err) = func_err {
+                if !error_matches_catch(&err, catch) {
+                    return Err(err);
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    /// 执行单次试验 (向后兼容的简化版本)。
     fn run_trial<F>(
         &self,
         func: &F,
@@ -381,51 +1025,10 @@ impl Study {
     where
         F: Fn(&mut Trial) -> Result<f64>,
     {
-        let mut trial = self.ask(None)?;
-        let trial_id = trial.trial_id();
-
-        let (state, values) = match func(&mut trial) {
-            Ok(value) => {
-                // Validate the value
-                if value.is_nan() {
-                    (TrialState::Fail, None)
-                } else {
-                    (TrialState::Complete, Some(vec![value]))
-                }
-            }
-            Err(OptunaError::TrialPruned) => {
-                // Use last intermediate value if available
-                let frozen = self.storage.get_trial(trial_id)?;
-                let last_value = frozen
-                    .last_step()
-                    .and_then(|step| frozen.intermediate_values.get(&step))
-                    .copied()
-                    .filter(|v| v.is_finite());
-                (TrialState::Pruned, last_value.map(|v| vec![v]))
-            }
-            Err(_e) => (TrialState::Fail, None),
-        };
-
-        let frozen = self.tell(
-            trial_id,
-            state,
-            values.as_deref(),
-        )?;
-
-        // Run callbacks
-        if let Some(cbs) = callbacks {
-            let n_complete = self
-                .storage
-                .get_n_trials(self.study_id, Some(&[TrialState::Complete]))?;
-            for cb in cbs {
-                cb.on_trial_complete(n_complete, &frozen);
-            }
-        }
-
-        Ok(())
+        self.run_trial_with_catch(func, callbacks, &[])
     }
 
-    /// Execute a single trial (multi-objective).
+    /// 执行单次多目标试验 (向后兼容的简化版本)。
     fn run_trial_multi<F>(
         &self,
         func: &F,
@@ -434,62 +1037,29 @@ impl Study {
     where
         F: Fn(&mut Trial) -> Result<Vec<f64>>,
     {
-        let mut trial = self.ask(None)?;
-        let trial_id = trial.trial_id();
-
-        let (state, values) = match func(&mut trial) {
-            Ok(vals) => {
-                if vals.iter().any(|v| v.is_nan())
-                    || vals.len() != self.directions.len()
-                {
-                    (TrialState::Fail, None)
-                } else {
-                    (TrialState::Complete, Some(vals))
-                }
-            }
-            Err(OptunaError::TrialPruned) => {
-                let frozen = self.storage.get_trial(trial_id)?;
-                let last_value = frozen
-                    .last_step()
-                    .and_then(|step| frozen.intermediate_values.get(&step))
-                    .copied()
-                    .filter(|v| v.is_finite());
-                (TrialState::Pruned, last_value.map(|v| vec![v]))
-            }
-            Err(_e) => (TrialState::Fail, None),
-        };
-
-        let frozen = self.tell(
-            trial_id,
-            state,
-            values.as_deref(),
-        )?;
-
-        if let Some(cbs) = callbacks {
-            let n_complete = self
-                .storage
-                .get_n_trials(self.study_id, Some(&[TrialState::Complete]))?;
-            for cb in cbs {
-                cb.on_trial_complete(n_complete, &frozen);
-            }
-        }
-
-        Ok(())
+        self.run_trial_multi_with_catch(func, callbacks, &[])
     }
 
-    /// Try to pop a WAITING trial and set it to RUNNING.
+    /// 尝试弹出一个 WAITING 试验并设为 RUNNING。
+    /// 尝试弹出一个 WAITING 试验并设为 RUNNING。
+    ///
+    /// 对齐 Python `_pop_waiting_trial_id`:
+    /// 遍历所有 WAITING 试验，逐一尝试 CAS 设为 RUNNING。
+    /// 如果某个已被其他线程占用（返回 false）或已完成，继续尝试下一个。
     fn pop_waiting_trial(&self) -> Result<Option<i64>> {
         let waiting = self
             .storage
             .get_all_trials(self.study_id, Some(&[TrialState::Waiting]))?;
-        if let Some(t) = waiting.first() {
-            let ok = self.storage.set_trial_state_values(
+        for t in &waiting {
+            match self.storage.set_trial_state_values(
                 t.trial_id,
                 TrialState::Running,
                 None,
-            )?;
-            if ok {
-                return Ok(Some(t.trial_id));
+            ) {
+                Ok(true) => return Ok(Some(t.trial_id)),
+                Ok(false) => continue, // 已被其他线程占用
+                Err(OptunaError::UpdateFinishedTrialError(_)) => continue, // 已完成
+                Err(e) => return Err(e),
             }
         }
         Ok(None)
@@ -498,7 +1068,22 @@ impl Study {
 
 /// Add a trial to a study directly.
 impl Study {
+    /// Add a trial to this study.
+    ///
+    /// 对齐 Python `Study.add_trial()`:
+    /// 1. 调用 trial.validate() 验证不变量
+    /// 2. 检查 values 数量与 directions 一致
     pub fn add_trial(&self, trial: &FrozenTrial) -> Result<()> {
+        trial.validate()?;
+        if let Some(vals) = &trial.values {
+            if self.directions.len() != vals.len() {
+                return Err(OptunaError::ValueError(format!(
+                    "The number of the values {} did not match the number of the objectives {}",
+                    vals.len(),
+                    self.directions.len()
+                )));
+            }
+        }
         self.storage
             .create_new_trial(self.study_id, Some(trial))?;
         Ok(())
@@ -515,7 +1100,25 @@ impl Study {
         &self,
         params: HashMap<String, crate::distributions::ParamValue>,
         user_attrs: Option<HashMap<String, serde_json::Value>>,
+        skip_if_exists: bool,
     ) -> Result<()> {
+        // skip_if_exists: 检查是否已有相同参数的 WAITING 试验
+        if skip_if_exists {
+            let waiting = self.storage.get_all_trials(
+                self.study_id,
+                Some(&[TrialState::Waiting]),
+            )?;
+            for t in &waiting {
+                if let Some(fp) = t.system_attrs.get("fixed_params") {
+                    if let Ok(existing) = serde_json::from_value::<HashMap<String, crate::distributions::ParamValue>>(fp.clone()) {
+                        if existing == params {
+                            return Ok(()); // 已存在相同参数的入队试验
+                        }
+                    }
+                }
+            }
+        }
+
         let mut template = FrozenTrial {
             number: 0,
             state: TrialState::Waiting,
@@ -994,5 +1597,101 @@ mod tests {
         // With 40 random trials, should find something reasonable
         let best_val = study.best_value().unwrap();
         assert!(best_val < 30.0, "best value {best_val} should be < 30");
+    }
+
+    #[test]
+    fn test_study_system_attrs() {
+        let study = create_study(
+            None, None, None, None,
+            Some(StudyDirection::Minimize), None, false,
+        ).unwrap();
+
+        // 设置系统属性
+        study.set_system_attr("test_key", serde_json::json!("test_value")).unwrap();
+        let attrs = study.system_attrs().unwrap();
+        assert_eq!(attrs.get("test_key").unwrap(), &serde_json::json!("test_value"));
+
+        // 覆盖已有属性
+        study.set_system_attr("test_key", serde_json::json!(42)).unwrap();
+        let attrs = study.system_attrs().unwrap();
+        assert_eq!(attrs.get("test_key").unwrap(), &serde_json::json!(42));
+    }
+
+    #[test]
+    fn test_study_metric_names() {
+        let study = create_study(
+            None, None, None, None,
+            Some(StudyDirection::Minimize), None, false,
+        ).unwrap();
+
+        // 初始无 metric_names
+        assert!(study.metric_names().unwrap().is_none());
+
+        // 设置 metric_names（长度必须与 directions 一致）
+        study.set_metric_names(&["loss"]).unwrap();
+        let names = study.metric_names().unwrap().unwrap();
+        assert_eq!(names, vec!["loss"]);
+    }
+
+    #[test]
+    fn test_trial_attribute_accessors() {
+        let study = create_study(
+            None, None, None, None,
+            Some(StudyDirection::Minimize), None, false,
+        ).unwrap();
+
+        let mut trial = study.ask(None).unwrap();
+        let x = trial.suggest_float("x", 0.0, 1.0, false, None).unwrap();
+
+        // params 访问器
+        let params = trial.params().unwrap();
+        assert!(params.contains_key("x"));
+
+        // distributions 访问器
+        let dists = trial.distributions().unwrap();
+        assert!(dists.contains_key("x"));
+
+        // user_attrs 访问器
+        trial.set_user_attr("note", serde_json::json!("hello")).unwrap();
+        let attrs = trial.user_attrs().unwrap();
+        assert_eq!(attrs.get("note").unwrap(), &serde_json::json!("hello"));
+
+        // datetime_start 访问器
+        let start = trial.datetime_start().unwrap();
+        assert!(start.is_some());
+
+        // Tell 完成
+        study.tell(trial.trial_id(), TrialState::Complete, Some(&[x])).unwrap();
+    }
+
+    #[test]
+    fn test_create_trial_function() {
+        use crate::trial::create_trial;
+        use crate::distributions::{FloatDistribution, ParamValue};
+
+        let mut params = HashMap::new();
+        params.insert("x".to_string(), ParamValue::Float(0.5));
+
+        let mut dists = HashMap::new();
+        dists.insert(
+            "x".to_string(),
+            Distribution::FloatDistribution(FloatDistribution::new(0.0, 1.0, false, None).unwrap()),
+        );
+
+        let trial = create_trial(
+            Some(TrialState::Complete),
+            Some(0.25),
+            None,
+            Some(params),
+            Some(dists),
+            None,
+            None,
+            None,
+        );
+
+        assert_eq!(trial.state, TrialState::Complete);
+        assert_eq!(trial.values.as_ref().unwrap()[0], 0.25);
+        assert!(trial.params.contains_key("x"));
+        assert!(trial.distributions.contains_key("x"));
     }
 }

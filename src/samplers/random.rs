@@ -62,6 +62,7 @@ impl RandomSampler {
 impl Sampler for RandomSampler {
     fn sample_independent(
         &self,
+        _trials: &[FrozenTrial],
         _trial: &FrozenTrial,
         _param_name: &str,
         distribution: &Distribution,
@@ -100,7 +101,7 @@ mod tests {
             Distribution::FloatDistribution(FloatDistribution::new(0.0, 1.0, false, None).unwrap());
         let trial = dummy_trial();
         for _ in 0..100 {
-            let v = sampler.sample_independent(&trial, "x", &dist).unwrap();
+            let v = sampler.sample_independent(&[], &trial, "x", &dist).unwrap();
             assert!(
                 (0.0..=1.0).contains(&v),
                 "value {v} out of [0, 1]"
@@ -116,7 +117,7 @@ mod tests {
         );
         let trial = dummy_trial();
         for _ in 0..100 {
-            let v = sampler.sample_independent(&trial, "lr", &dist).unwrap();
+            let v = sampler.sample_independent(&[], &trial, "lr", &dist).unwrap();
             assert!(
                 (0.001..=1.0).contains(&v),
                 "value {v} out of [0.001, 1.0]"
@@ -131,7 +132,7 @@ mod tests {
         let dist = Distribution::FloatDistribution(fd.clone());
         let trial = dummy_trial();
         for _ in 0..100 {
-            let v = sampler.sample_independent(&trial, "x", &dist).unwrap();
+            let v = sampler.sample_independent(&[], &trial, "x", &dist).unwrap();
             assert!(fd.contains(v), "value {v} not on step grid");
         }
     }
@@ -143,7 +144,7 @@ mod tests {
             Distribution::IntDistribution(IntDistribution::new(1, 10, false, 1).unwrap());
         let trial = dummy_trial();
         for _ in 0..100 {
-            let v = sampler.sample_independent(&trial, "n", &dist).unwrap() as i64;
+            let v = sampler.sample_independent(&[], &trial, "n", &dist).unwrap() as i64;
             assert!((1..=10).contains(&v), "value {v} out of [1, 10]");
         }
     }
@@ -155,7 +156,7 @@ mod tests {
         let dist = Distribution::IntDistribution(id.clone());
         let trial = dummy_trial();
         for _ in 0..100 {
-            let v = sampler.sample_independent(&trial, "n", &dist).unwrap();
+            let v = sampler.sample_independent(&[], &trial, "n", &dist).unwrap();
             assert!(id.contains(v), "value {v} not on step grid");
         }
     }
@@ -167,7 +168,7 @@ mod tests {
             Distribution::IntDistribution(IntDistribution::new(1, 100, true, 1).unwrap());
         let trial = dummy_trial();
         for _ in 0..100 {
-            let v = sampler.sample_independent(&trial, "n", &dist).unwrap() as i64;
+            let v = sampler.sample_independent(&[], &trial, "n", &dist).unwrap() as i64;
             assert!((1..=100).contains(&v), "value {v} out of [1, 100]");
         }
     }
@@ -185,7 +186,7 @@ mod tests {
         );
         let trial = dummy_trial();
         for _ in 0..100 {
-            let v = sampler.sample_independent(&trial, "opt", &dist).unwrap() as usize;
+            let v = sampler.sample_independent(&[], &trial, "opt", &dist).unwrap() as usize;
             assert!(v < 3, "index {v} out of range");
         }
     }
@@ -198,12 +199,12 @@ mod tests {
         let fd = Distribution::FloatDistribution(
             FloatDistribution::new(5.0, 5.0, false, None).unwrap(),
         );
-        let v = sampler.sample_independent(&trial, "x", &fd).unwrap();
+        let v = sampler.sample_independent(&[], &trial, "x", &fd).unwrap();
         assert!((v - 5.0).abs() < 1e-10);
 
         let id =
             Distribution::IntDistribution(IntDistribution::new(3, 3, false, 1).unwrap());
-        let v = sampler.sample_independent(&trial, "n", &id).unwrap();
+        let v = sampler.sample_independent(&[], &trial, "n", &id).unwrap();
         assert!((v - 3.0).abs() < 1e-10);
     }
 
@@ -215,8 +216,8 @@ mod tests {
             Distribution::FloatDistribution(FloatDistribution::new(0.0, 1.0, false, None).unwrap());
         let trial = dummy_trial();
         for _ in 0..20 {
-            let v1 = s1.sample_independent(&trial, "x", &dist).unwrap();
-            let v2 = s2.sample_independent(&trial, "x", &dist).unwrap();
+            let v1 = s1.sample_independent(&[], &trial, "x", &dist).unwrap();
+            let v2 = s2.sample_independent(&[], &trial, "x", &dist).unwrap();
             assert_eq!(v1, v2);
         }
     }

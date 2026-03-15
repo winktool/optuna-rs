@@ -94,6 +94,7 @@ impl Sampler for PartialFixedSampler {
 
     fn sample_independent(
         &self,
+        trials: &[FrozenTrial],
         trial: &FrozenTrial,
         param_name: &str,
         distribution: &Distribution,
@@ -102,7 +103,7 @@ impl Sampler for PartialFixedSampler {
             return Ok(value);
         }
         self.base_sampler
-            .sample_independent(trial, param_name, distribution)
+            .sample_independent(trials, trial, param_name, distribution)
     }
 
     fn before_trial(&self, trials: &[FrozenTrial]) {

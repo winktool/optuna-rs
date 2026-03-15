@@ -2,4 +2,7 @@ mod parzen_estimator;
 mod sampler;
 mod truncnorm;
 
-pub use sampler::{TpeSampler, TpeSamplerBuilder};
+pub use sampler::{
+    TpeSampler, TpeSamplerBuilder, ConstraintsFn, GammaFn, WeightsFn,
+    default_weights, hyperopt_default_gamma,
+};

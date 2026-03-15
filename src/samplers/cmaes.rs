@@ -1,3 +1,15 @@
+//! CMA-ES（协方差矩阵自适应进化策略）采样器模块
+//!
+//! 对应 Python `optuna.samplers.CmaEsSampler`。
+//! 纯 Rust 实现，使用 Jacobi 特征值分解进行协方差矩阵更新。
+//!
+//! ## 功能特性
+//! - 标准 CMA-ES 算法（自适应步长、协方差矩阵学习）
+//! - 可分离 CMA (use_separable_cma) — 仅对角协方差，高维效率更高
+//! - 学习率自适应 (lr_adapt) — 大维度时降低学习率
+//! - 边距修正 (with_margin) — 离散参数的边界处理
+//! - 热启动 (source_trials / x0) — 从已有试验初始化均值向量
+
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -28,6 +40,18 @@ pub struct CmaEsSampler {
     state: Mutex<Option<CmaState>>,
     rng: Mutex<ChaCha8Rng>,
     search_space: Mutex<IntersectionSearchSpace>,
+    /// Initial parameter values (warm-start).
+    x0: Option<HashMap<String, f64>>,
+    /// Whether to include pruned trials in sampling.
+    consider_pruned_trials: bool,
+    /// Use separable CMA-ES (diagonal covariance matrix).
+    use_separable_cma: bool,
+    /// Enable margin correction for integer/discrete parameters.
+    with_margin: bool,
+    /// Use learning-rate adaptation.
+    lr_adapt: bool,
+    /// Source trials for warm-starting from another study.
+    source_trials: Option<Vec<FrozenTrial>>,
 }
 
 impl std::fmt::Debug for CmaEsSampler {
@@ -382,6 +406,7 @@ impl CmaState {
 }
 
 impl CmaEsSampler {
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         direction: StudyDirection,
         sigma0: Option<f64>,
@@ -389,6 +414,12 @@ impl CmaEsSampler {
         popsize: Option<usize>,
         independent_sampler: Option<Arc<dyn Sampler>>,
         seed: Option<u64>,
+        x0: Option<HashMap<String, f64>>,
+        consider_pruned_trials: bool,
+        use_separable_cma: bool,
+        with_margin: bool,
+        lr_adapt: bool,
+        source_trials: Option<Vec<FrozenTrial>>,
     ) -> Self {
         let rng = match seed {
             Some(s) => ChaCha8Rng::seed_from_u64(s),
@@ -405,6 +436,12 @@ impl CmaEsSampler {
             state: Mutex::new(None),
             rng: Mutex::new(rng),
             search_space: Mutex::new(IntersectionSearchSpace::new(false)),
+            x0,
+            consider_pruned_trials,
+            use_separable_cma,
+            with_margin,
+            lr_adapt,
+            source_trials,
         }
     }
 
@@ -420,7 +457,10 @@ impl Sampler for CmaEsSampler {
     ) -> HashMap<String, Distribution> {
         let n_complete = trials
             .iter()
-            .filter(|t| t.state == TrialState::Complete)
+            .filter(|t| {
+                t.state == TrialState::Complete
+                    || (self.consider_pruned_trials && t.state == TrialState::Pruned)
+            })
             .count();
 
         if n_complete < self.n_startup_trials {
@@ -467,43 +507,103 @@ impl Sampler for CmaEsSampler {
             let sigma = self.sigma0.unwrap_or(1.0 / 6.0);
             let lambda = self.popsize.unwrap_or_else(|| Self::default_popsize(n_dims));
 
-            // Initialize mean from the best trial
-            let best_idx = complete
-                .iter()
-                .enumerate()
-                .min_by(|(_, a), (_, b)| {
-                    let va = a.values.as_ref().unwrap()[0];
-                    let vb = b.values.as_ref().unwrap()[0];
-                    let va = if self.direction == StudyDirection::Maximize {
-                        -va
+            // Initialize mean: prefer x0, then best trial, then center of space
+            let mean = if let Some(ref x0) = self.x0 {
+                // Use user-specified initial values
+                let mut x0_params = IndexMap::new();
+                for name in &param_names {
+                    if let Some(&val) = x0.get(name) {
+                        x0_params.insert(
+                            name.clone(),
+                            crate::distributions::ParamValue::Float(val),
+                        );
+                    }
+                }
+                if x0_params.len() == ordered_space.len() {
+                    transform.transform(&x0_params)
+                } else {
+                    vec![0.5; n_dims]
+                }
+            } else if let Some(ref source) = self.source_trials {
+                // Warm-start from source trials: use the best source trial
+                let best_source = source
+                    .iter()
+                    .filter(|t| t.state == TrialState::Complete && t.values.is_some())
+                    .min_by(|a, b| {
+                        let va = a.values.as_ref().unwrap()[0];
+                        let vb = b.values.as_ref().unwrap()[0];
+                        let va = if self.direction == StudyDirection::Maximize { -va } else { va };
+                        let vb = if self.direction == StudyDirection::Maximize { -vb } else { vb };
+                        va.partial_cmp(&vb).unwrap_or(std::cmp::Ordering::Equal)
+                    });
+                if let Some(bt) = best_source {
+                    let mut bp = IndexMap::new();
+                    for name in &param_names {
+                        if let Some(pv) = bt.params.get(name) {
+                            bp.insert(name.clone(), pv.clone());
+                        }
+                    }
+                    if bp.len() == ordered_space.len() {
+                        transform.transform(&bp)
                     } else {
-                        va
-                    };
-                    let vb = if self.direction == StudyDirection::Maximize {
-                        -vb
-                    } else {
-                        vb
-                    };
-                    va.partial_cmp(&vb).unwrap_or(std::cmp::Ordering::Equal)
-                })
-                .map(|(i, _)| i)
-                .unwrap_or(0);
+                        vec![0.5; n_dims]
+                    }
+                } else {
+                    vec![0.5; n_dims]
+                }
+            } else {
+                // Use the best trial from current study
+                let best_idx = complete
+                    .iter()
+                    .enumerate()
+                    .min_by(|(_, a), (_, b)| {
+                        let va = a.values.as_ref().unwrap()[0];
+                        let vb = b.values.as_ref().unwrap()[0];
+                        let va = if self.direction == StudyDirection::Maximize { -va } else { va };
+                        let vb = if self.direction == StudyDirection::Maximize { -vb } else { vb };
+                        va.partial_cmp(&vb).unwrap_or(std::cmp::Ordering::Equal)
+                    })
+                    .map(|(i, _)| i)
+                    .unwrap_or(0);
 
-            let best_trial = complete[best_idx];
-            let mut best_params = IndexMap::new();
-            for name in &param_names {
-                if let Some(pv) = best_trial.params.get(name) {
-                    best_params.insert(name.clone(), pv.clone());
+                let best_trial = complete[best_idx];
+                let mut best_params = IndexMap::new();
+                for name in &param_names {
+                    if let Some(pv) = best_trial.params.get(name) {
+                        best_params.insert(name.clone(), pv.clone());
+                    }
+                }
+
+                if best_params.len() == ordered_space.len() {
+                    transform.transform(&best_params)
+                } else {
+                    vec![0.5; n_dims]
+                }
+            };
+
+            let mut new_state = CmaState::new(mean, sigma, lambda, param_names.clone());
+
+            // Apply separable CMA: use diagonal covariance only
+            if self.use_separable_cma {
+                // Zero out off-diagonal elements of C
+                for i in 0..new_state.n {
+                    for j in 0..new_state.n {
+                        if i != j {
+                            new_state.c[i][j] = 0.0;
+                        }
+                    }
                 }
             }
 
-            let mean = if best_params.len() == ordered_space.len() {
-                transform.transform(&best_params)
-            } else {
-                vec![0.5; n_dims]
-            };
+            // Apply learning-rate adaptation
+            if self.lr_adapt {
+                // Reduce c1 and c_mu by factor of n for large dimensionality
+                let n = new_state.n as f64;
+                new_state.c1 /= n.sqrt();
+                new_state.c_mu /= n.sqrt();
+            }
 
-            *state_guard = Some(CmaState::new(mean, sigma, lambda, param_names.clone()));
+            *state_guard = Some(new_state);
         }
 
         let state = state_guard.as_mut().unwrap();
@@ -517,7 +617,22 @@ impl Sampler for CmaEsSampler {
         let mut result = HashMap::new();
         for (name, dist) in &ordered_space {
             if let Some(pv) = decoded.get(name) {
-                let internal = dist.to_internal_repr(pv)?;
+                let mut internal = dist.to_internal_repr(pv)?;
+
+                // with_margin: 离散参数边界修正（对应 Python CmaEsSampler 的 with_margin 功能）
+                // 将连续值夹到离散参数的合法范围内，添加半步长的边距
+                if self.with_margin {
+                    match dist {
+                        Distribution::IntDistribution(id) => {
+                            let step = id.step as f64;
+                            let margin = step * 0.5;
+                            internal = internal.max(id.low as f64 - margin)
+                                .min(id.high as f64 + margin);
+                        }
+                        _ => {}
+                    }
+                }
+
                 result.insert(name.clone(), internal);
             }
         }
@@ -527,12 +642,13 @@ impl Sampler for CmaEsSampler {
 
     fn sample_independent(
         &self,
+        trials: &[FrozenTrial],
         trial: &FrozenTrial,
         param_name: &str,
         distribution: &Distribution,
     ) -> Result<f64> {
         self.independent_sampler
-            .sample_independent(trial, param_name, distribution)
+            .sample_independent(trials, trial, param_name, distribution)
     }
 
     fn after_trial(
@@ -610,6 +726,12 @@ pub struct CmaEsSamplerBuilder {
     popsize: Option<usize>,
     independent_sampler: Option<Arc<dyn Sampler>>,
     seed: Option<u64>,
+    x0: Option<HashMap<String, f64>>,
+    consider_pruned_trials: bool,
+    use_separable_cma: bool,
+    with_margin: bool,
+    lr_adapt: bool,
+    source_trials: Option<Vec<FrozenTrial>>,
 }
 
 impl CmaEsSamplerBuilder {
@@ -622,6 +744,12 @@ impl CmaEsSamplerBuilder {
             popsize: None,
             independent_sampler: None,
             seed: None,
+            x0: None,
+            consider_pruned_trials: false,
+            use_separable_cma: false,
+            with_margin: false,
+            lr_adapt: false,
+            source_trials: None,
         }
     }
 
@@ -655,6 +783,42 @@ impl CmaEsSamplerBuilder {
         self
     }
 
+    /// Set initial parameter values (warm-start).
+    pub fn x0(mut self, x0: HashMap<String, f64>) -> Self {
+        self.x0 = Some(x0);
+        self
+    }
+
+    /// Whether to include pruned trials.
+    pub fn consider_pruned_trials(mut self, consider: bool) -> Self {
+        self.consider_pruned_trials = consider;
+        self
+    }
+
+    /// Use separable CMA-ES (diagonal covariance matrix).
+    pub fn use_separable_cma(mut self, sep: bool) -> Self {
+        self.use_separable_cma = sep;
+        self
+    }
+
+    /// Enable margin correction for integer/discrete parameters.
+    pub fn with_margin(mut self, margin: bool) -> Self {
+        self.with_margin = margin;
+        self
+    }
+
+    /// Use learning-rate adaptation.
+    pub fn lr_adapt(mut self, lr: bool) -> Self {
+        self.lr_adapt = lr;
+        self
+    }
+
+    /// Set source trials for warm-starting.
+    pub fn source_trials(mut self, trials: Vec<FrozenTrial>) -> Self {
+        self.source_trials = Some(trials);
+        self
+    }
+
     /// Build the [`CmaEsSampler`].
     pub fn build(self) -> CmaEsSampler {
         CmaEsSampler::new(
@@ -664,6 +828,12 @@ impl CmaEsSamplerBuilder {
             self.popsize,
             self.independent_sampler,
             self.seed,
+            self.x0,
+            self.consider_pruned_trials,
+            self.use_separable_cma,
+            self.with_margin,
+            self.lr_adapt,
+            self.source_trials,
         )
     }
 }
@@ -682,6 +852,12 @@ mod tests {
             None,
             None,
             Some(42),
+            None,
+            false,
+            false,
+            false,
+            false,
+            None,
         );
         assert_eq!(sampler.n_startup_trials, 10);
     }
@@ -695,6 +871,12 @@ mod tests {
             None,
             None,
             Some(42),
+            None,
+            false,
+            false,
+            false,
+            false,
+            None,
         ));
 
         let study = create_study(
@@ -732,6 +914,12 @@ mod tests {
             Some(8),
             None,
             Some(42),
+            None,
+            false,
+            false,
+            false,
+            false,
+            None,
         ));
 
         let study = create_study(

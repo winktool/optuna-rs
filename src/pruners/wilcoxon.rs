@@ -190,6 +190,11 @@ fn wilcoxon_signed_rank_test(diff_values: &[f64], direction: StudyDirection) -> 
         .map(|(i, &d)| (d.abs(), i))
         .collect();
 
+    // 对齐 Python scipy: 如果所有差值都是零，直接返回 1.0（NullHypothesisWarning）
+    if abs_diffs.iter().all(|(a, _)| *a < 1e-15) {
+        return 1.0;
+    }
+
     // 按绝对值排序
     abs_diffs.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
 
@@ -445,6 +450,51 @@ mod tests {
         assert_eq!(ranks[1], 2.5); // 值 2.0 并列 → 秩 (2+3)/2 = 2.5
         assert_eq!(ranks[2], 2.5);
         assert_eq!(ranks[3], 4.0); // 值 3.0 → 秩 4
+    }
+
+    // ========================================================================
+    // Python 交叉验证测试: 使用 scipy.stats.wilcoxon 精确参考值
+    // ========================================================================
+
+    /// Python: wilcoxon([10]*20, alt='greater', zero_method='zsplit').pvalue ≈ 3.87e-06
+    /// 全部正差值 → p 值极小 → 方向一致
+    #[test]
+    fn test_python_cross_wilcoxon_clear_diff() {
+        let diff: Vec<f64> = vec![10.0; 20];
+        let p = wilcoxon_signed_rank_test(&diff, StudyDirection::Minimize);
+        // Python 精确值: 3.872108215522035e-06
+        assert!(p < 0.001, "Python p≈3.87e-06, got {p}");
+    }
+
+    /// Python: wilcoxon([0]*10, alt='greater', zero_method='zsplit').pvalue = 1.0
+    /// 全部零差值 → p = 1.0 → 不能拒绝原假设
+    #[test]
+    fn test_python_cross_wilcoxon_all_zero() {
+        let diff: Vec<f64> = vec![0.0; 10];
+        let p = wilcoxon_signed_rank_test(&diff, StudyDirection::Minimize);
+        // Python 精确值: 1.0
+        assert!((p - 1.0).abs() < 0.05, "Python p=1.0, got {p}");
+    }
+
+    /// Python: wilcoxon(mixed, alt='greater', zero_method='zsplit').pvalue ≈ 0.0439
+    /// 混合正负差值 → 中等 p 值
+    #[test]
+    fn test_python_cross_wilcoxon_mixed() {
+        let diff = vec![1.0, -0.5, 2.0, -0.3, 1.5, 0.8, -0.1, 1.2, 0.5, -0.2];
+        let p = wilcoxon_signed_rank_test(&diff, StudyDirection::Minimize);
+        // Python 精确值: 0.0439453125
+        // 正态近似可能有 ~0.01 偏移，允许 0.03 容差
+        assert!((p - 0.044).abs() < 0.03, "Python p≈0.044, got {p}");
+    }
+
+    /// Python: wilcoxon(mixed, alt='less', zero_method='zsplit').pvalue ≈ 0.9600
+    /// 同数据用 Maximize 方向 → p 值大 → 不剪枝
+    #[test]
+    fn test_python_cross_wilcoxon_mixed_maximize() {
+        let diff = vec![1.0, -0.5, 2.0, -0.3, 1.5, 0.8, -0.1, 1.2, 0.5, -0.2];
+        let p = wilcoxon_signed_rank_test(&diff, StudyDirection::Maximize);
+        // Python 精确值: 0.9599609375
+        assert!((p - 0.96).abs() < 0.03, "Python p≈0.96, got {p}");
     }
 
     #[test]

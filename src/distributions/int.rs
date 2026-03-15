@@ -248,4 +248,57 @@ mod tests {
             assert_eq!(v, external);
         }
     }
+
+    // ========================================================================
+    // Python 交叉验证测试
+    // ========================================================================
+
+    /// Python 交叉验证: IntDistribution(0, 10, step=3)
+    /// Python: high=9, single=false
+    #[test]
+    fn test_python_cross_int_step3() {
+        let d = IntDistribution::new(0, 10, false, 3).unwrap();
+        assert_eq!(d.high, 9,  "Python: high=9");
+        assert!(!d.single(),   "Python: single=false");
+        assert!(d.contains(0.0),  "Python: contains(0)=true");
+        assert!(d.contains(3.0),  "Python: contains(3)=true");
+        assert!(d.contains(6.0),  "Python: contains(6)=true");
+        assert!(d.contains(9.0),  "Python: contains(9)=true");
+        assert!(!d.contains(10.0), "Python: contains(10)=false");
+        assert!(!d.contains(1.0),  "Python: contains(1)=false");
+    }
+
+    /// Python 交叉验证: IntDistribution(0, 10, step=2)
+    /// Python: high=10
+    #[test]
+    fn test_python_cross_int_step2() {
+        let d = IntDistribution::new(0, 10, false, 2).unwrap();
+        assert_eq!(d.high, 10, "Python: high=10 (无调整)");
+    }
+
+    /// Python 交叉验证: IntDistribution(0, 2, step=5)
+    /// Python: high=0, single=true
+    #[test]
+    fn test_python_cross_int_small_range_step() {
+        let d = IntDistribution::new(0, 2, false, 5).unwrap();
+        assert_eq!(d.high, 0, "Python: high=0");
+        assert!(d.single(),  "Python: single=true");
+    }
+
+    /// Python 交叉验证: IntDistribution(1, 100, log=True)
+    /// Python: single=false
+    #[test]
+    fn test_python_cross_int_log() {
+        let d = IntDistribution::new(1, 100, true, 1).unwrap();
+        assert!(!d.single(), "Python: single=false");
+    }
+
+    /// log 分布的 to_internal_repr 拒绝非正值
+    #[test]
+    fn test_log_to_internal_repr_rejects_non_positive() {
+        let d = IntDistribution::new(1, 100, true, 1).unwrap();
+        assert!(d.to_internal_repr(0).is_err());
+        assert!(d.to_internal_repr(-1).is_err());
+        assert!(d.to_internal_repr(1).is_ok());
+    }
 }

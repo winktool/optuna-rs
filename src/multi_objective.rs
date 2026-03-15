@@ -150,12 +150,18 @@ pub fn dominates(a: &[f64], b: &[f64], directions: &[StudyDirection]) -> bool {
     debug_assert_eq!(a.len(), b.len());
     debug_assert_eq!(a.len(), directions.len());
 
+    // 防御式处理：若方向未设置（NotSet），不应让调用栈 panic 崩溃。
+    // Python 对应场景会在更上层做方向有效性校验；这里返回 false 以保持运行稳定性。
+    if directions.iter().any(|d| matches!(d, StudyDirection::NotSet)) {
+        return false;
+    }
+
     let mut dominated_in_any = false;
     for i in 0..a.len() {
         let cmp = match directions[i] {
             StudyDirection::Minimize => a[i].partial_cmp(&b[i]),
             StudyDirection::Maximize => b[i].partial_cmp(&a[i]),
-            StudyDirection::NotSet => panic!("direction must be set"),
+            StudyDirection::NotSet => return false,
         };
         match cmp {
             Some(std::cmp::Ordering::Greater) => return false, // a is worse in this objective
@@ -995,6 +1001,13 @@ mod tests {
     }
 
     #[test]
+    fn test_dominates_notset_direction_no_panic_and_false() {
+        let dirs = vec![StudyDirection::NotSet, StudyDirection::Minimize];
+        assert!(!dominates(&[1.0, 1.0], &[2.0, 2.0], &dirs));
+        assert!(!dominates(&[2.0, 2.0], &[1.0, 1.0], &dirs));
+    }
+
+    #[test]
     fn test_fast_non_dominated_sort_simple() {
         let dirs = vec![StudyDirection::Minimize, StudyDirection::Minimize];
         let t0 = make_trial(0, vec![1.0, 4.0]);
@@ -1389,5 +1402,30 @@ mod tests {
         let (lower, upper) = get_non_dominated_box_bounds(&vals, &ref_point);
         assert!(!lower.is_empty());
         assert_eq!(lower.len(), upper.len());
+    }
+
+    // ========================================================================
+    // Python 交叉验证测试
+    // ========================================================================
+
+    /// Python 交叉验证: compute_hypervolume([[1,4],[2,3],[3,2],[4,1]], [5,5]) = 10.0
+    #[test]
+    fn test_python_cross_hypervolume_2d() {
+        let pts = vec![
+            vec![1.0, 4.0],
+            vec![2.0, 3.0],
+            vec![3.0, 2.0],
+            vec![4.0, 1.0],
+        ];
+        let ref_point = vec![5.0, 5.0];
+        let vol = hypervolume(&pts, &ref_point);
+        assert!((vol - 10.0).abs() < 1e-8, "Python: hypervolume=10.0, got {vol}");
+    }
+
+    /// Python 交叉验证: NotSet 方向不 panic（已修复为返回 false）
+    #[test]
+    fn test_python_cross_dominates_notset() {
+        let dirs = vec![StudyDirection::NotSet, StudyDirection::Minimize];
+        assert!(!dominates(&[1.0, 1.0], &[2.0, 2.0], &dirs));
     }
 }

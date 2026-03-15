@@ -243,4 +243,41 @@ mod tests {
         .unwrap();
         assert!(d.to_external_repr(5.0).is_err());
     }
+
+    // ========================================================================
+    // Python 交叉验证测试
+    // ========================================================================
+
+    /// Python 交叉验证: CategoricalDistribution(['a','b','c'])
+    /// Python: to_internal('a')=0, to_internal('c')=2, to_external(0)='a'
+    ///         single=false, contains(0)=true, contains(3)=false
+    #[test]
+    fn test_python_cross_categorical() {
+        let d = CategoricalDistribution::new(vec![
+            CategoricalChoice::Str("a".into()),
+            CategoricalChoice::Str("b".into()),
+            CategoricalChoice::Str("c".into()),
+        ]).unwrap();
+
+        assert_eq!(
+            d.to_internal_repr(&CategoricalChoice::Str("a".into())).unwrap(),
+            0.0, "Python: to_internal('a')=0"
+        );
+        assert_eq!(
+            d.to_internal_repr(&CategoricalChoice::Str("c".into())).unwrap(),
+            2.0, "Python: to_internal('c')=2"
+        );
+        let ext = d.to_external_repr(0.0).unwrap();
+        assert_eq!(ext, CategoricalChoice::Str("a".into()), "Python: to_external(0)='a'");
+        assert!(!d.single(), "Python: single=false");
+        assert!(d.contains(0.0),  "Python: contains(0)=true");
+        assert!(!d.contains(3.0), "Python: contains(3)=false");
+    }
+
+    /// Python 交叉验证: CategoricalDistribution([42]) → single=true
+    #[test]
+    fn test_python_cross_categorical_one() {
+        let d = CategoricalDistribution::new(vec![CategoricalChoice::Int(42)]).unwrap();
+        assert!(d.single(), "Python: single=true");
+    }
 }

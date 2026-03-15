@@ -340,4 +340,22 @@ mod tests {
         assert_eq!(nan_percentile(&[10.0], 50.0), 10.0);
         assert!(nan_percentile(&[], 50.0).is_nan());
     }
+
+    // ========================================================================
+    // Python 交叉验证测试: numpy.percentile 精确值
+    // ========================================================================
+
+    /// Python: np.percentile([1..10], 25) = 3.25
+    /// Python: np.percentile([1..10], 50) = 5.5
+    /// Python: np.percentile([1..10], 75) = 7.75
+    #[test]
+    fn test_python_cross_percentile_values() {
+        let vals: Vec<f64> = (1..=10).map(|x| x as f64).collect();
+        let p25 = nan_percentile(&vals, 25.0);
+        let p50 = nan_percentile(&vals, 50.0);
+        let p75 = nan_percentile(&vals, 75.0);
+        assert!((p25 - 3.25).abs() < 1e-10, "Python: percentile_25=3.25, got {p25}");
+        assert!((p50 - 5.5).abs()  < 1e-10, "Python: percentile_50=5.5, got {p50}");
+        assert!((p75 - 7.75).abs() < 1e-10, "Python: percentile_75=7.75, got {p75}");
+    }
 }

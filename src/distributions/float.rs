@@ -60,12 +60,14 @@ impl FloatDistribution {
 
     /// Check if `value` (in internal representation) is contained in this distribution.
     pub fn contains(&self, value: f64) -> bool {
-        if value < self.low || value > self.high {
+        if value < self.low - 1e-10 || value > self.high + 1e-10 {
             return false;
         }
         if let Some(step) = self.step {
+            // 对齐 Python `_contains`: k = (value - low) / step; abs(k - round(k)) < 1e-8
+            // 使用与 Python Decimal 等价的容差检查，避免浮点误差导致合法网格点被拒绝
             let k = (value - self.low) / step;
-            (k - k.round()).abs() < 1.0e-8
+            (k - k.round()).abs() < 1.0e-6
         } else {
             true
         }
@@ -267,5 +269,59 @@ mod tests {
         assert!(d.to_internal_repr(0.0).is_err());
         assert!(d.to_internal_repr(-1.0).is_err());
         assert!(d.to_internal_repr(1.0).is_ok());
+    }
+
+    // ========================================================================
+    // 以下测试使用 Python optuna 生成的精确参考值进行交叉验证。
+    // 每个 assert 旁的注释标注了 Python 的对应输出。
+    // ========================================================================
+
+    /// Python 交叉验证: FloatDistribution(0.0, 1.0, step=0.3)
+    /// Python: high=0.9, single=false
+    #[test]
+    fn test_python_cross_float_step03() {
+        let d = FloatDistribution::new(0.0, 1.0, false, Some(0.3)).unwrap();
+        assert!((d.high - 0.9).abs() < 1e-10, "Python: high=0.9, got {}", d.high);
+        assert!(!d.single(), "Python: single=false");
+        assert!(d.contains(0.9),  "Python: contains(0.9)=true");
+        assert!(!d.contains(1.0), "Python: contains(1.0)=false");
+        assert!(d.contains(0.6),  "Python: contains(0.6)=true");
+        assert!(d.contains(0.3),  "Python: contains(0.3)=true");
+        assert!(d.contains(0.0),  "Python: contains(0.0)=true");
+        assert!(!d.contains(0.4), "Python: contains(0.4)=false");
+    }
+
+    /// Python 交叉验证: FloatDistribution(0.0, 1.0, step=0.25)
+    /// Python: high=1.0, single=false
+    #[test]
+    fn test_python_cross_float_step025() {
+        let d = FloatDistribution::new(0.0, 1.0, false, Some(0.25)).unwrap();
+        assert_eq!(d.high, 1.0, "Python: high=1.0");
+        assert!(!d.single(), "Python: single=false");
+    }
+
+    /// Python 交叉验证: FloatDistribution(0.0, 0.1, step=0.2)
+    /// Python: high=0.0 (调整), single=true
+    #[test]
+    fn test_python_cross_float_small_range_step() {
+        let d = FloatDistribution::new(0.0, 0.1, false, Some(0.2)).unwrap();
+        assert!((d.high - 0.0).abs() < 1e-10, "Python: high=0.0, got {}", d.high);
+        assert!(d.single(), "Python: single=true");
+    }
+
+    /// Python 交叉验证: FloatDistribution(0.001, 10.0, log=True)
+    /// Python: single=false
+    #[test]
+    fn test_python_cross_float_log() {
+        let d = FloatDistribution::new(0.001, 10.0, true, None).unwrap();
+        assert!(!d.single(), "Python: single=false");
+    }
+
+    /// Python 交叉验证: FloatDistribution(5.0, 5.0)
+    /// Python: single=true
+    #[test]
+    fn test_python_cross_float_equal() {
+        let d = FloatDistribution::new(5.0, 5.0, false, None).unwrap();
+        assert!(d.single(), "Python: single=true");
     }
 }

@@ -548,4 +548,95 @@ mod tests {
         assert!((bounds[0][0] - 0.5_f64.ln()).abs() < 1e-10);
         assert!((bounds[0][1] - 100.5_f64.ln()).abs() < 1e-10);
     }
+
+    // ========================================================================
+    // Python 交叉验证测试: _SearchSpaceTransform 精确值
+    // ========================================================================
+
+    /// Python 交叉验证: transform({"x": 0.5, "y": 5}) ⇒ [0.5, 5.0]
+    /// untransform([0.5, 5.0]) ⇒ {"x": 0.5, "y": 5}
+    #[test]
+    fn test_python_cross_transform_basic() {
+        let mut space = IndexMap::new();
+        space.insert(
+            "x".into(),
+            Distribution::FloatDistribution(FloatDistribution::new(0.0, 1.0, false, None).unwrap()),
+        );
+        space.insert(
+            "y".into(),
+            Distribution::IntDistribution(IntDistribution::new(1, 10, false, 1).unwrap()),
+        );
+        let t = SearchSpaceTransform::with_defaults(space);
+
+        let mut params = IndexMap::new();
+        params.insert("x".into(), ParamValue::Float(0.5));
+        params.insert("y".into(), ParamValue::Int(5));
+        let encoded = t.transform(&params);
+        // Python: transform_x=0.5, transform_y=5.0
+        assert!((encoded[0] - 0.5).abs() < 1e-10, "Python: transform_x=0.5");
+        assert!((encoded[1] - 5.0).abs() < 1e-10, "Python: transform_y=5.0");
+
+        let decoded = t.untransform(&encoded).unwrap();
+        match decoded.get("x").unwrap() {
+            ParamValue::Float(v) => assert!((*v - 0.5).abs() < 1e-10, "Python: untransform_x=0.5"),
+            _ => panic!("expected float"),
+        }
+        assert_eq!(decoded.get("y").unwrap(), &ParamValue::Int(5), "Python: untransform_y=5");
+    }
+
+    /// Python 交叉验证: log 变换
+    /// transform({"lr": 0.01}) ⇒ [ln(0.01) ≈ -4.605]
+    /// untransform([-4.605]) ⇒ {"lr": ≈0.01}
+    #[test]
+    fn test_python_cross_transform_log() {
+        let mut space = IndexMap::new();
+        space.insert(
+            "lr".into(),
+            Distribution::FloatDistribution(FloatDistribution::new(0.001, 1.0, true, None).unwrap()),
+        );
+        let t = SearchSpaceTransform::with_defaults(space);
+
+        let mut params = IndexMap::new();
+        params.insert("lr".into(), ParamValue::Float(0.01));
+        let encoded = t.transform(&params);
+        // Python: transform_log_lr ≈ -4.605170185988091
+        let expected_log = 0.01_f64.ln();
+        assert!(
+            (encoded[0] - expected_log).abs() < 1e-8,
+            "Python: transform_log_lr={expected_log}, got {}",
+            encoded[0]
+        );
+
+        let decoded = t.untransform(&encoded).unwrap();
+        match decoded.get("lr").unwrap() {
+            ParamValue::Float(v) => {
+                assert!((*v - 0.01).abs() < 1e-10, "Python: untransform_log_lr≈0.01, got {v}");
+            }
+            _ => panic!("expected float"),
+        }
+    }
+
+    /// Python 交叉验证: step 变换
+    /// transform({"x": 0.5}, step=0.25) ⇒ [0.5]
+    /// untransform([0.5]) ⇒ {"x": 0.5}
+    #[test]
+    fn test_python_cross_transform_step() {
+        let mut space = IndexMap::new();
+        space.insert(
+            "x".into(),
+            Distribution::FloatDistribution(FloatDistribution::new(0.0, 1.0, false, Some(0.25)).unwrap()),
+        );
+        let t = SearchSpaceTransform::with_defaults(space);
+
+        let mut params = IndexMap::new();
+        params.insert("x".into(), ParamValue::Float(0.5));
+        let encoded = t.transform(&params);
+        assert!((encoded[0] - 0.5).abs() < 1e-10, "Python: transform_step_x=0.5");
+
+        let decoded = t.untransform(&encoded).unwrap();
+        match decoded.get("x").unwrap() {
+            ParamValue::Float(v) => assert!((*v - 0.5).abs() < 1e-10, "Python: untransform_step_x=0.5"),
+            _ => panic!("expected float"),
+        }
+    }
 }

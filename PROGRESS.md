@@ -2,9 +2,9 @@
 
 ## 总览
 
-- **Rust 测试基线**: 593 default / 669 all-features
-- **Python 交叉验证**: 74 tests (全部通过)
-- **最新提交**: Session 25-26 on gitlab/main
+- **Rust 测试基线**: 610 default / 686 all-features
+- **Python 交叉验证**: 81 tests (全部通过)
+- **最新提交**: Session 27 on gitlab/main
 
 ## 功能对齐状态 (对比 Python optuna)
 
@@ -40,10 +40,18 @@
 - [LOW] Trial.suggest() 缺少 distribution.single() 短路返回
 - [BUG] InMemoryStorage.set_trial_system_attr 错误检查 updatable
 
-### Session 26 (当前)
+### Session 26 (commit bb70d72)
 - 深度审计确认 98% 功能对齐
 - 新增 21 个 Python 交叉验证测试 (53→74)
 - 新增 22 个 Rust 内联测试 (571→593)
+
+### Session 27 (当前)
+- [MEDIUM] FloatDistribution.contains() 容差 1e-6 → 1e-8 (对齐 Python _contains 精确容差)
+- [CRITICAL] RandomSampler gen_range(*lo..=*hi) → gen_range(*lo..*hi) (对齐 Python np.random.uniform [lo, hi) 半开区间)
+- [HIGH] Trial.suggest() 检查顺序: single() 在 fixed_params 之前 → fixed_params 在 single() 之前 (对齐 Python _suggest 精确顺序)
+- 新增 17 个 Rust 内联测试 (593→610)
+- 新增 7 个 Python 交叉验证测试 (74→81)
+- 扩展 brute_force.rs 测试 (+5), partial_fixed.rs (+4), callbacks/mod.rs (+3), trial/handle.rs (+2), float.rs (+1), random.rs (+2)
 
 ## 测试覆盖
 
@@ -52,17 +60,23 @@
 - study/core.rs: 33 tests
 - storage/in_memory.rs: 21 tests
 - search_space/transform.rs: 19 tests
+- distributions/float.rs: 16 tests
+- trial/handle.rs: 14 tests
 - storage/journal.rs: 12 tests
-- trial/handle.rs: 11 tests
-- distributions/float.rs, int.rs, categorical.rs: 多文件合计 ~40 tests
+- random.rs: 12 tests
+- callbacks/mod.rs: 11 tests
+- distributions/int.rs, categorical.rs: 合计 ~25 tests
 
 ### 中覆盖文件 (4-10 tests)
+- samplers/brute_force.rs: 9 tests
 - storage/mod.rs: 8 tests
 - search_space/intersection.rs: 8 tests
 - search_space/group_decomposed.rs: 8 tests
+- samplers/partial_fixed.rs: 8 tests
+- pruners/hyperband.rs: 9 tests
+- pruners/successive_halving.rs: 11 tests
 - error.rs: 6 tests
 - trial/state.rs: 6 tests
 - study/frozen.rs: 5 tests
-- samplers/ga.rs: 5 tests
 - study/mod.rs: 9 tests
 - pruners/mod.rs: 5 tests

@@ -255,4 +255,100 @@ mod tests {
         let trials = study.trials().unwrap();
         assert!(!trials.is_empty());
     }
+
+    /// 验证 enumerate_distribution 对 float+step 的枚举正确性
+    #[test]
+    fn test_brute_force_enumerate_float_step() {
+        let dist = Distribution::FloatDistribution(
+            FloatDistribution::new(0.0, 1.0, false, Some(0.25)).unwrap(),
+        );
+        let vals = BruteForceSampler::enumerate_distribution(&dist).unwrap();
+        assert_eq!(vals, vec![0.0, 0.25, 0.5, 0.75, 1.0]);
+    }
+
+    /// 验证 enumerate_distribution 对 single-value float 返回唯一值
+    #[test]
+    fn test_brute_force_enumerate_single_float() {
+        let dist = Distribution::FloatDistribution(
+            FloatDistribution::new(5.0, 5.0, false, None).unwrap(),
+        );
+        let vals = BruteForceSampler::enumerate_distribution(&dist).unwrap();
+        assert_eq!(vals, vec![5.0]);
+    }
+
+    /// 验证 get_visited_combinations 正确收集已完成和运行中试验
+    #[test]
+    fn test_brute_force_get_visited_combinations() {
+        use std::collections::HashMap;
+        let param_names = vec!["x".to_string()];
+        let dist = Distribution::IntDistribution(IntDistribution::new(1, 3, false, 1).unwrap());
+
+        let mut params1 = HashMap::new();
+        params1.insert("x".to_string(), crate::distributions::ParamValue::Int(1));
+        let mut dists1 = HashMap::new();
+        dists1.insert("x".to_string(), dist.clone());
+
+        let trial1 = FrozenTrial {
+            number: 0,
+            trial_id: 0,
+            state: TrialState::Complete,
+            values: Some(vec![1.0]),
+            datetime_start: None,
+            datetime_complete: None,
+            params: params1,
+            distributions: dists1,
+            user_attrs: HashMap::new(),
+            system_attrs: HashMap::new(),
+            intermediate_values: HashMap::new(),
+        };
+
+        let visited = BruteForceSampler::get_visited_combinations(&[trial1], &param_names);
+        assert_eq!(visited.len(), 1, "完成的试验应被记录为已访问");
+    }
+
+    /// 验证 sample_relative 正确跳过已访问组合
+    #[test]
+    fn test_brute_force_sample_relative_skips_visited() {
+        let sampler = BruteForceSampler::new(Some(42));
+
+        let dist = Distribution::IntDistribution(IntDistribution::new(1, 2, false, 1).unwrap());
+        let mut search_space = HashMap::new();
+        search_space.insert("x".to_string(), dist.clone());
+
+        // 第一次调用: 无已访问组合 → 返回第一个 (x=1)
+        let r1 = sampler.sample_relative(&[], &search_space).unwrap();
+        assert_eq!(r1["x"], 1.0, "首次应返回第一个组合 x=1");
+
+        // 模拟 x=1 已被访问的试验
+        let mut params = std::collections::HashMap::new();
+        params.insert("x".to_string(), crate::distributions::ParamValue::Int(1));
+        let mut dists = std::collections::HashMap::new();
+        dists.insert("x".to_string(), dist.clone());
+
+        let visited_trial = FrozenTrial {
+            number: 0,
+            trial_id: 0,
+            state: TrialState::Complete,
+            values: Some(vec![1.0]),
+            datetime_start: None,
+            datetime_complete: None,
+            params,
+            distributions: dists,
+            user_attrs: std::collections::HashMap::new(),
+            system_attrs: std::collections::HashMap::new(),
+            intermediate_values: std::collections::HashMap::new(),
+        };
+
+        // 第二次调用: x=1 已访问 → 跳过，返回 x=2
+        let r2 = sampler.sample_relative(&[visited_trial], &search_space).unwrap();
+        assert_eq!(r2["x"], 2.0, "应跳过已访问的 x=1，返回 x=2");
+    }
+
+    /// 验证空搜索空间时 sample_relative 返回空 HashMap
+    #[test]
+    fn test_brute_force_empty_search_space() {
+        let sampler = BruteForceSampler::new(Some(42));
+        let result = sampler.sample_relative(&[], &HashMap::new()).unwrap();
+        assert!(result.is_empty());
+    }
 }

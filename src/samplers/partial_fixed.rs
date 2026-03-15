@@ -291,4 +291,55 @@ mod tests {
             _ => panic!("unexpected error type"),
         }
     }
+
+    /// 验证 from_param_values 对 Float/Int 类型无分布时的直接转换
+    #[test]
+    fn test_from_param_values_float_int_without_distribution() {
+        let base: Arc<dyn Sampler> = Arc::new(RandomSampler::new(Some(1)));
+        let mut fixed_params = HashMap::new();
+        fixed_params.insert("f".to_string(), ParamValue::Float(3.14));
+        fixed_params.insert("i".to_string(), ParamValue::Int(42));
+        let distributions = HashMap::new();
+
+        let sampler = PartialFixedSampler::from_param_values(fixed_params, &distributions, base).unwrap();
+        assert!((sampler.fixed_params["f"] - 3.14).abs() < 1e-15);
+        assert!((sampler.fixed_params["i"] - 42.0).abs() < 1e-15);
+    }
+
+    /// 验证 infer_relative_search_space 排除固定参数
+    #[test]
+    fn test_infer_relative_search_space_excludes_fixed() {
+        let base: Arc<dyn Sampler> = Arc::new(RandomSampler::new(Some(42)));
+        let mut fixed = HashMap::new();
+        fixed.insert("x".to_string(), 0.5);
+
+        let sampler = PartialFixedSampler::new(fixed, base);
+        // RandomSampler 默认返回空搜索空间
+        let space = sampler.infer_relative_search_space(&[]);
+        assert!(!space.contains_key("x"), "固定参数应被排除");
+    }
+
+    /// 验证 sample_relative 注入固定值
+    #[test]
+    fn test_sample_relative_injects_fixed() {
+        let base: Arc<dyn Sampler> = Arc::new(RandomSampler::new(Some(42)));
+        let mut fixed = HashMap::new();
+        fixed.insert("x".to_string(), 0.5);
+
+        let sampler = PartialFixedSampler::new(fixed, base);
+        let result = sampler.sample_relative(&[], &HashMap::new()).unwrap();
+        assert!((result["x"] - 0.5).abs() < 1e-15, "固定参数应被注入");
+    }
+
+    /// 验证 Debug trait 实现
+    #[test]
+    fn test_debug_display() {
+        let base: Arc<dyn Sampler> = Arc::new(RandomSampler::new(Some(42)));
+        let mut fixed = HashMap::new();
+        fixed.insert("x".to_string(), 0.5);
+        let sampler = PartialFixedSampler::new(fixed, base);
+        let debug_str = format!("{:?}", sampler);
+        assert!(debug_str.contains("PartialFixedSampler"));
+        assert!(debug_str.contains("n_fixed"));
+    }
 }

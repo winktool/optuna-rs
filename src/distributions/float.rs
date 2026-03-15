@@ -65,9 +65,8 @@ impl FloatDistribution {
         }
         if let Some(step) = self.step {
             // 对齐 Python `_contains`: k = (value - low) / step; abs(k - round(k)) < 1e-8
-            // 使用与 Python Decimal 等价的容差检查，避免浮点误差导致合法网格点被拒绝
             let k = (value - self.low) / step;
-            (k - k.round()).abs() < 1.0e-6
+            (k - k.round()).abs() < 1.0e-8
         } else {
             true
         }
@@ -298,6 +297,21 @@ mod tests {
         let d = FloatDistribution::new(0.0, 1.0, false, Some(0.25)).unwrap();
         assert_eq!(d.high, 1.0, "Python: high=1.0");
         assert!(!d.single(), "Python: single=false");
+    }
+
+    /// 验证 contains() 使用 1e-8 容差（对齐 Python _contains）。
+    /// 容差公式: abs((value - low) / step - round((value - low) / step)) < 1e-8
+    /// step=0.25 时, offset=1e-9 → k_offset=4e-9 < 1e-8 → 通过
+    ///              offset=5e-9 → k_offset=2e-8 > 1e-8 → 拒绝
+    #[test]
+    fn test_contains_tolerance_1e8() {
+        let d = FloatDistribution::new(0.0, 1.0, false, Some(0.25)).unwrap();
+        // 偏差 1e-9 → k_offset = 1e-9 / 0.25 = 4e-9 < 1e-8 → 应通过
+        assert!(d.contains(0.25 + 1e-9), "1e-9 offset should pass 1e-8 tolerance");
+        assert!(d.contains(0.25 - 1e-9), "1e-9 negative offset should pass");
+        // 偏差 5e-9 → k_offset = 5e-9 / 0.25 = 2e-8 > 1e-8 → 应拒绝
+        assert!(!d.contains(0.25 + 5e-9), "5e-9 offset should fail (k_offset=2e-8 > 1e-8)");
+        assert!(!d.contains(0.25 - 5e-9), "5e-9 negative offset should fail");
     }
 
     /// Python 交叉验证: FloatDistribution(0.0, 0.1, step=0.2)

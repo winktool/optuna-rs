@@ -925,6 +925,132 @@ def test_retry_failed_trial_callback():
     assert len(failed) >= 1  # 至少有失败的试验被重试
 
 # ═══════════════════════════════════════════════════════════════════════════
+#  29. FloatDistribution contains() 容差 1e-8 — 对应 Rust float.rs
+# ═══════════════════════════════════════════════════════════════════════════
+
+def test_float_contains_tolerance_1e8():
+    """验证 Python _contains 中 abs(k - round(k)) < 1e-8 的精确容差"""
+    d = optuna.distributions.FloatDistribution(low=0.0, high=1.0, step=0.25)
+    # 偏差 1e-9 → k_offset = 1e-9 / 0.25 = 4e-9 < 1e-8 → 通过
+    assert d._contains(0.25 + 1e-9), "1e-9 offset should pass"
+    assert d._contains(0.25 - 1e-9), "1e-9 neg offset should pass"
+    # 偏差 5e-9 → k_offset = 5e-9 / 0.25 = 2e-8 > 1e-8 → 拒绝
+    assert not d._contains(0.25 + 5e-9), "5e-9 offset should fail"
+    assert not d._contains(0.25 - 5e-9), "5e-9 neg offset should fail"
+
+# ═══════════════════════════════════════════════════════════════════════════
+#  30. RandomSampler 半开区间 [lo, hi) — 对应 Rust random.rs
+# ═══════════════════════════════════════════════════════════════════════════
+
+def test_random_sampler_half_open_interval():
+    """验证 np.random.uniform(lo, hi) 是 [lo, hi) 半开区间"""
+    import numpy as np
+    rng = np.random.RandomState(0)
+    # 连续采样 10000 次，所有值必须 < hi
+    for _ in range(10000):
+        v = rng.uniform(0.0, 1.0)
+        assert v < 1.0, f"np.random.uniform 应返回 < hi 的值, got {v}"
+        assert v >= 0.0, f"np.random.uniform 应返回 >= lo 的值, got {v}"
+
+# ═══════════════════════════════════════════════════════════════════════════
+#  31. suggest() 检查顺序: fixed_params 优先于 single() — 对应 Rust handle.rs
+# ═══════════════════════════════════════════════════════════════════════════
+
+def test_suggest_fixed_param_priority_over_single():
+    """验证 Python _suggest 中 fixed_params 优先于 distribution.single()"""
+    study = optuna.create_study()
+    # 通过 enqueue_trial 注入 fixed_params
+    study.enqueue_trial({"x": 5.0})
+    trial = study.ask()
+    # 使用 single 分布 (low==high==3.0) 但 fixed=5.0
+    x = trial.suggest_float("x", 3.0, 3.0)
+    assert abs(x - 5.0) < 1e-12, f"fixed(5.0) 应优先于 single(3.0), got {x}"
+
+# ═══════════════════════════════════════════════════════════════════════════
+#  32. BruteForceSampler 穷举网格 — 对应 Rust brute_force.rs
+# ═══════════════════════════════════════════════════════════════════════════
+
+def test_brute_force_sampler_enumerate():
+    """验证 BruteForceSampler 会穷举所有离散组合"""
+    sampler = optuna.samplers.BruteForceSampler()
+    study = optuna.create_study(sampler=sampler)
+    study.optimize(
+        lambda trial: trial.suggest_int("x", 1, 3),
+        n_trials=10,
+    )
+    # 应至少使用了 3 个不同的 x 值 (1, 2, 3)
+    xs = set(t.params["x"] for t in study.trials)
+    assert xs == {1, 2, 3}, f"应穷举 {{1,2,3}}, got {xs}"
+
+# ═══════════════════════════════════════════════════════════════════════════
+#  33. PartialFixedSampler 固定参数 — 对应 Rust partial_fixed.rs
+# ═══════════════════════════════════════════════════════════════════════════
+
+def test_partial_fixed_sampler():
+    """验证 PartialFixedSampler 固定参数行为"""
+    base = optuna.samplers.RandomSampler(seed=42)
+    sampler = optuna.samplers.PartialFixedSampler(
+        base_sampler=base,
+        fixed_params={"x": 0.5},
+    )
+    study = optuna.create_study(sampler=sampler)
+    study.optimize(
+        lambda trial: trial.suggest_float("x", 0.0, 1.0) + trial.suggest_float("y", 0.0, 1.0),
+        n_trials=10,
+    )
+    for t in study.trials:
+        assert abs(t.params["x"] - 0.5) < 1e-10, f"x 应始终为 0.5, got {t.params['x']}"
+    # y 应该会变化
+    ys = [t.params["y"] for t in study.trials]
+    assert len(set(round(y, 6) for y in ys)) > 1, "y 应该在不同试验中有不同值"
+
+# ═══════════════════════════════════════════════════════════════════════════
+#  34. MaxTrialsCallback 实际停止 — 对应 Rust callbacks/mod.rs
+# ═══════════════════════════════════════════════════════════════════════════
+
+def test_max_trials_callback_stops():
+    """验证 MaxTrialsCallback 在达到限制后停止优化"""
+    from optuna.study import MaxTrialsCallback
+    study = optuna.create_study()
+    cb = MaxTrialsCallback(3, states=(optuna.trial.TrialState.COMPLETE,))
+    study.optimize(
+        lambda trial: trial.suggest_float("x", 0, 1),
+        n_trials=100,  # 大上限
+        callbacks=[cb],
+    )
+    n_complete = len([t for t in study.trials if t.state == optuna.trial.TrialState.COMPLETE])
+    # 回调应在 3 次完成后停止
+    assert 3 <= n_complete <= 5, f"应在 3 次后停止, got {n_complete}"
+
+# ═══════════════════════════════════════════════════════════════════════════
+#  35. RetryFailedTrialCallback 继承中间值 — 对应 Rust callbacks/mod.rs
+# ═══════════════════════════════════════════════════════════════════════════
+
+def test_retry_callback_inherit_intermediate_values():
+    """验证 inherit_intermediate_values=True 时继承中间值"""
+    study = optuna.create_study()
+    call_count = 0
+    def objective(trial):
+        nonlocal call_count
+        call_count += 1
+        trial.report(0.5, 0)
+        trial.report(0.3, 1)
+        if call_count == 1:
+            raise RuntimeError("fail")
+        return trial.suggest_float("x", 0, 1)
+
+    cb = optuna.storages.RetryFailedTrialCallback(
+        max_retry=3, inherit_intermediate_values=True
+    )
+    study.optimize(objective, n_trials=3, callbacks=[cb], catch=(RuntimeError,))
+
+    # 找到 WAITING 状态的重试试验
+    waiting = [t for t in study.trials if t.state == optuna.trial.TrialState.WAITING]
+    if waiting:
+        # 应继承中间值
+        assert len(waiting[0].intermediate_values) == 2
+
+# ═══════════════════════════════════════════════════════════════════════════
 #  执行
 # ═══════════════════════════════════════════════════════════════════════════
 

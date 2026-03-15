@@ -423,4 +423,106 @@ mod tests {
         // 注意：stop() 设置的是 AtomicBool，外部无法直接检查
         // 但可以验证 optimize 会提前停止
     }
+
+    /// 对齐 Python: MaxTrialsCallback 实际停止 optimize 循环
+    #[test]
+    fn test_max_trials_callback_actually_stops_optimize() {
+        let study = create_study(
+            None, None, None, None,
+            Some(StudyDirection::Minimize), None, false,
+        ).unwrap();
+
+        let cb = MaxTrialsCallback::with_default_states(3);
+        let cbs: &[&dyn Callback] = &[&cb];
+
+        study.optimize(
+            |trial| {
+                let x = trial.suggest_float("x", 0.0, 1.0, false, None)?;
+                Ok(x * x)
+            },
+            Some(100), // 设置很大的上限，回调应在 3 次后停止
+            None,
+            Some(cbs),
+        ).unwrap();
+
+        let trials = study.trials().unwrap();
+        let n_complete = trials.iter().filter(|t| t.state == TrialState::Complete).count();
+        // 回调在 3 次完成后触发 stop → 实际可能是 3 或 4 次(竞争窗口)
+        assert!(n_complete >= 3 && n_complete <= 5,
+            "应在约 3 次完成后停止，实际完成 {} 次", n_complete);
+    }
+
+    /// 对齐 Python: RetryFailedTrialCallback 继承中间值
+    #[test]
+    fn test_retry_failed_trial_inherits_intermediate_values() {
+        let study = create_study(
+            None, None, None, None,
+            Some(StudyDirection::Minimize), None, false,
+        ).unwrap();
+
+        let cb = RetryFailedTrialCallback::new(Some(3), true); // inherit=true
+
+        let mut intermediate_values = std::collections::HashMap::new();
+        intermediate_values.insert(0_i64, 0.5);
+        intermediate_values.insert(1, 0.3);
+
+        let failed = FrozenTrial {
+            number: 0,
+            trial_id: 0,
+            state: TrialState::Fail,
+            values: None,
+            datetime_start: None,
+            datetime_complete: None,
+            params: std::collections::HashMap::new(),
+            distributions: std::collections::HashMap::new(),
+            user_attrs: std::collections::HashMap::new(),
+            system_attrs: std::collections::HashMap::new(),
+            intermediate_values,
+        };
+
+        cb.on_trial_complete(&study, &failed);
+
+        let waiting = study.get_trials(Some(&[TrialState::Waiting])).unwrap();
+        assert_eq!(waiting.len(), 1);
+        // inherit_intermediate_values=true → 应继承中间值
+        assert_eq!(waiting[0].intermediate_values.len(), 2,
+            "应继承 2 个中间值");
+        assert_eq!(waiting[0].intermediate_values.get(&0).copied(), Some(0.5));
+        assert_eq!(waiting[0].intermediate_values.get(&1).copied(), Some(0.3));
+    }
+
+    /// 对齐 Python: RetryFailedTrialCallback 不继承中间值
+    #[test]
+    fn test_retry_failed_trial_no_inherit_intermediate_values() {
+        let study = create_study(
+            None, None, None, None,
+            Some(StudyDirection::Minimize), None, false,
+        ).unwrap();
+
+        let cb = RetryFailedTrialCallback::new(Some(3), false); // inherit=false
+
+        let mut intermediate_values = std::collections::HashMap::new();
+        intermediate_values.insert(0_i64, 0.5);
+
+        let failed = FrozenTrial {
+            number: 0,
+            trial_id: 0,
+            state: TrialState::Fail,
+            values: None,
+            datetime_start: None,
+            datetime_complete: None,
+            params: std::collections::HashMap::new(),
+            distributions: std::collections::HashMap::new(),
+            user_attrs: std::collections::HashMap::new(),
+            system_attrs: std::collections::HashMap::new(),
+            intermediate_values,
+        };
+
+        cb.on_trial_complete(&study, &failed);
+
+        let waiting = study.get_trials(Some(&[TrialState::Waiting])).unwrap();
+        assert_eq!(waiting.len(), 1);
+        assert!(waiting[0].intermediate_values.is_empty(),
+            "inherit=false 时不应继承中间值");
+    }
 }

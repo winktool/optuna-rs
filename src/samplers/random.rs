@@ -48,7 +48,13 @@ impl RandomSampler {
         let mut rng = self.rng.lock();
         let mut encoded = Vec::with_capacity(bounds.len());
         for [lo, hi] in &bounds {
-            let v: f64 = rng.gen_range(*lo..=*hi);
+            // 对齐 Python np.random.uniform(lo, hi) → [lo, hi) 半开区间
+            // lo == hi 时（single value）直接返回 lo
+            let v: f64 = if (hi - lo).abs() < f64::EPSILON {
+                *lo
+            } else {
+                rng.gen_range(*lo..*hi)
+            };
             encoded.push(v);
         }
         drop(rng);
@@ -220,5 +226,31 @@ mod tests {
             let v2 = s2.sample_independent(&[], &trial, "x", &dist).unwrap();
             assert_eq!(v1, v2);
         }
+    }
+
+    /// 验证 RandomSampler 使用半开区间 [lo, hi)（对齐 Python np.random.uniform）。
+    /// 连续 float 分布采样值必须严格 < high。
+    #[test]
+    fn test_sample_float_strictly_less_than_high() {
+        let sampler = RandomSampler::new(Some(0));
+        let dist =
+            Distribution::FloatDistribution(FloatDistribution::new(0.0, 1.0, false, None).unwrap());
+        let trial = dummy_trial();
+        for _ in 0..10000 {
+            let v = sampler.sample_independent(&[], &trial, "x", &dist).unwrap();
+            assert!(v < 1.0, "value {v} must be strictly < high (Python np.random.uniform is [lo, hi))");
+            assert!(v >= 0.0, "value {v} must be >= low");
+        }
+    }
+
+    /// 验证 lo == hi 边界情况（single-value 分布不会 panic）。
+    #[test]
+    fn test_sample_float_lo_eq_hi_no_panic() {
+        let sampler = RandomSampler::new(Some(42));
+        let dist =
+            Distribution::FloatDistribution(FloatDistribution::new(3.0, 3.0, false, None).unwrap());
+        let trial = dummy_trial();
+        let v = sampler.sample_independent(&[], &trial, "x", &dist).unwrap();
+        assert!((v - 3.0).abs() < 1e-15, "lo==hi should return lo");
     }
 }

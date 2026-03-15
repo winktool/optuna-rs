@@ -215,24 +215,8 @@ impl Trial {
     /// 使用 check_distribution_compatibility() 进行兼容性检查，
     /// 允许同类型但不同 range 的分布（对齐 Python 行为）。
     fn suggest(&mut self, name: &str, dist: &Distribution) -> Result<f64> {
-        // 对齐 Python: distribution.single() 时直接返回唯一值，跳过采样器
-        if dist.single() {
-            let only_value = match dist {
-                Distribution::FloatDistribution(d) => d.low,
-                Distribution::IntDistribution(d) => d.low as f64,
-                Distribution::CategoricalDistribution(_) => 0.0,
-            };
-            // 仍然需要记录到 storage（对齐 Python _suggest 的 set_trial_param 调用）
-            let existing = self.storage.get_trial(self.trial_id)?;
-            if existing.distributions.contains_key(name) {
-                let val = existing.params.get(name).unwrap();
-                return dist.to_internal_repr(val);
-            }
-            self.storage.set_trial_param(self.trial_id, name, only_value, dist)?;
-            return Ok(only_value);
-        }
-
         // Check if this param was already set (re-suggest returns same value)
+        // 对齐 Python: 已存在则直接返回，仅做兼容性检查
         let existing = self.storage.get_trial(self.trial_id)?;
         if let Some(existing_dist) = existing.distributions.get(name) {
             // 兼容性检查：允许同类型不同 range（对齐 Python）
@@ -251,8 +235,13 @@ impl Trial {
             return dist.to_internal_repr(val);
         }
 
-        // Python `_is_fixed_param` 对齐：固定参数优先，越界仅告警。
+        // 对齐 Python _suggest 检查顺序:
+        // 1. fixed_params (即使超范围也使用，仅告警)
+        // 2. distribution.single() (只有一个可选值时直接返回)
+        // 3. relative_params (在分布范围内时使用，否则回退独立采样)
+        // 4. independent sampling (独立采样)
         let internal = if let Some(value) = self.fixed_params.get(name) {
+            // Python `_is_fixed_param` 对齐：固定参数优先，越界仅告警。
             let internal = dist.to_internal_repr(value)?;
             if !dist.contains(internal) {
                 crate::optuna_warn!(
@@ -263,8 +252,15 @@ impl Trial {
                 );
             }
             internal
-        // Python `_is_relative_param` 对齐：检查 relative search space 与分布兼容性。
+        } else if dist.single() {
+            // 对齐 Python: distribution.single() 时直接返回唯一值，跳过采样器
+            match dist {
+                Distribution::FloatDistribution(d) => d.low,
+                Distribution::IntDistribution(d) => d.low as f64,
+                Distribution::CategoricalDistribution(_) => 0.0,
+            }
         } else if let Some(&v) = self.relative_params.get(name) {
+            // Python `_is_relative_param` 对齐：检查 relative search space 与分布兼容性。
             if !self.relative_search_space.contains_key(name) {
                 return Err(OptunaError::ValueError(format!(
                     "The parameter {name} was sampled by `sample_relative` method but it is not contained in the relative search space."
@@ -774,5 +770,43 @@ mod tests {
         let trial = study.ask(None).unwrap();
         // 未 report 任何中间值 → should_prune = false
         assert!(!trial.should_prune().unwrap());
+    }
+
+    /// 对齐 Python: fixed_params 优先于 distribution.single()。
+    /// 当分布 single()=true 且 fixed_params 也有值时，应返回 fixed value。
+    /// Python 检查顺序: existing → fixed_params → single() → relative → independent
+    #[test]
+    fn test_fixed_param_priority_over_single() {
+        let study = create_study(
+            None, None, None, None,
+            Some(StudyDirection::Minimize), None, false,
+        ).unwrap();
+
+        // 注入 fixed_params: x=5.0
+        let mut params = HashMap::new();
+        params.insert("x".to_string(), crate::distributions::ParamValue::Float(5.0));
+        study.enqueue_trial(params, None, false).unwrap();
+
+        let mut trial = study.ask(None).unwrap();
+        // 使用 single() 分布 (low==high==3.0)，但 fixed=5.0
+        // Python 行为: 返回 5.0（fixed 优先），并发出越界警告
+        let x = trial.suggest_float("x", 3.0, 3.0, false, None).unwrap();
+        assert!(
+            (x - 5.0).abs() < 1e-12,
+            "fixed_params(5.0) should take priority over single(3.0), got {x}"
+        );
+    }
+
+    /// 对齐 Python: suggest 对已存在参数的第二次调用返回第一次的值
+    #[test]
+    fn test_resuggest_returns_first_value() {
+        let study = create_study(
+            None, None, None, None,
+            Some(StudyDirection::Minimize), None, false,
+        ).unwrap();
+        let mut trial = study.ask(None).unwrap();
+        let v1 = trial.suggest_float_default("x", 0.0, 1.0).unwrap();
+        let v2 = trial.suggest_float_default("x", 0.0, 1.0).unwrap();
+        assert_eq!(v1, v2, "re-suggest should return same value");
     }
 }

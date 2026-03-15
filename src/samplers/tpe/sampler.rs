@@ -48,7 +48,8 @@ pub fn default_weights(n: usize) -> Vec<f64> {
     let ramp_len = n - 25;
     // 对齐 Python np.linspace(1.0/n, 1.0, num=ramp_len)
     if ramp_len == 1 {
-        w.push(1.0 / n as f64);
+        // np.linspace(start, 1.0, num=1) returns [1.0]
+        w.push(1.0);
     } else {
         let start = 1.0 / n as f64;
         let step = (1.0 - start) / (ramp_len as f64 - 1.0);
@@ -935,5 +936,21 @@ mod tests {
             .sample_relative(&[], &HashMap::new())
             .unwrap();
         assert!(result.is_empty());
+    }
+
+    #[test]
+    fn test_default_weights_edge_n26_matches_python() {
+        // Python: n=26 => np.linspace(1/26, 1.0, num=1) + ones(25) => all 1.0
+        let w = default_weights(26);
+        assert_eq!(w.len(), 26);
+        assert!(w.iter().all(|x| (*x - 1.0).abs() < 1e-12));
+    }
+
+    #[test]
+    fn test_default_weights_ramp_hits_one() {
+        // Python linspace 保证斜坡末端是 1.0
+        let w = default_weights(100);
+        assert_eq!(w.len(), 100);
+        assert!((w[74] - 1.0).abs() < 1e-12);
     }
 }

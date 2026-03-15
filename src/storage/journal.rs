@@ -668,11 +668,9 @@ impl Storage for JournalStorage {
                         "Cannot update finished trial {trial_id}"
                     )));
                 }
-                // RUNNING → RUNNING 时（enqueue pop 竞争）返回 false
-                if trial.state == TrialState::Running && state != TrialState::Waiting {
-                    if state == TrialState::Running {
-                        // write_log 后由 replay 处理 owned_trial_id 竞争
-                    }
+                // 对齐 Python/InMemoryStorage: RUNNING 且非 WAITING 的 trial 再次设为 RUNNING 返回 false
+                if state == TrialState::Running && trial.state != TrialState::Waiting {
+                    return Ok(false);
                 }
             } else {
                 return Err(OptunaError::ValueError(format!(
@@ -1399,6 +1397,48 @@ mod tests {
 
         let complete = storage.get_all_trials(sid, Some(&[TrialState::Complete])).unwrap();
         assert_eq!(complete.len(), 1);
+        fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn test_journal_storage_running_to_running_returns_false() {
+        let path = temp_path();
+        let backend = JournalFileBackend::new(&path).unwrap();
+        let storage = JournalStorage::new(Box::new(backend)).unwrap();
+
+        let sid = storage
+            .create_new_study(&[StudyDirection::Minimize], Some("jr_running"))
+            .unwrap();
+        let tid = storage.create_new_trial(sid, None).unwrap();
+
+        let updated = storage
+            .set_trial_state_values(tid, TrialState::Running, None)
+            .unwrap();
+        assert!(!updated);
+        fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn test_journal_storage_finished_trial_update_error() {
+        let path = temp_path();
+        let backend = JournalFileBackend::new(&path).unwrap();
+        let storage = JournalStorage::new(Box::new(backend)).unwrap();
+
+        let sid = storage
+            .create_new_study(&[StudyDirection::Minimize], Some("jr_finish"))
+            .unwrap();
+        let tid = storage.create_new_trial(sid, None).unwrap();
+        storage
+            .set_trial_state_values(tid, TrialState::Complete, Some(&[1.0]))
+            .unwrap();
+
+        let err = storage
+            .set_trial_state_values(tid, TrialState::Fail, None)
+            .unwrap_err();
+        match err {
+            OptunaError::UpdateFinishedTrialError(_) => {}
+            e => panic!("expected UpdateFinishedTrialError, got {e:?}"),
+        }
         fs::remove_file(&path).ok();
     }
 }

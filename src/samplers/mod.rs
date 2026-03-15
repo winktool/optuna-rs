@@ -82,3 +82,80 @@ pub trait Sampler: Send + Sync {
     ) {
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::distributions::{Distribution, FloatDistribution};
+    use crate::trial::FrozenTrial;
+    use std::collections::HashMap;
+
+    /// 测试用最小 Sampler 实现：只实现 sample_independent，其余走默认
+    struct DummySampler;
+    impl Sampler for DummySampler {
+        fn sample_independent(
+            &self,
+            _trials: &[FrozenTrial],
+            _trial: &FrozenTrial,
+            _param_name: &str,
+            _distribution: &Distribution,
+        ) -> Result<f64> {
+            Ok(0.5)
+        }
+    }
+
+    fn make_trial() -> FrozenTrial {
+        FrozenTrial::new(
+            0,
+            TrialState::Running,
+            None,
+            None,
+            Some(chrono::Utc::now()),
+            None,
+            HashMap::new(),
+            HashMap::new(),
+            HashMap::new(),
+            HashMap::new(),
+            HashMap::new(),
+            0,
+        )
+        .unwrap()
+    }
+
+    /// 对齐 Python: infer_relative_search_space 默认返回空
+    #[test]
+    fn test_default_infer_relative_search_space() {
+        let s = DummySampler;
+        let space = s.infer_relative_search_space(&[]);
+        assert!(space.is_empty());
+    }
+
+    /// 对齐 Python: sample_relative 默认返回空
+    #[test]
+    fn test_default_sample_relative() {
+        let s = DummySampler;
+        let result = s.sample_relative(&[], &HashMap::new()).unwrap();
+        assert!(result.is_empty());
+    }
+
+    /// 对齐 Python: before_trial / after_trial 默认不 panic
+    #[test]
+    fn test_default_hooks_no_panic() {
+        let s = DummySampler;
+        s.before_trial(&[]);
+        let trial = make_trial();
+        s.after_trial(&[], &trial, TrialState::Complete, Some(&[1.0]));
+    }
+
+    /// 对齐 Python: sample_independent 基本行为
+    #[test]
+    fn test_sample_independent() {
+        let s = DummySampler;
+        let trial = make_trial();
+        let dist = Distribution::FloatDistribution(
+            FloatDistribution::new(0.0, 1.0, false, None).unwrap(),
+        );
+        let val = s.sample_independent(&[], &trial, "x", &dist).unwrap();
+        assert_eq!(val, 0.5);
+    }
+}

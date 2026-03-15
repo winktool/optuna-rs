@@ -237,3 +237,139 @@ pub trait Storage: Send + Sync {
     /// No-op session cleanup hook.
     fn remove_session(&self) {}
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 辅助：创建 study 和 n 个完成的 trial，返回 (study_id, trial_ids)
+    fn setup_study_with_trials(
+        storage: &InMemoryStorage,
+        direction: StudyDirection,
+        values: &[f64],
+    ) -> (i64, Vec<i64>) {
+        let study_id = storage
+            .create_new_study(&[direction], Some("test"))
+            .unwrap();
+        let mut trial_ids = Vec::new();
+        for &v in values {
+            let tid = storage.create_new_trial(study_id, None).unwrap();
+            storage
+                .set_trial_state_values(tid, TrialState::Complete, Some(&[v]))
+                .unwrap();
+            trial_ids.push(tid);
+        }
+        (study_id, trial_ids)
+    }
+
+    /// 对齐 Python: get_best_trial (minimize)
+    #[test]
+    fn test_get_best_trial_minimize() {
+        let s = InMemoryStorage::new();
+        let (sid, _) = setup_study_with_trials(&s, StudyDirection::Minimize, &[3.0, 1.0, 2.0]);
+        let best = s.get_best_trial(sid).unwrap();
+        assert_eq!(best.value().unwrap().unwrap(), 1.0);
+    }
+
+    /// 对齐 Python: get_best_trial (maximize)
+    #[test]
+    fn test_get_best_trial_maximize() {
+        let s = InMemoryStorage::new();
+        let (sid, _) = setup_study_with_trials(&s, StudyDirection::Maximize, &[3.0, 1.0, 2.0]);
+        let best = s.get_best_trial(sid).unwrap();
+        assert_eq!(best.value().unwrap().unwrap(), 3.0);
+    }
+
+    /// 对齐 Python: get_best_trial 无完成试验时报错
+    #[test]
+    fn test_get_best_trial_no_complete() {
+        let s = InMemoryStorage::new();
+        let sid = s.create_new_study(&[StudyDirection::Minimize], None).unwrap();
+        assert!(s.get_best_trial(sid).is_err());
+    }
+
+    /// 对齐 Python: get_best_trial 多目标报错
+    #[test]
+    fn test_get_best_trial_multi_objective() {
+        let s = InMemoryStorage::new();
+        let sid = s
+            .create_new_study(
+                &[StudyDirection::Minimize, StudyDirection::Maximize],
+                None,
+            )
+            .unwrap();
+        let tid = s.create_new_trial(sid, None).unwrap();
+        s.set_trial_state_values(tid, TrialState::Complete, Some(&[1.0, 2.0]))
+            .unwrap();
+        assert!(s.get_best_trial(sid).is_err());
+    }
+
+    /// 对齐 Python: get_trial_id_from_study_id_trial_number
+    #[test]
+    fn test_get_trial_id_from_trial_number() {
+        let s = InMemoryStorage::new();
+        let (sid, tids) =
+            setup_study_with_trials(&s, StudyDirection::Minimize, &[1.0, 2.0, 3.0]);
+        for (i, &tid) in tids.iter().enumerate() {
+            let found = s
+                .get_trial_id_from_study_id_trial_number(sid, i as i64)
+                .unwrap();
+            assert_eq!(found, tid);
+        }
+        // 不存在的 trial number
+        assert!(s
+            .get_trial_id_from_study_id_trial_number(sid, 999)
+            .is_err());
+    }
+
+    /// 对齐 Python: get_n_trials
+    #[test]
+    fn test_get_n_trials() {
+        let s = InMemoryStorage::new();
+        let sid = s
+            .create_new_study(&[StudyDirection::Minimize], None)
+            .unwrap();
+        assert_eq!(s.get_n_trials(sid, None).unwrap(), 0);
+        let t1 = s.create_new_trial(sid, None).unwrap();
+        assert_eq!(s.get_n_trials(sid, None).unwrap(), 1);
+        s.set_trial_state_values(t1, TrialState::Complete, Some(&[1.0]))
+            .unwrap();
+        assert_eq!(
+            s.get_n_trials(sid, Some(&[TrialState::Complete])).unwrap(),
+            1
+        );
+        assert_eq!(
+            s.get_n_trials(sid, Some(&[TrialState::Running])).unwrap(),
+            0
+        );
+    }
+
+    /// 对齐 Python: check_trial_is_updatable
+    #[test]
+    fn test_check_trial_is_updatable() {
+        let s = InMemoryStorage::new();
+        let sid = s
+            .create_new_study(&[StudyDirection::Minimize], None)
+            .unwrap();
+        let tid = s.create_new_trial(sid, None).unwrap();
+        // Running 状态可更新
+        assert!(s.check_trial_is_updatable(tid, TrialState::Running).is_ok());
+        // Complete 状态不可更新
+        s.set_trial_state_values(tid, TrialState::Complete, Some(&[1.0]))
+            .unwrap();
+        assert!(s
+            .check_trial_is_updatable(tid, TrialState::Complete)
+            .is_err());
+    }
+
+    /// 对齐 Python: get_trial_number_from_id
+    #[test]
+    fn test_get_trial_number_from_id() {
+        let s = InMemoryStorage::new();
+        let (sid, tids) =
+            setup_study_with_trials(&s, StudyDirection::Minimize, &[10.0, 20.0]);
+        let _ = sid;
+        assert_eq!(s.get_trial_number_from_id(tids[0]).unwrap(), 0);
+        assert_eq!(s.get_trial_number_from_id(tids[1]).unwrap(), 1);
+    }
+}

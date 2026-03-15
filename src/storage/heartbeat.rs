@@ -217,3 +217,39 @@ pub fn fail_stale_trials(study: &Study, storage: &dyn Heartbeat) -> Result<()> {
 pub fn is_heartbeat_enabled(storage: &dyn Heartbeat) -> bool {
     storage.get_heartbeat_interval().is_some()
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 对齐 Python: HeartbeatHandle::Null stop 不 panic
+    #[test]
+    fn test_null_heartbeat_handle_stop() {
+        let mut handle = HeartbeatHandle::Null;
+        handle.stop(); // 不应 panic
+    }
+
+    /// 对齐 Python: HeartbeatHandle::Null drop 不 panic
+    #[test]
+    fn test_null_heartbeat_handle_drop() {
+        let _handle = HeartbeatHandle::Null;
+        // drop 不应 panic
+    }
+
+    /// 对齐 Python: get_heartbeat_handle 无 Heartbeat 实现时返回 Null
+    #[test]
+    fn test_get_heartbeat_handle_returns_null() {
+        let storage: Arc<dyn Storage> = Arc::new(crate::storage::InMemoryStorage::new());
+        let handle = get_heartbeat_handle(0, &storage);
+        match handle {
+            HeartbeatHandle::Null => {} // 正确
+            HeartbeatHandle::Active(_) => panic!("应返回 Null"),
+        }
+    }
+
+    /// 对齐 Python: NullHeartbeatThread 是零大小类型
+    #[test]
+    fn test_null_heartbeat_thread_zst() {
+        assert_eq!(std::mem::size_of::<NullHeartbeatThread>(), 0);
+    }
+}

@@ -190,3 +190,138 @@ pub fn get_all_study_names(storage: &dyn Storage) -> Result<Vec<String>> {
 pub fn get_all_study_summaries(storage: &dyn Storage) -> Result<Vec<FrozenStudy>> {
     storage.get_all_studies()
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 对齐 Python: create_study 默认参数
+    #[test]
+    fn test_create_study_default() {
+        let study = create_study(None, None, None, None, None, None, false).unwrap();
+        // 默认方向为 Minimize
+        assert_eq!(study.directions(), &[StudyDirection::Minimize]);
+    }
+
+    /// 对齐 Python: direction 和 directions 互斥
+    #[test]
+    fn test_create_study_direction_conflict() {
+        let result = create_study(
+            None, None, None, None,
+            Some(StudyDirection::Minimize),
+            Some(vec![StudyDirection::Maximize]),
+            false,
+        );
+        assert!(result.is_err());
+    }
+
+    /// 对齐 Python: load_if_exists
+    #[test]
+    fn test_create_study_load_if_exists() {
+        let storage: Arc<dyn Storage> = Arc::new(InMemoryStorage::new());
+        let s1 = create_study(
+            Some(Arc::clone(&storage)),
+            None, None, Some("my_study"),
+            Some(StudyDirection::Minimize), None, false,
+        ).unwrap();
+        // 重复创建同名 study 报错
+        let err = create_study(
+            Some(Arc::clone(&storage)),
+            None, None, Some("my_study"),
+            Some(StudyDirection::Minimize), None, false,
+        );
+        assert!(err.is_err());
+        // load_if_exists=true 则加载
+        let s2 = create_study(
+            Some(Arc::clone(&storage)),
+            None, None, Some("my_study"),
+            Some(StudyDirection::Minimize), None, true,
+        ).unwrap();
+        assert_eq!(s1.study_id(), s2.study_id());
+    }
+
+    /// 对齐 Python: load_study
+    #[test]
+    fn test_load_study() {
+        let storage: Arc<dyn Storage> = Arc::new(InMemoryStorage::new());
+        let s1 = create_study(
+            Some(Arc::clone(&storage)),
+            None, None, Some("test_load"),
+            Some(StudyDirection::Maximize), None, false,
+        ).unwrap();
+        let s2 = load_study("test_load", Arc::clone(&storage), None, None).unwrap();
+        assert_eq!(s1.study_id(), s2.study_id());
+    }
+
+    /// 对齐 Python: load_study 未找到报错
+    #[test]
+    fn test_load_study_not_found() {
+        let storage: Arc<dyn Storage> = Arc::new(InMemoryStorage::new());
+        let result = load_study("nonexistent", storage, None, None);
+        assert!(result.is_err());
+    }
+
+    /// 对齐 Python: delete_study
+    #[test]
+    fn test_delete_study() {
+        let storage: Arc<dyn Storage> = Arc::new(InMemoryStorage::new());
+        let _ = create_study(
+            Some(Arc::clone(&storage)),
+            None, None, Some("to_delete"),
+            Some(StudyDirection::Minimize), None, false,
+        ).unwrap();
+        delete_study("to_delete", &*storage).unwrap();
+        // 再次删除应报错
+        assert!(delete_study("to_delete", &*storage).is_err());
+    }
+
+    /// 对齐 Python: copy_study
+    #[test]
+    fn test_copy_study() {
+        let from_storage: Arc<dyn Storage> = Arc::new(InMemoryStorage::new());
+        let to_storage: Arc<dyn Storage> = Arc::new(InMemoryStorage::new());
+        let study = create_study(
+            Some(Arc::clone(&from_storage)),
+            None, None, Some("source"),
+            Some(StudyDirection::Minimize), None, false,
+        ).unwrap();
+        // 添加试验
+        study.optimize(|trial| {
+            let x = trial.suggest_float("x", -5.0, 5.0, false, None)?;
+            Ok(x * x)
+        }, Some(3), None, None).unwrap();
+        // 复制
+        copy_study("source", &*from_storage, &*to_storage, Some("target")).unwrap();
+        // 验证目标
+        let target = load_study("target", Arc::clone(&to_storage), None, None).unwrap();
+        assert_eq!(target.trials().unwrap().len(), 3);
+    }
+
+    /// 对齐 Python: get_all_study_names
+    #[test]
+    fn test_get_all_study_names() {
+        let storage: Arc<dyn Storage> = Arc::new(InMemoryStorage::new());
+        let _ = create_study(
+            Some(Arc::clone(&storage)), None, None, Some("s1"),
+            Some(StudyDirection::Minimize), None, false,
+        ).unwrap();
+        let _ = create_study(
+            Some(Arc::clone(&storage)), None, None, Some("s2"),
+            Some(StudyDirection::Minimize), None, false,
+        ).unwrap();
+        let names = get_all_study_names(&*storage).unwrap();
+        assert!(names.contains(&"s1".to_string()));
+        assert!(names.contains(&"s2".to_string()));
+    }
+
+    /// 对齐 Python: create_study 多目标
+    #[test]
+    fn test_create_study_multi_objective() {
+        let study = create_study(
+            None, None, None, None, None,
+            Some(vec![StudyDirection::Minimize, StudyDirection::Maximize]),
+            false,
+        ).unwrap();
+        assert_eq!(study.directions().len(), 2);
+    }
+}

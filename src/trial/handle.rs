@@ -215,6 +215,23 @@ impl Trial {
     /// 使用 check_distribution_compatibility() 进行兼容性检查，
     /// 允许同类型但不同 range 的分布（对齐 Python 行为）。
     fn suggest(&mut self, name: &str, dist: &Distribution) -> Result<f64> {
+        // 对齐 Python: distribution.single() 时直接返回唯一值，跳过采样器
+        if dist.single() {
+            let only_value = match dist {
+                Distribution::FloatDistribution(d) => d.low,
+                Distribution::IntDistribution(d) => d.low as f64,
+                Distribution::CategoricalDistribution(_) => 0.0,
+            };
+            // 仍然需要记录到 storage（对齐 Python _suggest 的 set_trial_param 调用）
+            let existing = self.storage.get_trial(self.trial_id)?;
+            if existing.distributions.contains_key(name) {
+                let val = existing.params.get(name).unwrap();
+                return dist.to_internal_repr(val);
+            }
+            self.storage.set_trial_param(self.trial_id, name, only_value, dist)?;
+            return Ok(only_value);
+        }
+
         // Check if this param was already set (re-suggest returns same value)
         let existing = self.storage.get_trial(self.trial_id)?;
         if let Some(existing_dist) = existing.distributions.get(name) {

@@ -447,10 +447,8 @@ impl Storage for InMemoryStorage {
         let mut inner = self.inner.lock();
         let (study_id, trial_number) = Self::resolve_trial(&inner, trial_id)?;
 
-        let study = Self::get_study(&inner, study_id)?;
-        let trial = &study.trials[trial_number as usize];
-        Self::check_updatable(trial)?;
-
+        // 对齐 Python: system_attrs 不检查 updatable，
+        // GA 采样器等需要在已完成试验上设置代际信息。
         let study = Self::get_study_mut(&mut inner, study_id)?;
         let trial = &mut study.trials[trial_number as usize];
         trial.system_attrs.insert(key.to_string(), value);

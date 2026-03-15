@@ -64,3 +64,66 @@ pub(crate) fn is_first_in_interval_step(
     // 只有在前一个步骤在间隔边界之前时才检查
     second_last_step < nearest_lower_pruning_step
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::HashMap;
+
+    /// 对齐 Python: is_first_in_interval_step 基本场景
+    #[test]
+    fn test_is_first_interval_step_basic() {
+        let mut iv = HashMap::new();
+        iv.insert(0, 1.0);
+        iv.insert(1, 1.0);
+        iv.insert(2, 1.0);
+        // step=2, warmup=0, interval=1 → 前一步是 1, 边界=2 → 1 < 2 → true
+        assert!(is_first_in_interval_step(2, &iv, 0, 1));
+    }
+
+    /// 对齐 Python: step == warmup 时应检查
+    #[test]
+    fn test_is_first_step_at_warmup() {
+        let mut iv = HashMap::new();
+        iv.insert(5, 1.0);
+        // step=5, warmup=5, interval=1 → 边界=5, 前一步=-1 → -1 < 5 → true
+        assert!(is_first_in_interval_step(5, &iv, 5, 1));
+    }
+
+    /// 对齐 Python: 无前序步骤
+    #[test]
+    fn test_is_first_no_previous_step() {
+        let mut iv = HashMap::new();
+        iv.insert(0, 1.0);
+        // step=0, 没有 <0 的步骤 → second_last = -1 → -1 < 0 → true
+        assert!(is_first_in_interval_step(0, &iv, 0, 1));
+    }
+
+    /// 对齐 Python: interval=3 时跳过中间步骤
+    #[test]
+    fn test_interval_skip() {
+        let mut iv = HashMap::new();
+        iv.insert(0, 1.0);
+        iv.insert(1, 1.0);
+        iv.insert(2, 1.0);
+        iv.insert(3, 1.0);
+        // step=1, warmup=0, interval=3 → 边界=0, 前一步=0 → 0 < 0 → false
+        assert!(!is_first_in_interval_step(1, &iv, 0, 3));
+        // step=3, warmup=0, interval=3 → 边界=3, 前一步=2 → 2 < 3 → true
+        assert!(is_first_in_interval_step(3, &iv, 0, 3));
+    }
+
+    /// 对齐 Python: warmup + interval 组合
+    #[test]
+    fn test_warmup_and_interval() {
+        let mut iv = HashMap::new();
+        for i in 0..10 {
+            iv.insert(i, 1.0);
+        }
+        // warmup=3, interval=2 → 检查步骤: 3, 5, 7, 9, ...
+        // step=4, 边界=3, 前一步=3 → 3 < 3 → false
+        assert!(!is_first_in_interval_step(4, &iv, 3, 2));
+        // step=5, 边界=5, 前一步=4 → 4 < 5 → true
+        assert!(is_first_in_interval_step(5, &iv, 3, 2));
+    }
+}

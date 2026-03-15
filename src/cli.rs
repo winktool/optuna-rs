@@ -424,10 +424,15 @@ pub mod commands {
                     }
                 }
 
-                store.set_trial_state_values(
+                // 对齐 Python: 通过 Study.tell() 走完整验证流程
+                // 包括 NaN 检查、values 数量验证、after_trial 回调等
+                let study = crate::study::load_study(&study_name, store, None, None)
+                    .map_err(|e| e.to_string())?;
+                study.tell_with_options(
                     trial_id,
                     trial_state,
                     vals.as_deref(),
+                    false, // skip_if_finished 已在上面处理
                 ).map_err(|e| e.to_string())?;
 
                 println!("Trial #{trial_number} → {state}");
@@ -608,6 +613,34 @@ pub mod commands {
                     Err("storage upgrade requires the 'rdb' feature to be enabled".to_string())
                 }
             }
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::parse_direction;
+        use crate::study::StudyDirection;
+
+        /// 对齐 Python: parse_direction "minimize"
+        #[test]
+        fn test_parse_direction_minimize() {
+            assert_eq!(parse_direction("minimize").unwrap(), StudyDirection::Minimize);
+            assert_eq!(parse_direction("min").unwrap(), StudyDirection::Minimize);
+            assert_eq!(parse_direction("MINIMIZE").unwrap(), StudyDirection::Minimize);
+        }
+
+        /// 对齐 Python: parse_direction "maximize"
+        #[test]
+        fn test_parse_direction_maximize() {
+            assert_eq!(parse_direction("maximize").unwrap(), StudyDirection::Maximize);
+            assert_eq!(parse_direction("max").unwrap(), StudyDirection::Maximize);
+        }
+
+        /// 对齐 Python: parse_direction 无效输入报错
+        #[test]
+        fn test_parse_direction_invalid() {
+            assert!(parse_direction("unknown").is_err());
+            assert!(parse_direction("").is_err());
         }
     }
 }

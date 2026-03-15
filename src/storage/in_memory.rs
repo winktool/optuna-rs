@@ -865,4 +865,36 @@ mod tests {
             Some(&serde_json::json!(true))
         );
     }
+
+    #[test]
+    fn test_template_trial_preserves_system_attrs() {
+        let storage = InMemoryStorage::new();
+        let sid = storage
+            .create_new_study(&[StudyDirection::Minimize], None)
+            .unwrap();
+
+        let mut template = FrozenTrial {
+            number: 0,
+            state: TrialState::Waiting,
+            values: None,
+            datetime_start: None,
+            datetime_complete: None,
+            params: HashMap::new(),
+            distributions: HashMap::new(),
+            user_attrs: HashMap::new(),
+            system_attrs: HashMap::new(),
+            intermediate_values: HashMap::new(),
+            trial_id: 0,
+        };
+        template
+            .system_attrs
+            .insert("fixed_params".into(), serde_json::json!({"x": 0.5}));
+
+        let tid = storage.create_new_trial(sid, Some(&template)).unwrap();
+        let trial = storage.get_trial(tid).unwrap();
+        assert_eq!(
+            trial.system_attrs.get("fixed_params"),
+            Some(&serde_json::json!({"x": 0.5}))
+        );
+    }
 }

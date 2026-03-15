@@ -3,6 +3,7 @@ use std::sync::Arc;
 
 use crate::distributions::{
     CategoricalChoice, CategoricalDistribution, Distribution, FloatDistribution, IntDistribution,
+    ParamValue,
 };
 use crate::error::{OptunaError, Result};
 use crate::pruners::Pruner;
@@ -26,6 +27,10 @@ pub struct Trial {
     directions: Vec<StudyDirection>,
     /// Relative param values pre-sampled by the sampler (internal repr).
     relative_params: HashMap<String, f64>,
+    /// Relative search space inferred by sampler.
+    relative_search_space: HashMap<String, Distribution>,
+    /// Fixed params injected by enqueue_trial (external repr).
+    fixed_params: HashMap<String, ParamValue>,
 }
 
 impl Trial {
@@ -40,6 +45,8 @@ impl Trial {
         pruner: Arc<dyn Pruner>,
         directions: Vec<StudyDirection>,
         relative_params: HashMap<String, f64>,
+        relative_search_space: HashMap<String, Distribution>,
+        fixed_params: HashMap<String, ParamValue>,
     ) -> Self {
         Self {
             trial_id,
@@ -50,6 +57,8 @@ impl Trial {
             number,
             directions,
             relative_params,
+            relative_search_space,
+            fixed_params,
         }
     }
 
@@ -223,9 +232,36 @@ impl Trial {
             return dist.to_internal_repr(val);
         }
 
-        // Check if we have a pre-sampled relative param
-        let internal = if let Some(&v) = self.relative_params.get(name) {
-            v
+        // Python `_is_fixed_param` 对齐：固定参数优先，越界仅告警。
+        let internal = if let Some(value) = self.fixed_params.get(name) {
+            let internal = dist.to_internal_repr(value)?;
+            if !dist.contains(internal) {
+                crate::optuna_warn!(
+                    "Fixed parameter {} with value {:?} is out of range for distribution {:?}.",
+                    name,
+                    value,
+                    dist
+                );
+            }
+            internal
+        // Python `_is_relative_param` 对齐：检查 relative search space 与分布兼容性。
+        } else if let Some(&v) = self.relative_params.get(name) {
+            if !self.relative_search_space.contains_key(name) {
+                return Err(OptunaError::ValueError(format!(
+                    "The parameter {name} was sampled by `sample_relative` method but it is not contained in the relative search space."
+                )));
+            }
+
+            let relative_distribution = self.relative_search_space.get(name).unwrap();
+            crate::distributions::check_distribution_compatibility(relative_distribution, dist)?;
+
+            // Python: relative param 若不在请求分布范围内，则回退独立采样。
+            if dist.contains(v) {
+                v
+            } else {
+                let all_trials = self.storage.get_all_trials(self.study_id, None)?;
+                self.sampler.sample_independent(&all_trials, &existing, name, dist)?
+            }
         } else {
             // Fall back to independent sampling
             // 获取所有历史试验供采样器参考（对齐 Python study._get_trials）
@@ -342,14 +378,26 @@ impl Trial {
     pub fn relative_params_internal(&self) -> HashMap<String, f64> {
         self.relative_params.clone()
     }
+
+    /// 返回 fixed 参数（外部表示）。
+    /// 对应 Python 从 trial system attrs 读取 fixed_params 的可见语义。
+    pub fn fixed_params(&self) -> HashMap<String, ParamValue> {
+        self.fixed_params.clone()
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use std::collections::HashMap;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
 
     use crate::distributions::Distribution;
+    use crate::error::Result;
+    use crate::pruners::Pruner;
+    use crate::samplers::Sampler;
     use crate::study::{StudyDirection, create_study};
+    use crate::trial::FrozenTrial;
 
     #[test]
     fn test_trial_float_python_compat_wrappers() {
@@ -529,5 +577,133 @@ mod tests {
         let trial = study.ask(Some(&fixed)).unwrap();
         let rel = trial.relative_params_internal();
         assert!(rel.contains_key("x"));
+    }
+
+    #[test]
+    fn test_fixed_params_from_enqueue_trial() {
+        let study = create_study(
+            None,
+            None,
+            None,
+            None,
+            Some(StudyDirection::Minimize),
+            None,
+            false,
+        )
+        .unwrap();
+
+        let mut params = HashMap::new();
+        params.insert("x".to_string(), crate::distributions::ParamValue::Float(0.8));
+        study.enqueue_trial(params, None, false).unwrap();
+
+        let mut trial = study.ask(None).unwrap();
+        let x = trial.suggest_float_default("x", 0.0, 1.0).unwrap();
+        assert!((x - 0.8).abs() < 1e-12);
+
+        let fixed = trial.fixed_params();
+        assert!(fixed.contains_key("x"));
+    }
+
+    #[test]
+    fn test_fixed_param_out_of_range_still_used() {
+        let study = create_study(
+            None,
+            None,
+            None,
+            None,
+            Some(StudyDirection::Minimize),
+            None,
+            false,
+        )
+        .unwrap();
+
+        let mut params = HashMap::new();
+        params.insert("x".to_string(), crate::distributions::ParamValue::Float(2.0));
+        study.enqueue_trial(params, None, false).unwrap();
+
+        let mut trial = study.ask(None).unwrap();
+        let x = trial.suggest_float_default("x", 0.0, 1.0).unwrap();
+        assert!((x - 2.0).abs() < 1e-12);
+    }
+
+    #[derive(Debug)]
+    struct RelativeFallbackSampler {
+        independent_calls: Arc<AtomicUsize>,
+    }
+
+    impl Sampler for RelativeFallbackSampler {
+        fn infer_relative_search_space(
+            &self,
+            _trials: &[FrozenTrial],
+        ) -> HashMap<String, Distribution> {
+            let mut m = HashMap::new();
+            m.insert(
+                "x".to_string(),
+                Distribution::FloatDistribution(
+                    crate::distributions::FloatDistribution::new(0.0, 1.0, false, None).unwrap(),
+                ),
+            );
+            m
+        }
+
+        fn sample_relative(
+            &self,
+            _trials: &[FrozenTrial],
+            _search_space: &HashMap<String, Distribution>,
+        ) -> Result<HashMap<String, f64>> {
+            let mut m = HashMap::new();
+            // 故意返回超范围值，触发 Trial::suggest 的 independent 回退路径。
+            m.insert("x".to_string(), 2.0);
+            Ok(m)
+        }
+
+        fn sample_independent(
+            &self,
+            _trials: &[FrozenTrial],
+            _trial: &FrozenTrial,
+            _param_name: &str,
+            _distribution: &Distribution,
+        ) -> Result<f64> {
+            self.independent_calls.fetch_add(1, Ordering::Relaxed);
+            Ok(0.25)
+        }
+    }
+
+    #[derive(Debug)]
+    struct NeverPrune;
+    impl Pruner for NeverPrune {
+        fn prune(
+            &self,
+            _study_trials: &[FrozenTrial],
+            _trial: &FrozenTrial,
+            _storage: Option<&dyn crate::storage::Storage>,
+        ) -> Result<bool> {
+            Ok(false)
+        }
+    }
+
+    #[test]
+    fn test_relative_param_out_of_range_falls_back_to_independent() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let sampler: Arc<dyn Sampler> = Arc::new(RelativeFallbackSampler {
+            independent_calls: Arc::clone(&calls),
+        });
+        let pruner: Arc<dyn Pruner> = Arc::new(NeverPrune);
+
+        let study = create_study(
+            None,
+            Some(sampler),
+            Some(pruner),
+            None,
+            Some(StudyDirection::Minimize),
+            None,
+            false,
+        )
+        .unwrap();
+
+        let mut trial = study.ask(None).unwrap();
+        let x = trial.suggest_float_default("x", 0.0, 1.0).unwrap();
+        assert!((x - 0.25).abs() < 1e-12);
+        assert_eq!(calls.load(Ordering::Relaxed), 1);
     }
 }

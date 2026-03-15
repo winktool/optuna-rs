@@ -224,4 +224,71 @@ mod tests {
             "y values should vary"
         );
     }
+
+    #[test]
+    fn test_from_param_values_with_distribution_for_categorical() {
+        let base: Arc<dyn Sampler> = Arc::new(RandomSampler::new(Some(1)));
+        let mut fixed_params = HashMap::new();
+        fixed_params.insert(
+            "cat".to_string(),
+            ParamValue::Categorical(crate::distributions::CategoricalChoice::Str("b".into())),
+        );
+
+        let mut distributions = HashMap::new();
+        distributions.insert(
+            "cat".to_string(),
+            Distribution::CategoricalDistribution(
+                crate::distributions::CategoricalDistribution::new(vec![
+                    crate::distributions::CategoricalChoice::Str("a".into()),
+                    crate::distributions::CategoricalChoice::Str("b".into()),
+                ])
+                .unwrap(),
+            ),
+        );
+
+        let sampler = PartialFixedSampler::from_param_values(fixed_params, &distributions, base).unwrap();
+        let trial = FrozenTrial {
+            number: 0,
+            state: TrialState::Running,
+            values: None,
+            datetime_start: Some(chrono::Utc::now()),
+            datetime_complete: None,
+            params: HashMap::new(),
+            distributions: HashMap::new(),
+            user_attrs: HashMap::new(),
+            system_attrs: HashMap::new(),
+            intermediate_values: HashMap::new(),
+            trial_id: 0,
+        };
+
+        let v = sampler
+            .sample_independent(
+                &[],
+                &trial,
+                "cat",
+                distributions.get("cat").unwrap(),
+            )
+            .unwrap();
+        assert_eq!(v, 1.0);
+    }
+
+    #[test]
+    fn test_from_param_values_without_distribution_for_categorical_errors() {
+        let base: Arc<dyn Sampler> = Arc::new(RandomSampler::new(Some(1)));
+        let mut fixed_params = HashMap::new();
+        fixed_params.insert(
+            "cat".to_string(),
+            ParamValue::Categorical(crate::distributions::CategoricalChoice::Str("b".into())),
+        );
+        let distributions = HashMap::new();
+
+        let err = PartialFixedSampler::from_param_values(fixed_params, &distributions, base)
+            .unwrap_err();
+        match err {
+            crate::error::OptunaError::ValueError(msg) => {
+                assert!(msg.contains("cannot fix categorical param 'cat' without a distribution"));
+            }
+            _ => panic!("unexpected error type"),
+        }
+    }
 }

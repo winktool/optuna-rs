@@ -344,6 +344,14 @@ impl Study {
         };
 
         // Sample relative params
+        let fixed_params = trial
+            .system_attrs
+            .get("fixed_params")
+            .map(|fp| serde_json::from_value::<HashMap<String, crate::distributions::ParamValue>>(fp.clone()))
+            .transpose()
+            .map_err(|e| OptunaError::StorageInternalError(e.to_string()))?
+            .unwrap_or_default();
+
         let mut relative_params = if !search_space.is_empty() {
             self.sampler
                 .sample_relative(&all_trials, &search_space)?
@@ -372,6 +380,8 @@ impl Study {
             Arc::clone(&self.pruner),
             self.directions.clone(),
             relative_params,
+            search_space,
+            fixed_params,
         ))
     }
 
@@ -1748,5 +1758,27 @@ mod tests {
 
         let x = trial.suggest_float_default("x", 0.0, 1.0).unwrap();
         assert!((0.0..=1.0).contains(&x));
+    }
+
+    #[test]
+    fn test_enqueue_trial_applies_fixed_params_on_ask() {
+        let study = create_study(
+            None,
+            None,
+            None,
+            None,
+            Some(StudyDirection::Minimize),
+            None,
+            false,
+        )
+        .unwrap();
+
+        let mut params = HashMap::new();
+        params.insert("x".to_string(), crate::distributions::ParamValue::Float(0.33));
+        study.enqueue_trial(params, None, false).unwrap();
+
+        let mut trial = study.ask(None).unwrap();
+        let x = trial.suggest_float_default("x", 0.0, 1.0).unwrap();
+        assert!((x - 0.33).abs() < 1e-12);
     }
 }

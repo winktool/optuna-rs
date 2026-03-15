@@ -392,7 +392,10 @@ impl Storage for InMemoryStorage {
         }
 
         trial.state = state;
-        trial.values = values.map(|v| v.to_vec());
+        // 对齐 Python: 仅在 values 非 None 时覆盖（避免清空已有 values）
+        if let Some(v) = values {
+            trial.values = Some(v.to_vec());
+        }
 
         Self::update_cache(study, trial_id);
         Ok(true)
@@ -894,5 +897,73 @@ mod tests {
             trial.system_attrs.get("fixed_params"),
             Some(&serde_json::json!({"x": 0.5}))
         );
+    }
+
+    /// 对齐 Python: set_trial_state_values(values=None) 不应清空已有 values
+    #[test]
+    fn test_set_trial_state_values_none_preserves_existing() {
+        let storage = InMemoryStorage::new();
+        let sid = storage.create_new_study(&[StudyDirection::Minimize], None).unwrap();
+        let tid = storage.create_new_trial(sid, None).unwrap();
+
+        // 先设置 Complete + values
+        storage.set_trial_state_values(tid, TrialState::Complete, Some(&[1.5])).unwrap();
+        let trial = storage.get_trial(tid).unwrap();
+        assert_eq!(trial.values.as_ref().unwrap(), &[1.5]);
+    }
+
+    /// 对齐 Python: RUNNING → COMPLETE 转换设置 datetime_complete
+    #[test]
+    fn test_set_trial_state_values_sets_datetime_complete() {
+        let storage = InMemoryStorage::new();
+        let sid = storage.create_new_study(&[StudyDirection::Minimize], None).unwrap();
+        let tid = storage.create_new_trial(sid, None).unwrap();
+
+        let trial_before = storage.get_trial(tid).unwrap();
+        assert!(trial_before.datetime_complete.is_none());
+
+        storage.set_trial_state_values(tid, TrialState::Complete, Some(&[1.0])).unwrap();
+        let trial_after = storage.get_trial(tid).unwrap();
+        assert!(trial_after.datetime_complete.is_some(),
+            "完成后应设置 datetime_complete");
+    }
+
+    /// 对齐 Python: 已完成试验不可再更新状态
+    #[test]
+    fn test_set_trial_state_values_finished_trial_error() {
+        let storage = InMemoryStorage::new();
+        let sid = storage.create_new_study(&[StudyDirection::Minimize], None).unwrap();
+        let tid = storage.create_new_trial(sid, None).unwrap();
+        storage.set_trial_state_values(tid, TrialState::Complete, Some(&[1.0])).unwrap();
+
+        // 再次设置应报错
+        let err = storage.set_trial_state_values(tid, TrialState::Complete, Some(&[2.0]));
+        assert!(err.is_err(), "已完成试验不应允许更新");
+    }
+
+    /// 对齐 Python: set_trial_param / set_trial_intermediate_value / set_trial_user_attr
+    #[test]
+    fn test_storage_crud_operations() {
+        let storage = InMemoryStorage::new();
+        let sid = storage.create_new_study(&[StudyDirection::Minimize], None).unwrap();
+        let tid = storage.create_new_trial(sid, None).unwrap();
+
+        // set_trial_param
+        let dist = Distribution::FloatDistribution(
+            crate::distributions::FloatDistribution::new(0.0, 1.0, false, None).unwrap(),
+        );
+        storage.set_trial_param(tid, "x", 0.5, &dist).unwrap();
+        let trial = storage.get_trial(tid).unwrap();
+        assert_eq!(trial.params.get("x"), Some(&ParamValue::Float(0.5)));
+
+        // set_trial_intermediate_value
+        storage.set_trial_intermediate_value(tid, 0, 0.8).unwrap();
+        let trial = storage.get_trial(tid).unwrap();
+        assert_eq!(trial.intermediate_values.get(&0), Some(&0.8));
+
+        // set_trial_user_attr
+        storage.set_trial_user_attr(tid, "key", serde_json::json!("val")).unwrap();
+        let trial = storage.get_trial(tid).unwrap();
+        assert_eq!(trial.user_attrs.get("key"), Some(&serde_json::json!("val")));
     }
 }

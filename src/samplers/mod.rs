@@ -81,6 +81,17 @@ pub trait Sampler: Send + Sync {
         _values: Option<&[f64]>,
     ) {
     }
+
+    /// 对齐 Python `_process_constraints_after_trial`:
+    /// 如果采样器设置了约束函数，计算并返回约束值。
+    /// 默认返回 None（无约束）。tell() 会将返回的值存储到 storage。
+    fn compute_constraints(
+        &self,
+        _trial: &FrozenTrial,
+        _state: TrialState,
+    ) -> Option<Vec<f64>> {
+        None
+    }
 }
 
 #[cfg(test)]

@@ -929,13 +929,37 @@ fn box_decomp_3d(loss_vals: &[Vec<f64>], ref_point: &[f64]) -> (Vec<Vec<f64>>, V
 }
 
 /// Get the Pareto-optimal trials from a list of complete trials.
+///
+/// 对齐 Python `get_pareto_front_trials(study, consider_constraint=False)`。
+/// 当 `consider_constraint=true` 时，只考虑可行解（约束值全 ≤ 0）。
 pub fn get_pareto_front_trials(
     trials: &[FrozenTrial],
     directions: &[StudyDirection],
 ) -> Vec<FrozenTrial> {
+    get_pareto_front_trials_with_constraint(trials, directions, false)
+}
+
+/// 带约束考虑的 Pareto 前沿获取。
+///
+/// 对齐 Python `get_pareto_front_trials(study, consider_constraint=True)`。
+pub fn get_pareto_front_trials_with_constraint(
+    trials: &[FrozenTrial],
+    directions: &[StudyDirection],
+    consider_constraint: bool,
+) -> Vec<FrozenTrial> {
     let complete: Vec<&FrozenTrial> = trials
         .iter()
-        .filter(|t| t.state == TrialState::Complete && t.values.is_some())
+        .filter(|t| {
+            if t.state != TrialState::Complete || t.values.is_none() {
+                return false;
+            }
+            if consider_constraint {
+                // 对齐 Python: 只保留可行解（约束值全 ≤ 0）
+                is_feasible(t)
+            } else {
+                true
+            }
+        })
         .collect();
 
     if complete.is_empty() {
@@ -1447,5 +1471,71 @@ mod tests {
         let ref_point = vec![5.0, 5.0];
         let hv = hypervolume(&pts, &ref_point);
         assert!((hv - 6.0).abs() < 1e-12, "Python: hv=6.0, got={hv}");
+    }
+
+    /// 对齐 Python: get_pareto_front_trials_with_constraint(consider_constraint=true)
+    /// 只保留可行解（约束值全 ≤ 0）
+    #[test]
+    fn test_pareto_front_with_constraint() {
+        let dirs = vec![StudyDirection::Minimize, StudyDirection::Minimize];
+
+        // 可行试验: 约束 [-1.0]（满足 ≤ 0）
+        let mut t1 = make_trial(0, vec![1.0, 2.0]);
+        t1.system_attrs.insert(
+            CONSTRAINTS_KEY.to_string(),
+            serde_json::json!([-1.0]),
+        );
+
+        // 不可行试验: 约束 [1.0]（违反 > 0）— 即使 Pareto 更优也应被排除
+        let mut t2 = make_trial(1, vec![0.5, 0.5]);
+        t2.system_attrs.insert(
+            CONSTRAINTS_KEY.to_string(),
+            serde_json::json!([1.0]),
+        );
+
+        // 可行试验: 约束 [0.0]（等于 0，满足 ≤ 0）
+        let mut t3 = make_trial(2, vec![1.5, 1.5]);
+        t3.system_attrs.insert(
+            CONSTRAINTS_KEY.to_string(),
+            serde_json::json!([0.0]),
+        );
+
+        let trials = vec![t1, t2, t3];
+
+        // consider_constraint=false → 包含不可行的 t2
+        let front_no_constraint = get_pareto_front_trials(&trials, &dirs);
+        assert!(front_no_constraint.iter().any(|t| t.number == 1),
+            "无约束时 t2 应在 Pareto 前沿");
+
+        // consider_constraint=true → 排除 t2
+        let front_with_constraint = get_pareto_front_trials_with_constraint(
+            &trials, &dirs, true
+        );
+        assert!(!front_with_constraint.iter().any(|t| t.number == 1),
+            "有约束时 t2 应被排除");
+        assert!(front_with_constraint.iter().any(|t| t.number == 0),
+            "可行的 t1 应在前沿");
+    }
+
+    /// 对齐 Python: is_feasible 语义
+    #[test]
+    fn test_is_feasible_semantics() {
+        let mut t = make_trial(0, vec![1.0]);
+        // 无约束信息 → 不可行
+        assert!(!is_feasible(&t), "无约束信息应视为不可行");
+
+        // 约束全 ≤ 0 → 可行
+        t.system_attrs.insert(
+            CONSTRAINTS_KEY.to_string(),
+            serde_json::json!([-1.0, 0.0]),
+        );
+        assert!(is_feasible(&t), "约束全 ≤ 0 应视为可行");
+
+        // 约束有 > 0 → 不可行
+        t.system_attrs.insert(
+            CONSTRAINTS_KEY.to_string(),
+            serde_json::json!([-1.0, 0.1]),
+        );
+        assert!(!is_feasible(&t), "约束有 > 0 应视为不可行");
     }
 }

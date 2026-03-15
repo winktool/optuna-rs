@@ -398,6 +398,40 @@ impl Study {
         self.tell_with_options(trial_id, state, values, false)
     }
 
+    /// 对齐 Python `Study.tell(state=None)`: 自动推断状态。
+    ///
+    /// - values 合法（非 NaN、数量匹配）→ Complete
+    /// - values 无效或 None → Fail
+    ///
+    /// 对应 Python `_tell_with_warning` 的 `state is None` 分支。
+    pub fn tell_auto(
+        &self,
+        trial_id: i64,
+        values: Option<&[f64]>,
+    ) -> Result<FrozenTrial> {
+        let inferred_state = if let Some(vals) = values {
+            // 检查 values 是否合法
+            let feasible = vals.iter().all(|v| !v.is_nan())
+                && vals.len() == self.directions.len();
+            if feasible {
+                TrialState::Complete
+            } else {
+                TrialState::Fail
+            }
+        } else {
+            // values=None → Fail（对齐 Python: "The value None could not be cast to float."）
+            TrialState::Fail
+        };
+
+        let final_values = if inferred_state == TrialState::Complete {
+            values
+        } else {
+            None
+        };
+
+        self.tell_with_options(trial_id, inferred_state, final_values, false)
+    }
+
     /// 带 skip_if_finished 选项的 tell。
     ///
     /// 对应 Python `Study.tell(skip_if_finished=True)`。
@@ -440,8 +474,13 @@ impl Study {
                 }
             }
             TrialState::Pruned | TrialState::Fail => {
-                // 对齐 Python: Pruned/Fail 时忽略 values（如果传了就丢弃）
-                // Python 会发出 UserWarning 但不报错
+                // 对齐 Python _check_state_and_values:
+                // Pruned/Fail 时传入 values 是错误
+                if values.is_some() {
+                    return Err(OptunaError::ValueError(
+                        "Values were told. Values cannot be specified when state is TrialState.PRUNED or TrialState.FAIL.".into(),
+                    ));
+                }
             }
             TrialState::Running | TrialState::Waiting => {
                 return Err(OptunaError::ValueError(format!(
@@ -497,6 +536,16 @@ impl Study {
             state,
             final_values.as_deref(),
         );
+
+        // 5b. 对齐 Python _process_constraints_after_trial:
+        // 计算约束值并存储到 trial.system_attrs
+        if let Some(constraints) = self.sampler.compute_constraints(&frozen, state) {
+            self.storage.set_trial_system_attr(
+                trial_id,
+                crate::multi_objective::CONSTRAINTS_KEY,
+                serde_json::json!(constraints),
+            )?;
+        }
 
         // 6. set_trial_state_values 放在 finally 等价位置
         self.storage
@@ -1978,5 +2027,161 @@ mod tests {
         study.set_metric_names(&["loss", "accuracy"]).unwrap();
         let names = study.metric_names().unwrap().unwrap();
         assert_eq!(names, vec!["loss".to_string(), "accuracy".to_string()]);
+    }
+
+    // ── 对齐 Python tell() 验证 ──
+
+    /// 对齐 Python: tell(state=PRUNED, values=...) 应抛出 ValueError
+    #[test]
+    fn test_tell_pruned_with_values_raises_error() {
+        let study = create_study(
+            None, None, None, None,
+            Some(StudyDirection::Minimize), None, false,
+        ).unwrap();
+        let trial = study.ask(None).unwrap();
+        let err = study.tell(trial.trial_id(), TrialState::Pruned, Some(&[1.0]));
+        assert!(err.is_err(), "PRUNED + values 应抛出 ValueError");
+        match err.unwrap_err() {
+            OptunaError::ValueError(msg) => {
+                assert!(msg.contains("Values cannot be specified") || msg.contains("Values were told"),
+                    "错误消息应指明 values 不允许: {msg}");
+            }
+            e => panic!("应是 ValueError: {e:?}"),
+        }
+    }
+
+    /// 对齐 Python: tell(state=FAIL, values=...) 应抛出 ValueError
+    #[test]
+    fn test_tell_fail_with_values_raises_error() {
+        let study = create_study(
+            None, None, None, None,
+            Some(StudyDirection::Minimize), None, false,
+        ).unwrap();
+        let trial = study.ask(None).unwrap();
+        let err = study.tell(trial.trial_id(), TrialState::Fail, Some(&[1.0]));
+        assert!(err.is_err(), "FAIL + values 应抛出 ValueError");
+    }
+
+    /// 对齐 Python: tell(state=COMPLETE, values=None) 应抛出 ValueError
+    #[test]
+    fn test_tell_complete_without_values_raises_error() {
+        let study = create_study(
+            None, None, None, None,
+            Some(StudyDirection::Minimize), None, false,
+        ).unwrap();
+        let trial = study.ask(None).unwrap();
+        let err = study.tell(trial.trial_id(), TrialState::Complete, None);
+        assert!(err.is_err(), "COMPLETE + None values 应抛出 ValueError");
+    }
+
+    /// 对齐 Python: tell(state=COMPLETE, values=[NaN]) 应抛出 ValueError
+    #[test]
+    fn test_tell_nan_value_raises_error() {
+        let study = create_study(
+            None, None, None, None,
+            Some(StudyDirection::Minimize), None, false,
+        ).unwrap();
+        let trial = study.ask(None).unwrap();
+        let err = study.tell(trial.trial_id(), TrialState::Complete, Some(&[f64::NAN]));
+        assert!(err.is_err(), "NaN value 应抛出 ValueError");
+    }
+
+    /// 对齐 Python: tell(state=COMPLETE, values 数量不匹配) 应抛出 ValueError
+    #[test]
+    fn test_tell_wrong_number_of_values_raises_error() {
+        let study = create_study(
+            None, None, None, None,
+            Some(StudyDirection::Minimize), None, false,
+        ).unwrap();
+        let trial = study.ask(None).unwrap();
+        // 单目标传入 2 个值
+        let err = study.tell(trial.trial_id(), TrialState::Complete, Some(&[1.0, 2.0]));
+        assert!(err.is_err(), "values 数量不匹配应抛出 ValueError");
+    }
+
+    /// 对齐 Python: tell_auto 自动推断状态
+    #[test]
+    fn test_tell_auto_infers_complete() {
+        let study = create_study(
+            None, None, None, None,
+            Some(StudyDirection::Minimize), None, false,
+        ).unwrap();
+        let trial = study.ask(None).unwrap();
+        let frozen = study.tell_auto(trial.trial_id(), Some(&[1.5])).unwrap();
+        assert_eq!(frozen.state, TrialState::Complete);
+        assert!((frozen.values.as_ref().unwrap()[0] - 1.5).abs() < 1e-12);
+    }
+
+    /// 对齐 Python: tell_auto values=None → Fail
+    #[test]
+    fn test_tell_auto_infers_fail_on_none() {
+        let study = create_study(
+            None, None, None, None,
+            Some(StudyDirection::Minimize), None, false,
+        ).unwrap();
+        let trial = study.ask(None).unwrap();
+        let frozen = study.tell_auto(trial.trial_id(), None).unwrap();
+        assert_eq!(frozen.state, TrialState::Fail);
+    }
+
+    /// 对齐 Python: tell_auto values=[NaN] → Fail
+    #[test]
+    fn test_tell_auto_infers_fail_on_nan() {
+        let study = create_study(
+            None, None, None, None,
+            Some(StudyDirection::Minimize), None, false,
+        ).unwrap();
+        let trial = study.ask(None).unwrap();
+        let frozen = study.tell_auto(trial.trial_id(), Some(&[f64::NAN])).unwrap();
+        assert_eq!(frozen.state, TrialState::Fail);
+    }
+
+    /// 对齐 Python: tell 非 RUNNING 试验应报错
+    #[test]
+    fn test_tell_non_running_trial_raises_error() {
+        let study = create_study(
+            None, None, None, None,
+            Some(StudyDirection::Minimize), None, false,
+        ).unwrap();
+        let trial = study.ask(None).unwrap();
+        let tid = trial.trial_id();
+        // 先完成
+        study.tell(tid, TrialState::Complete, Some(&[1.0])).unwrap();
+        // 再次 tell 应报错
+        let err = study.tell(tid, TrialState::Complete, Some(&[2.0]));
+        assert!(err.is_err(), "已完成的试验不应允许再次 tell");
+    }
+
+    /// 对齐 Python: tell skip_if_finished=true 不报错
+    #[test]
+    fn test_tell_skip_if_finished() {
+        let study = create_study(
+            None, None, None, None,
+            Some(StudyDirection::Minimize), None, false,
+        ).unwrap();
+        let trial = study.ask(None).unwrap();
+        let tid = trial.trial_id();
+        study.tell(tid, TrialState::Complete, Some(&[1.0])).unwrap();
+        // skip_if_finished=true → 静默返回已有 trial
+        let frozen = study.tell_with_options(tid, TrialState::Complete, Some(&[2.0]), true).unwrap();
+        assert!((frozen.values.as_ref().unwrap()[0] - 1.0).abs() < 1e-12,
+            "skip_if_finished 应保留原始值");
+    }
+
+    /// 对齐 Python: PRUNED 试验自动使用最后中间值
+    #[test]
+    fn test_tell_pruned_uses_last_intermediate_value() {
+        let study = create_study(
+            None, None, None, None,
+            Some(StudyDirection::Minimize), None, false,
+        ).unwrap();
+        let trial = study.ask(None).unwrap();
+        trial.report(0.5, 0).unwrap();
+        trial.report(0.3, 1).unwrap();
+        let frozen = study.tell(trial.trial_id(), TrialState::Pruned, None).unwrap();
+        assert_eq!(frozen.state, TrialState::Pruned);
+        // 应使用最后中间值 (step=1, value=0.3)
+        assert!(frozen.values.is_some(), "PRUNED 应自动使用最后中间值");
+        assert!((frozen.values.as_ref().unwrap()[0] - 0.3).abs() < 1e-12);
     }
 }

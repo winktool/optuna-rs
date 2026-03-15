@@ -241,8 +241,14 @@ fn untransform_numerical_float(trans: f64, d: &FloatDistribution, transform_log:
 
 fn untransform_numerical_int(trans: f64, d: &IntDistribution, transform_log: bool) -> i64 {
     if d.log {
-        let v = if transform_log { trans.exp() } else { trans };
-        (v.round() as i64).clamp(d.low, d.high)
+        if transform_log {
+            // 对齐 Python: int(np.clip(np.round(exp(trans)), low, high))
+            let v = trans.exp();
+            (v.round() as i64).clamp(d.low, d.high)
+        } else {
+            // 对齐 Python: int(trans_param) — 向零截断（非四舍五入）
+            (trans as i64).clamp(d.low, d.high)
+        }
     } else {
         let v = ((trans - d.low as f64) / d.step as f64).round() * d.step as f64 + d.low as f64;
         (v.round() as i64).clamp(d.low, d.high)
@@ -744,5 +750,32 @@ mod tests {
             ParamValue::Float(v) => assert!((*v - 5.0).abs() < 1e-10),
             _ => panic!("expected float"),
         }
+    }
+
+    /// 对齐 Python: IntDist log + transform_log=False 使用截断（非四舍五入）
+    /// Python: int(2.9) == 2, int(-2.9) == -2
+    #[test]
+    fn test_untransform_int_log_no_transform_truncation() {
+        let d = IntDistribution::new(1, 100, true, 1).unwrap();
+        // transform_log=false 时，传入值直接 int() 截断
+        let result = untransform_numerical_int(2.9, &d, false);
+        assert_eq!(result, 2, "Python int(2.9)=2, 向零截断");
+
+        let result2 = untransform_numerical_int(2.1, &d, false);
+        assert_eq!(result2, 2, "Python int(2.1)=2");
+
+        let result3 = untransform_numerical_int(99.7, &d, false);
+        assert_eq!(result3, 99, "Python int(99.7)=99");
+    }
+
+    /// 对齐 Python: IntDist log + transform_log=True 使用四舍五入
+    /// Python: int(np.round(exp(trans)))
+    #[test]
+    fn test_untransform_int_log_with_transform_round() {
+        let d = IntDistribution::new(1, 100, true, 1).unwrap();
+        // transform_log=true 时，先 exp 再 round
+        let trans = 3.0_f64.ln(); // exp(ln(3)) = 3.0
+        let result = untransform_numerical_int(trans, &d, true);
+        assert_eq!(result, 3, "exp(ln(3)) round = 3");
     }
 }

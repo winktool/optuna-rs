@@ -548,19 +548,33 @@ impl Sampler for TpeSampler {
     fn after_trial(
         &self,
         _trials: &[FrozenTrial],
-        trial: &FrozenTrial,
-        state: TrialState,
+        _trial: &FrozenTrial,
+        _state: TrialState,
         _values: Option<&[f64]>,
     ) {
-        // Store constraint values if constraints_func is set
-        if let Some(ref cf) = self.constraints_func {
-            if state == TrialState::Complete || state == TrialState::Pruned {
-                let _constraints = cf(trial);
-                // In a full implementation, this would store to trial.system_attrs
-                // via storage. For now the constraints_func pattern is exposed for
-                // user-level usage where they can store via set_system_attr.
-            }
+        // 约束值由 compute_constraints() 返回，tell() 负责存储到 storage。
+        // 对齐 Python: after_trial 调用 _process_constraints_after_trial + random_sampler.after_trial
+    }
+
+    /// 对齐 Python `_process_constraints_after_trial`:
+    /// 当设置了 constraints_func 且状态为 Complete 或 Pruned 时，
+    /// 计算约束值并返回，由 tell() 存储到 trial.system_attrs。
+    fn compute_constraints(
+        &self,
+        trial: &FrozenTrial,
+        state: TrialState,
+    ) -> Option<Vec<f64>> {
+        let cf = self.constraints_func.as_ref()?;
+        if state != TrialState::Complete && state != TrialState::Pruned {
+            return None;
         }
+        let constraints = cf(trial);
+        // 对齐 Python: 检查 NaN
+        if constraints.iter().any(|c| c.is_nan()) {
+            crate::optuna_warn!("Constraint values cannot be NaN. Storing None.");
+            return None;
+        }
+        Some(constraints)
     }
 }
 

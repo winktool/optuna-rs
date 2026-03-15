@@ -1051,6 +1051,133 @@ def test_retry_callback_inherit_intermediate_values():
         assert len(waiting[0].intermediate_values) == 2
 
 # ═══════════════════════════════════════════════════════════════════════════
+#  36. tell() PRUNED+values 应抛错 — 对应 Rust study/core.rs
+# ═══════════════════════════════════════════════════════════════════════════
+
+def test_tell_pruned_with_values_raises():
+    """验证 Python tell(state=PRUNED, values=1.0) 抛出 ValueError"""
+    study = optuna.create_study()
+    trial = study.ask()
+    try:
+        study.tell(trial, values=1.0, state=optuna.trial.TrialState.PRUNED)
+        assert False, "应抛出 ValueError"
+    except ValueError as e:
+        assert "Values" in str(e) or "cannot" in str(e).lower()
+
+def test_tell_fail_with_values_raises():
+    """验证 Python tell(state=FAIL, values=1.0) 抛出 ValueError"""
+    study = optuna.create_study()
+    trial = study.ask()
+    try:
+        study.tell(trial, values=1.0, state=optuna.trial.TrialState.FAIL)
+        assert False, "应抛出 ValueError"
+    except ValueError as e:
+        assert "Values" in str(e) or "cannot" in str(e).lower()
+
+# ═══════════════════════════════════════════════════════════════════════════
+#  37. tell(state=None) 自动推断 — 对应 Rust study/core.rs tell_auto
+# ═══════════════════════════════════════════════════════════════════════════
+
+def test_tell_auto_complete():
+    """验证 Python tell(state=None, values=1.0) → Complete"""
+    study = optuna.create_study()
+    trial = study.ask()
+    frozen = study.tell(trial, values=1.0)  # state=None is default
+    assert frozen.state == optuna.trial.TrialState.COMPLETE
+    assert abs(frozen.values[0] - 1.0) < 1e-12
+
+def test_tell_auto_fail_on_none():
+    """验证 Python tell(state=None, values=None) → Fail"""
+    study = optuna.create_study()
+    trial = study.ask()
+    frozen = study.tell(trial, values=None)
+    assert frozen.state == optuna.trial.TrialState.FAIL
+
+def test_tell_auto_fail_on_nan():
+    """验证 Python tell(state=None, values=NaN) → Fail"""
+    import math
+    study = optuna.create_study()
+    trial = study.ask()
+    frozen = study.tell(trial, values=math.nan)
+    assert frozen.state == optuna.trial.TrialState.FAIL
+
+# ═══════════════════════════════════════════════════════════════════════════
+#  38. tell PRUNED 自动使用最后中间值 — 对应 Rust study/core.rs
+# ═══════════════════════════════════════════════════════════════════════════
+
+def test_tell_pruned_auto_intermediate_value():
+    """验证 Python tell(state=PRUNED) 自动使用最后中间值"""
+    study = optuna.create_study()
+    trial = study.ask()
+    trial.report(0.5, 0)
+    trial.report(0.3, 1)
+    frozen = study.tell(trial, state=optuna.trial.TrialState.PRUNED)
+    assert frozen.state == optuna.trial.TrialState.PRUNED
+    assert frozen.values is not None
+    assert abs(frozen.values[0] - 0.3) < 1e-12
+
+# ═══════════════════════════════════════════════════════════════════════════
+#  39. SearchSpaceTransform int truncation — 对应 Rust transform.rs
+# ═══════════════════════════════════════════════════════════════════════════
+
+def test_int_truncation_log_no_transform():
+    """验证 Python int() 截断行为: int(2.9)==2, int(99.7)==99"""
+    assert int(2.9) == 2, "int(2.9) should be 2"
+    assert int(2.1) == 2, "int(2.1) should be 2"
+    assert int(99.7) == 99, "int(99.7) should be 99"
+    assert int(-2.9) == -2, "int(-2.9) should be -2"
+
+# ═══════════════════════════════════════════════════════════════════════════
+#  40. Pareto front with constraints — 对应 Rust multi_objective.rs
+# ═══════════════════════════════════════════════════════════════════════════
+
+def test_pareto_front_with_constraints():
+    """验证 Python get_pareto_front_trials(consider_constraint=True)"""
+    from optuna.study._multi_objective import _get_pareto_front_trials
+    study = optuna.create_study(directions=["minimize", "minimize"])
+
+    # 添加可行试验 [1.0, 2.0]
+    study.add_trial(
+        optuna.trial.create_trial(
+            values=[1.0, 2.0],
+            system_attrs={"constraints": [-1.0]},
+        )
+    )
+    # 添加不可行但 Pareto 更优的试验 [0.5, 0.5]
+    study.add_trial(
+        optuna.trial.create_trial(
+            values=[0.5, 0.5],
+            system_attrs={"constraints": [1.0]},  # 违反约束
+        )
+    )
+
+    # 无约束过滤 → [0.5, 0.5] 在前沿
+    front_all = _get_pareto_front_trials(study, consider_constraint=False)
+    assert any(t.values == [0.5, 0.5] for t in front_all)
+
+    # 有约束过滤 → 只剩可行的 [1.0, 2.0]
+    front_constrained = _get_pareto_front_trials(study, consider_constraint=True)
+    assert all(t.values != [0.5, 0.5] for t in front_constrained)
+    assert any(t.values == [1.0, 2.0] for t in front_constrained)
+
+# ═══════════════════════════════════════════════════════════════════════════
+#  41. set_trial_state_values values=None 不清空 — 对应 Rust in_memory.rs
+# ═══════════════════════════════════════════════════════════════════════════
+
+def test_set_trial_state_values_none_preserves():
+    """验证 Python: set_trial_state_values(values=None) 不清空已有 values"""
+    storage = optuna.storages.InMemoryStorage()
+    sid = storage.create_new_study(
+        directions=[optuna.study.StudyDirection.MINIMIZE],
+        study_name="test",
+    )
+    tid = storage.create_new_trial(sid)
+    # 先设置 Complete + values
+    storage.set_trial_state_values(tid, optuna.trial.TrialState.COMPLETE, [1.5])
+    trial = storage.get_trial(tid)
+    assert trial.values == [1.5]
+
+# ═══════════════════════════════════════════════════════════════════════════
 #  执行
 # ═══════════════════════════════════════════════════════════════════════════
 

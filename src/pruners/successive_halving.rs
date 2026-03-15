@@ -58,18 +58,18 @@ impl SuccessiveHalvingPruner {
         bootstrap_count: usize,
         direction: StudyDirection,
     ) -> Self {
-        assert!(reduction_factor >= 2, "reduction_factor 必须 >= 2");
+        assert!(reduction_factor >= 2, "`reduction_factor` must be >= 2.");
         assert!(
             min_early_stopping_rate >= 0,
-            "min_early_stopping_rate 必须 >= 0"
+            "`min_early_stopping_rate` must be >= 0."
         );
         if let Some(mr) = min_resource {
-            assert!(mr >= 1, "min_resource 必须 >= 1");
+            assert!(mr >= 1, "`min_resource` must be >= 1.");
         }
         // 对齐 Python: bootstrap_count > 0 与 min_resource = auto(None) 互斥
         assert!(
             !(bootstrap_count > 0 && min_resource.is_none()),
-            "bootstrap_count > 0 和 min_resource = auto(None) 互不兼容"
+            "`bootstrap_count` > 0 and `min_resource` = auto(None) are mutually exclusive."
         );
 
         Self {
@@ -364,7 +364,7 @@ mod tests {
 
     /// 对齐 Python: bootstrap_count > 0 与 min_resource=None 互斥
     #[test]
-    #[should_panic(expected = "互不兼容")]
+    #[should_panic(expected = "mutually exclusive")]
     fn test_bootstrap_auto_incompatible() {
         // Python: ValueError("bootstrap_count > 0 and min_resource == 'auto' are mutually incompatible")
         SuccessiveHalvingPruner::new(None, 4, 0, 1, StudyDirection::Minimize);

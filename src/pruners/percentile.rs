@@ -37,10 +37,11 @@ impl PercentilePruner {
     ) -> Self {
         assert!(
             (0.0..=100.0).contains(&percentile),
-            "percentile must be in [0, 100]"
+            "Percentile must be between 0 and 100 inclusive."
         );
-        assert!(interval_steps >= 1, "interval_steps must be >= 1");
-        assert!(n_min_trials >= 1, "n_min_trials must be >= 1");
+        assert!(n_warmup_steps >= 0, "Number of warmup steps cannot be negative.");
+        assert!(interval_steps >= 1, "Pruning interval steps must be at least 1.");
+        assert!(n_min_trials >= 1, "Number of trials for pruning must be at least 1.");
         Self {
             percentile,
             n_startup_trials,

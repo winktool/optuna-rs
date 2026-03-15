@@ -560,6 +560,12 @@ impl Study {
             crate::optuna_warn!("after_trial panicked for trial {}: {:?}", trial_id, e);
         }
 
+        // 对齐 Python BruteForceSampler.after_trial 中的 study.stop():
+        // 如果采样器请求停止（如搜索空间耗尽），设置 stop_flag
+        if self.sampler.should_stop_study() {
+            self.stop();
+        }
+
         let result = self.storage.get_trial(trial_id)?;
         Ok(result)
     }
@@ -755,6 +761,8 @@ impl Study {
         F: Fn(&mut Trial) -> Result<Vec<f64>>,
     {
         self.stop_flag.store(false, Ordering::Release);
+        SIGINT_RECEIVED.store(false, Ordering::SeqCst);
+        install_signal_handler(&self.stop_flag);
         let start = Instant::now();
         let mut i_trial: usize = 0;
         loop {
@@ -783,6 +791,8 @@ impl Study {
         F: Fn(&mut Trial) -> Result<Vec<f64>> + Send + Sync,
     {
         self.stop_flag.store(false, Ordering::Release);
+        SIGINT_RECEIVED.store(false, Ordering::SeqCst);
+        install_signal_handler(&self.stop_flag);
         let start = Instant::now();
 
         #[cfg(feature = "progress")]
@@ -938,6 +948,8 @@ impl Study {
         F: Fn(&mut Trial) -> Result<Vec<f64>>,
     {
         self.stop_flag.store(false, Ordering::Release);
+        SIGINT_RECEIVED.store(false, Ordering::SeqCst);
+        install_signal_handler(&self.stop_flag);
         let start = Instant::now();
 
         let mut i_trial: usize = 0;

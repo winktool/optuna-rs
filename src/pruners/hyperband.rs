@@ -64,18 +64,18 @@ impl HyperbandPruner {
         direction: StudyDirection,
         study_name: &str,
     ) -> Self {
-        assert!(min_resource >= 1, "min_resource 必须 >= 1");
-        assert!(reduction_factor >= 2, "reduction_factor 必须 >= 2");
+        assert!(min_resource >= 1, "`min_resource` must be >= 1.");
+        assert!(reduction_factor >= 2, "`reduction_factor` must be >= 2.");
         if let Some(mr) = max_resource {
             assert!(
                 mr >= min_resource,
-                "max_resource 必须 >= min_resource"
+                "`max_resource` must be >= `min_resource`."
             );
         }
         // 对齐 Python: bootstrap_count > 0 与 max_resource="auto"(None) 互斥
         assert!(
             !(bootstrap_count > 0 && max_resource.is_none()),
-            "bootstrap_count > 0 和 max_resource = auto(None) 互不兼容"
+            "`bootstrap_count` > 0 and `max_resource` = auto(None) are mutually exclusive."
         );
 
         Self {
@@ -327,7 +327,7 @@ mod tests {
 
     /// 对齐 Python: bootstrap_count > 0 + max_resource=None 互斥
     #[test]
-    #[should_panic(expected = "互不兼容")]
+    #[should_panic(expected = "mutually exclusive")]
     fn test_bootstrap_auto_incompatible() {
         HyperbandPruner::new(1, None, 3, 1, StudyDirection::Minimize, "test");
     }

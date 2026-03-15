@@ -38,7 +38,7 @@ impl WilcoxonPruner {
     pub fn new(p_threshold: f64, n_startup_steps: usize, direction: StudyDirection) -> Self {
         assert!(
             (0.0..=1.0).contains(&p_threshold),
-            "p_threshold 必须在 [0.0, 1.0] 范围内"
+            "`p_threshold` must be in [0.0, 1.0]."
         );
         Self {
             p_threshold,

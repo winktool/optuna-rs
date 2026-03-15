@@ -56,17 +56,17 @@ impl ThresholdPruner {
         // 与 Python 一致：lower 和 upper 不能同时为 None
         assert!(
             lower.is_some() || upper.is_some(),
-            "至少需要指定 lower 或 upper 之一"
+            "At least one of `lower` or `upper` must be specified."
         );
-        assert!(interval_steps >= 1, "interval_steps 必须 >= 1");
-        assert!(n_warmup_steps >= 0, "n_warmup_steps 必须 >= 0");
+        assert!(interval_steps >= 1, "`interval_steps` must be >= 1.");
+        assert!(n_warmup_steps >= 0, "`n_warmup_steps` must be >= 0.");
 
         let lower_val = lower.unwrap_or(f64::NEG_INFINITY);
         let upper_val = upper.unwrap_or(f64::INFINITY);
 
         assert!(
             lower_val <= upper_val,
-            "lower ({}) 必须 <= upper ({})",
+            "`lower` ({}) must be <= `upper` ({}).",
             lower_val,
             upper_val
         );

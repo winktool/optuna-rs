@@ -49,7 +49,7 @@ impl PatientPruner {
         min_delta: f64,
         direction: StudyDirection,
     ) -> Self {
-        assert!(min_delta >= 0.0, "min_delta 必须 >= 0.0");
+        assert!(min_delta >= 0.0, "`min_delta` must be >= 0.0.");
         Self {
             wrapped_pruner,
             patience,

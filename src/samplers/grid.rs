@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use parking_lot::Mutex;
 use rand::seq::SliceRandom;
@@ -25,6 +26,8 @@ pub struct GridSampler {
     all_grids: Vec<Vec<(String, f64)>>,
     /// RNG for random selection from unvisited grids.
     rng: Mutex<ChaCha8Rng>,
+    /// Set by `after_trial` when all grid points are exhausted.
+    stop_requested: AtomicBool,
 }
 
 impl std::fmt::Debug for GridSampler {
@@ -42,10 +45,8 @@ impl GridSampler {
     /// * `search_space` - Map from param name to list of internal-repr values.
     /// * `seed` - Optional seed for shuffling and random selection.
     pub fn new(search_space: HashMap<String, Vec<f64>>, seed: Option<u64>) -> Self {
-        let mut rng = match seed {
-            Some(s) => ChaCha8Rng::seed_from_u64(s),
-            None => ChaCha8Rng::from_entropy(),
-        };
+        // 对齐 Python: seed=None → seed=0（确定性），不使用随机熵
+        let mut rng = ChaCha8Rng::seed_from_u64(seed.unwrap_or(0));
 
         // Sort param names for deterministic ordering.
         let mut param_names: Vec<String> = search_space.keys().cloned().collect();
@@ -73,6 +74,7 @@ impl GridSampler {
             search_space,
             all_grids: grids,
             rng: Mutex::new(rng),
+            stop_requested: AtomicBool::new(false),
         }
     }
 
@@ -179,17 +181,23 @@ impl GridSampler {
     }
 
     /// Pick a grid_id for a trial. Returns the index into all_grids.
+    ///
+    /// 对齐 Python: 当所有 grid 点已耗尽时，发出 warning 并从全部 grid 中
+    /// 随机选择一个（而非返回错误），以支持分布式优化和重新运行场景。
     fn pick_grid_id(&self, trials: &[FrozenTrial]) -> Result<usize> {
-        let unvisited = self.get_unvisited_grid_ids(trials);
-        if unvisited.is_empty() {
-            return Err(OptunaError::ValueError(
-                "GridSampler: all grid points have been visited".to_string(),
-            ));
+        let mut candidates = self.get_unvisited_grid_ids(trials);
+        if candidates.is_empty() {
+            crate::optuna_warn!(
+                "GridSampler is re-evaluating a configuration because the grid has been \
+                 exhausted. This may happen due to a timing issue during distributed \
+                 optimization or when re-running optimizations on already finished studies."
+            );
+            candidates = (0..self.all_grids.len()).collect();
         }
 
-        // Pick randomly from unvisited.
+        // Pick randomly from candidates.
         let mut rng = self.rng.lock();
-        let &grid_id = unvisited.choose(&mut *rng).unwrap();
+        let &grid_id = candidates.choose(&mut *rng).unwrap();
         Ok(grid_id)
     }
 }
@@ -261,13 +269,30 @@ impl Sampler for GridSampler {
         let _ = trials;
     }
 
+    /// 对齐 Python: grid 耗尽时通知 study 停止优化循环。
     fn after_trial(
         &self,
-        _trials: &[FrozenTrial],
-        _trial: &FrozenTrial,
+        trials: &[FrozenTrial],
+        trial: &FrozenTrial,
         _state: TrialState,
         _values: Option<&[f64]>,
     ) {
+        let target_grids = self.get_unvisited_grid_ids(trials);
+        if target_grids.is_empty() {
+            self.stop_requested.store(true, Ordering::Release);
+        } else if target_grids.len() == 1 {
+            // 对齐 Python: 如果只剩一个未访问的 grid_id 且恰好是当前 trial 的，
+            // 说明当前 trial 完成后就耗尽了。
+            if let Some(grid_id) = Self::get_grid_id(trial) {
+                if grid_id == target_grids[0] {
+                    self.stop_requested.store(true, Ordering::Release);
+                }
+            }
+        }
+    }
+
+    fn should_stop_study(&self) -> bool {
+        self.stop_requested.swap(false, Ordering::AcqRel)
     }
 }
 
@@ -339,8 +364,10 @@ mod tests {
         assigned_ids.dedup();
         assert_eq!(assigned_ids.len(), 4);
 
-        // 5th trial should error.
-        assert!(sampler.suggest_grid_id(&trials).is_err());
+        // 5th trial: grid exhausted → should still succeed (returns random re-used grid_id),
+        // matching Python's behavior of warning + re-evaluation.
+        let grid_id = sampler.suggest_grid_id(&trials).unwrap();
+        assert!(grid_id < 4, "re-used grid_id should be within range");
     }
 
     #[test]
@@ -431,5 +458,73 @@ mod tests {
         let sampler = GridSampler::from_distributions(dists, Some(0)).unwrap();
         // 0.0, 0.25, 0.5, 0.75, 1.0 → 5 values
         assert_eq!(sampler.all_grids.len(), 5);
+    }
+
+    /// 对齐 Python: grid 耗尽后 after_trial 应设置 should_stop_study
+    #[test]
+    fn test_grid_sampler_after_trial_signals_stop() {
+        let mut space = HashMap::new();
+        space.insert("x".to_string(), vec![1.0, 2.0]);
+        let sampler = GridSampler::new(space, Some(42));
+
+        // 分配并完成两个 grid 点
+        let mut trials = Vec::new();
+        for i in 0..2 {
+            let grid_id = sampler.suggest_grid_id(&trials).unwrap();
+            trials.push(make_trial_with_grid_id(i, grid_id, TrialState::Complete));
+        }
+
+        // after_trial 应检测到 grid 耗尽并请求停止
+        sampler.after_trial(&trials, &trials[1], TrialState::Complete, Some(&[0.0]));
+        assert!(sampler.should_stop_study(), "grid 耗尽后应请求停止");
+
+        // should_stop_study 使用 swap(false)，第二次调用应返回 false
+        assert!(!sampler.should_stop_study(), "stop 标志应在读取后重置");
+    }
+
+    /// 对齐 Python: grid 未耗尽时 after_trial 不应设置停止标志
+    #[test]
+    fn test_grid_sampler_after_trial_no_stop_when_remaining() {
+        let mut space = HashMap::new();
+        space.insert("x".to_string(), vec![1.0, 2.0, 3.0]);
+        let sampler = GridSampler::new(space, Some(42));
+
+        // 只完成 1 个 grid 点（剩余 2 个）
+        let grid_id = sampler.suggest_grid_id(&[]).unwrap();
+        let trials = vec![make_trial_with_grid_id(0, grid_id, TrialState::Complete)];
+        sampler.after_trial(&trials, &trials[0], TrialState::Complete, Some(&[0.0]));
+        assert!(!sampler.should_stop_study(), "还有未访问 grid 点时不应停止");
+    }
+
+    /// 对齐 Python: grid 耗尽后 suggest_grid_id 应返回有效 grid_id（而非错误）
+    #[test]
+    fn test_grid_sampler_exhausted_returns_valid_id() {
+        let mut space = HashMap::new();
+        space.insert("x".to_string(), vec![1.0]);
+        let sampler = GridSampler::new(space, Some(42));
+
+        // 完成唯一的 grid 点
+        let grid_id = sampler.suggest_grid_id(&[]).unwrap();
+        let trials = vec![make_trial_with_grid_id(0, grid_id, TrialState::Complete)];
+
+        // 耗尽后应仍然返回 Ok（随机复用），不应报错
+        let result = sampler.suggest_grid_id(&trials);
+        assert!(result.is_ok(), "耗尽后应返回 Ok 而非 Err");
+        assert_eq!(result.unwrap(), 0, "唯一的 grid_id 应为 0");
+    }
+
+    /// 对齐 Python: seed=None 时应使用 seed=0（确定性）
+    #[test]
+    fn test_grid_sampler_seed_none_is_deterministic() {
+        let mk = || {
+            let mut space = HashMap::new();
+            space.insert("x".to_string(), vec![1.0, 2.0, 3.0]);
+            space.insert("y".to_string(), vec![10.0, 20.0]);
+            GridSampler::new(space, None)
+        };
+        let s1 = mk();
+        let s2 = mk();
+        // seed=None 等同于 seed=0，应产生相同结果
+        assert_eq!(s1.all_grids, s2.all_grids, "seed=None 应确定性（=seed=0）");
     }
 }

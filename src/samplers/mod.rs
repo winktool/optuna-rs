@@ -82,6 +82,12 @@ pub trait Sampler: Send + Sync {
     ) {
     }
 
+    /// Whether the sampler wants the study to stop after this trial.
+    /// Used by `BruteForceSampler` to signal exhaustion from `after_trial`.
+    fn should_stop_study(&self) -> bool {
+        false
+    }
+
     /// 对齐 Python `_process_constraints_after_trial`:
     /// 如果采样器设置了约束函数，计算并返回约束值。
     /// 默认返回 None（无约束）。tell() 会将返回的值存储到 storage。

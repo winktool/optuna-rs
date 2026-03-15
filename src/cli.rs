@@ -541,7 +541,7 @@ pub mod commands {
                             ))
                         }
                         "BruteForceSampler" => {
-                            Arc::new(crate::samplers::BruteForceSampler::new(seed))
+                            Arc::new(crate::samplers::BruteForceSampler::new(seed, false))
                         }
                         _ => return Err(format!("unknown sampler: {sampler_name}. Available: TPESampler, RandomSampler, CmaEsSampler, GPSampler, QMCSampler, BruteForceSampler")),
                     };

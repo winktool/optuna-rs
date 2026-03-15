@@ -1,34 +1,230 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Mutex;
 
-use crate::distributions::Distribution;
+use rand::rngs::StdRng;
+use rand::seq::SliceRandom;
+use rand::SeedableRng;
+
+use crate::distributions::{Distribution, ParamValue};
 use crate::error::{OptunaError, Result};
-use crate::samplers::random::RandomSampler;
 use crate::samplers::Sampler;
 use crate::trial::{FrozenTrial, TrialState};
 
+// ---------------------------------------------------------------------------
+// TreeNode — mirrors Python's `_TreeNode`
+// ---------------------------------------------------------------------------
+
+/// A tree node representing the search space exploration state.
+///
+/// Three states:
+/// 1. **Unexpanded** — `children` is `None`.
+/// 2. **Leaf** — `children` is `Some(empty vec)` and `param_name` is `None`.
+/// 3. **Normal** — has a `param_name` and non-empty `children`.
+#[derive(Debug, Clone)]
+struct TreeNode {
+    param_name: Option<String>,
+    /// `None` = unexpanded. `Some(vec)` = expanded (may be empty for leaf).
+    children: Option<Vec<(FloatKey, TreeNode)>>,
+    is_running: bool,
+}
+
+/// Float wrapper using bit-exact equality (same semantics as Python dict float keys).
+#[derive(Debug, Clone, Copy)]
+struct FloatKey(f64);
+
+impl PartialEq for FloatKey {
+    fn eq(&self, other: &Self) -> bool {
+        self.0.to_bits() == other.0.to_bits()
+    }
+}
+impl Eq for FloatKey {}
+
+impl std::hash::Hash for FloatKey {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        self.0.to_bits().hash(state);
+    }
+}
+
+impl TreeNode {
+    fn new() -> Self {
+        Self {
+            param_name: None,
+            children: None,
+            is_running: false,
+        }
+    }
+
+    /// Expand the node. If already expanded, this is a no-op
+    /// (Python raises ValueError on mismatch, but in practice the caller
+    /// always provides consistent values).
+    fn expand(&mut self, param_name: Option<&str>, search_space: &[f64]) {
+        if self.children.is_none() {
+            self.param_name = param_name.map(|s| s.to_string());
+            self.children = Some(
+                search_space
+                    .iter()
+                    .map(|&v| (FloatKey(v), TreeNode::new()))
+                    .collect(),
+            );
+        }
+    }
+
+    fn set_running(&mut self) {
+        self.is_running = true;
+    }
+
+    fn set_leaf(&mut self) {
+        self.expand(None, &[]);
+    }
+
+    /// Add a path (one trial's parameters) to the tree.
+    /// Returns `Some(&mut leaf)` if the path is on the grid, `None` otherwise.
+    fn add_path(
+        &mut self,
+        params_and_search_spaces: &[(String, Vec<f64>, f64)],
+    ) -> Option<&mut TreeNode> {
+        let mut current = self;
+        for (param_name, search_space, value) in params_and_search_spaces {
+            current.expand(Some(param_name), search_space);
+            let children = current.children.as_mut().unwrap();
+            let key = FloatKey(*value);
+            let found = children.iter_mut().find(|(k, _)| *k == key);
+            match found {
+                Some((_, child)) => current = child,
+                None => return None,
+            }
+        }
+        Some(current)
+    }
+
+    /// Count unexpanded (unvisited) leaves in the subtree.
+    /// Mirrors Python's `count_unexpanded`.
+    fn count_unexpanded(&self, exclude_running: bool) -> usize {
+        match &self.children {
+            None => {
+                if exclude_running && self.is_running {
+                    0
+                } else {
+                    1
+                }
+            }
+            Some(children) => children
+                .iter()
+                .map(|(_, child)| child.count_unexpanded(exclude_running))
+                .sum(),
+        }
+    }
+
+    /// Sample a child proportional to count_unexpanded weights.
+    /// Mirrors Python's `sample_child`: weighted random, prioritizing non-running branches.
+    fn sample_child(&self, rng: &mut StdRng, exclude_running: bool) -> f64 {
+        let children = self.children.as_ref().unwrap();
+        let mut weights: Vec<f64> = children
+            .iter()
+            .map(|(_, child)| child.count_unexpanded(exclude_running) as f64)
+            .collect();
+
+        // Prioritize non-running unexpanded children (matches Python).
+        let has_non_running_unexpanded = children
+            .iter()
+            .enumerate()
+            .any(|(i, (_, child))| !child.is_running && weights[i] > 0.0);
+        if has_non_running_unexpanded {
+            for (i, (_, child)) in children.iter().enumerate() {
+                if child.is_running {
+                    weights[i] = 0.0;
+                }
+            }
+        }
+
+        let total: f64 = weights.iter().sum();
+        if total == 0.0 {
+            // Fallback: uniform (shouldn't happen if count_unexpanded > 0)
+            use rand::Rng;
+            let idx = rng.r#gen_range(0..children.len());
+            return children[idx].0 .0;
+        }
+
+        // Weighted random choice (mirrors `rng.choice(keys, p=weights)`)
+        use rand::Rng;
+        let mut r: f64 = rng.r#gen::<f64>() * total;
+        for (i, w) in weights.iter().enumerate() {
+            r -= w;
+            if r <= 0.0 {
+                return children[i].0 .0;
+            }
+        }
+        // Fallback to last
+        children.last().unwrap().0 .0
+    }
+}
+
+// ---------------------------------------------------------------------------
+// BruteForceSampler
+// ---------------------------------------------------------------------------
+
 /// A sampler that exhaustively evaluates all possible discrete parameter combinations.
 ///
-/// Similar to `GridSampler` but dynamically discovers parameter distributions
-/// from the search space rather than requiring them upfront.
+/// Mirrors Python's `optuna.samplers.BruteForceSampler`:
+/// - All logic lives in `sample_independent` (not `sample_relative`), because the
+///   search space is discovered dynamically per-parameter and may be conditional.
+/// - `after_trial` checks whether the entire search space is exhausted and signals
+///   the study to stop.
+/// - `avoid_premature_stop` controls whether Running trials are excluded when
+///   counting unvisited combinations.
 pub struct BruteForceSampler {
-    random_sampler: RandomSampler,
+    seed: Option<u64>,
+    avoid_premature_stop: bool,
+    /// Lazily initialized RNG.
+    rng: Mutex<Option<StdRng>>,
+    /// Set by `after_trial` when the search space is exhausted.
+    stop_requested: AtomicBool,
 }
 
 impl std::fmt::Debug for BruteForceSampler {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("BruteForceSampler").finish()
+        f.debug_struct("BruteForceSampler")
+            .field("avoid_premature_stop", &self.avoid_premature_stop)
+            .finish()
     }
 }
 
 impl BruteForceSampler {
-    pub fn new(seed: Option<u64>) -> Self {
+    /// Create a new `BruteForceSampler`.
+    ///
+    /// # Arguments
+    /// * `seed` — RNG seed for reproducibility.
+    /// * `avoid_premature_stop` — If `true`, Running trials are **not** excluded
+    ///   when counting unvisited combinations, preventing premature study stop
+    ///   at the cost of possible duplicate suggestions.
+    pub fn new(seed: Option<u64>, avoid_premature_stop: bool) -> Self {
         Self {
-            random_sampler: RandomSampler::new(seed),
+            seed,
+            avoid_premature_stop,
+            rng: Mutex::new(None),
+            stop_requested: AtomicBool::new(false),
         }
     }
 
-    /// Enumerate all values for a distribution, if discrete.
-    fn enumerate_distribution(dist: &Distribution) -> Option<Vec<f64>> {
+    fn get_rng(&self) -> std::sync::MutexGuard<'_, Option<StdRng>> {
+        let mut guard = self.rng.lock().unwrap();
+        if guard.is_none() {
+            *guard = Some(match self.seed {
+                Some(s) => StdRng::seed_from_u64(s),
+                None => StdRng::from_entropy(),
+            });
+        }
+        guard
+    }
+
+    /// Enumerate all candidate internal-repr values for a distribution.
+    ///
+    /// Uses step-based enumeration to avoid float accumulation errors
+    /// (mirrors Python's `_enumerate_candidates` which uses `decimal.Decimal`).
+    ///
+    /// Returns `None` for continuous (step-less) float distributions.
+    fn enumerate_candidates(dist: &Distribution) -> Option<Vec<f64>> {
         match dist {
             Distribution::IntDistribution(d) => {
                 let mut vals = Vec::new();
@@ -41,14 +237,16 @@ impl BruteForceSampler {
             }
             Distribution::FloatDistribution(d) => {
                 if let Some(step) = d.step {
-                    let mut vals = Vec::new();
-                    let n_steps = ((d.high - d.low) / step).round() as i64;
-                    for i in 0..=n_steps {
-                        let v = d.low + step * i as f64;
-                        if v <= d.high + 1e-8 {
-                            vals.push(v);
-                        }
+                    if step == 0.0 {
+                        return Some(vec![d.low]);
                     }
+                    let n_steps = ((d.high - d.low) / step).round() as usize;
+                    let vals: Vec<f64> = (0..=n_steps)
+                        .map(|i| {
+                            let v = d.low + step * i as f64;
+                            if v > d.high { d.high } else { v }
+                        })
+                        .collect();
                     Some(vals)
                 } else if d.single() {
                     Some(vec![d.low])
@@ -62,40 +260,100 @@ impl BruteForceSampler {
         }
     }
 
-    /// Get all parameter combinations that have been visited.
-    /// 对齐 Python: 包含 Complete, Pruned, Running, Fail 四种状态
-    fn get_visited_combinations(trials: &[FrozenTrial], param_names: &[String]) -> HashSet<Vec<i64>> {
-        let mut visited = HashSet::new();
+    /// Populate the tree from existing trials, filtering by already-chosen params.
+    /// Mirrors Python's `_populate_tree`.
+    fn populate_tree(
+        tree: &mut TreeNode,
+        trials: &[TrialSnapshot],
+        fixed_params: &HashMap<String, ParamValue>,
+    ) {
         for trial in trials {
-            // 对齐 Python: states=(COMPLETE, PRUNED, RUNNING, FAIL)
-            if trial.state == TrialState::Complete
-                || trial.state == TrialState::Pruned
-                || trial.state == TrialState::Running
-                || trial.state == TrialState::Fail
-            {
-                let key: Vec<i64> = param_names
-                    .iter()
-                    .map(|name| {
-                        trial
-                            .params
-                            .get(name)
-                            .map(|pv| {
-                                let dist = trial.distributions.get(name);
-                                dist.and_then(|d| d.to_internal_repr(pv).ok())
-                                    .map(|v| (v * 1e6).round() as i64)
-                                    .unwrap_or(0)
-                            })
-                            .unwrap_or(i64::MIN)
-                    })
-                    .collect();
-                visited.insert(key);
+            // Check fixed params match.
+            let matches = fixed_params.iter().all(|(p, v)| {
+                trial.params.get(p).map_or(false, |tv| tv == v)
+            });
+            if !matches {
+                continue;
+            }
+
+            // Only consider relevant states.
+            match trial.state {
+                TrialState::Complete
+                | TrialState::Pruned
+                | TrialState::Running
+                | TrialState::Fail => {}
+                _ => continue,
+            }
+
+            // Build path excluding fixed params.
+            // Sort by param name for deterministic order (Python dicts preserve
+            // insertion order, but Rust HashMaps don't).
+            let mut dist_pairs: Vec<(&String, &Distribution)> = trial
+                .distributions
+                .iter()
+                .filter(|(name, _)| !fixed_params.contains_key(*name))
+                .collect();
+            dist_pairs.sort_by_key(|(name, _)| name.clone());
+
+            let path: Vec<(String, Vec<f64>, f64)> = dist_pairs
+                .into_iter()
+                .filter_map(|(name, dist)| {
+                    let candidates = Self::enumerate_candidates(dist)?;
+                    let value = trial
+                        .params
+                        .get(name)
+                        .and_then(|pv| dist.to_internal_repr(pv).ok())?;
+                    Some((name.clone(), candidates, value))
+                })
+                .collect();
+
+            if let Some(leaf) = tree.add_path(&path) {
+                if trial.state.is_finished() {
+                    leaf.set_leaf();
+                } else {
+                    leaf.set_running();
+                }
             }
         }
-        visited
+    }
+}
+
+/// Lightweight snapshot of a trial for tree population.
+/// Mirrors Python's approach of passing modified trial objects.
+struct TrialSnapshot {
+    state: TrialState,
+    params: HashMap<String, ParamValue>,
+    distributions: HashMap<String, Distribution>,
+}
+
+impl From<&FrozenTrial> for TrialSnapshot {
+    fn from(t: &FrozenTrial) -> Self {
+        Self {
+            state: t.state,
+            params: t.params.clone(),
+            distributions: t.distributions.clone(),
+        }
     }
 }
 
 impl Sampler for BruteForceSampler {
+    // Python returns {} — no relative search space.
+    fn infer_relative_search_space(
+        &self,
+        _trials: &[FrozenTrial],
+    ) -> HashMap<String, Distribution> {
+        HashMap::new()
+    }
+
+    // Python returns {} — all logic is in sample_independent.
+    fn sample_relative(
+        &self,
+        _trials: &[FrozenTrial],
+        _search_space: &HashMap<String, Distribution>,
+    ) -> Result<HashMap<String, f64>> {
+        Ok(HashMap::new())
+    }
+
     fn sample_independent(
         &self,
         trials: &[FrozenTrial],
@@ -103,86 +361,78 @@ impl Sampler for BruteForceSampler {
         param_name: &str,
         distribution: &Distribution,
     ) -> Result<f64> {
-        // For brute force, we try to pick an unvisited value
-        // In independent mode, just delegate to random
-        self.random_sampler
-            .sample_independent(trials, trial, param_name, distribution)
-    }
+        let exclude_running = !self.avoid_premature_stop;
 
-    fn infer_relative_search_space(
-        &self,
-        trials: &[FrozenTrial],
-    ) -> HashMap<String, Distribution> {
-        // Use intersection search space from completed trials
-        crate::search_space::intersection_search_space(trials, false)
-    }
-
-    fn sample_relative(
-        &self,
-        trials: &[FrozenTrial],
-        search_space: &HashMap<String, Distribution>,
-    ) -> Result<HashMap<String, f64>> {
-        if search_space.is_empty() {
-            return Ok(HashMap::new());
-        }
-
-        // Sort param names for deterministic ordering
-        let mut param_names: Vec<String> = search_space.keys().cloned().collect();
-        param_names.sort();
-
-        // Enumerate all values for each param
-        let mut param_values: Vec<Vec<f64>> = Vec::new();
-        for name in &param_names {
-            let dist = &search_space[name];
-            match Self::enumerate_distribution(dist) {
-                Some(vals) => param_values.push(vals),
-                None => {
-                    // Can't enumerate continuous param, delegate to random
-                    return self.random_sampler.sample_relative(trials, search_space);
-                }
+        let candidates = match Self::enumerate_candidates(distribution) {
+            Some(c) => c,
+            None => {
+                return Err(OptunaError::ValueError(
+                    "FloatDistribution.step must be given for BruteForceSampler \
+                     (otherwise, the search space will be infinite)."
+                        .to_string(),
+                ));
             }
-        }
+        };
 
-        // Build cartesian product
-        let mut all_combos: Vec<Vec<f64>> = vec![vec![]];
-        for vals in &param_values {
-            let mut new_combos = Vec::new();
-            for combo in &all_combos {
-                for &val in vals {
-                    let mut entry = combo.clone();
-                    entry.push(val);
-                    new_combos.push(entry);
-                }
-            }
-            all_combos = new_combos;
-        }
+        let mut tree = TreeNode::new();
+        tree.expand(Some(param_name), &candidates);
 
-        // Find visited combinations
-        let visited = Self::get_visited_combinations(trials, &param_names);
-
-        // Find first unvisited combination
-        let unvisited: Vec<&Vec<f64>> = all_combos
+        // Populate tree with existing trials (excluding current trial).
+        let fixed_params = trial.params.clone();
+        let snapshots: Vec<TrialSnapshot> = trials
             .iter()
-            .filter(|combo| {
-                let key: Vec<i64> = combo.iter().map(|v| (v * 1e6).round() as i64).collect();
-                !visited.contains(&key)
+            .filter(|t| t.number != trial.number)
+            .map(TrialSnapshot::from)
+            .collect();
+        Self::populate_tree(&mut tree, &snapshots, &fixed_params);
+
+        let mut rng_guard = self.get_rng();
+        let rng = rng_guard.as_mut().unwrap();
+
+        if tree.count_unexpanded(exclude_running) == 0 {
+            // All exhausted — return a random candidate (matches Python behavior).
+            let &val = candidates.choose(rng).unwrap();
+            Ok(val)
+        } else {
+            Ok(tree.sample_child(rng, exclude_running))
+        }
+    }
+
+    fn after_trial(
+        &self,
+        trials: &[FrozenTrial],
+        trial: &FrozenTrial,
+        state: TrialState,
+        _values: Option<&[f64]>,
+    ) {
+        let exclude_running = !self.avoid_premature_stop;
+
+        // Build snapshots, replacing current trial's state with the final state.
+        let snapshots: Vec<TrialSnapshot> = trials
+            .iter()
+            .map(|t| {
+                if t.number == trial.number {
+                    TrialSnapshot {
+                        state,
+                        params: trial.params.clone(),
+                        distributions: trial.distributions.clone(),
+                    }
+                } else {
+                    TrialSnapshot::from(t)
+                }
             })
             .collect();
 
-        if unvisited.is_empty() {
-            return Err(OptunaError::ValueError(
-                "BruteForceSampler: all parameter combinations have been exhausted".to_string(),
-            ));
-        }
+        let mut tree = TreeNode::new();
+        Self::populate_tree(&mut tree, &snapshots, &HashMap::new());
 
-        // Pick the first unvisited combo (deterministic)
-        let combo = unvisited[0];
-        let mut result = HashMap::new();
-        for (i, name) in param_names.iter().enumerate() {
-            result.insert(name.clone(), combo[i]);
+        if tree.count_unexpanded(exclude_running) == 0 {
+            self.stop_requested.store(true, Ordering::SeqCst);
         }
+    }
 
-        Ok(result)
+    fn should_stop_study(&self) -> bool {
+        self.stop_requested.swap(false, Ordering::SeqCst)
     }
 }
 
@@ -190,18 +440,16 @@ impl Sampler for BruteForceSampler {
 mod tests {
     use super::*;
     use crate::distributions::*;
-    use crate::study::{create_study, StudyDirection};
-    use std::sync::Arc;
 
     #[test]
-    fn test_brute_force_enumerate_int() {
+    fn test_enumerate_int() {
         let dist = Distribution::IntDistribution(IntDistribution::new(0, 4, false, 2).unwrap());
-        let vals = BruteForceSampler::enumerate_distribution(&dist).unwrap();
+        let vals = BruteForceSampler::enumerate_candidates(&dist).unwrap();
         assert_eq!(vals, vec![0.0, 2.0, 4.0]);
     }
 
     #[test]
-    fn test_brute_force_enumerate_categorical() {
+    fn test_enumerate_categorical() {
         let dist = Distribution::CategoricalDistribution(
             CategoricalDistribution::new(vec![
                 CategoricalChoice::Str("a".into()),
@@ -209,20 +457,296 @@ mod tests {
             ])
             .unwrap(),
         );
-        let vals = BruteForceSampler::enumerate_distribution(&dist).unwrap();
+        let vals = BruteForceSampler::enumerate_candidates(&dist).unwrap();
         assert_eq!(vals, vec![0.0, 1.0]);
     }
 
     #[test]
-    fn test_brute_force_enumerate_continuous_none() {
-        let dist =
-            Distribution::FloatDistribution(FloatDistribution::new(0.0, 1.0, false, None).unwrap());
-        assert!(BruteForceSampler::enumerate_distribution(&dist).is_none());
+    fn test_enumerate_continuous_none() {
+        let dist = Distribution::FloatDistribution(
+            FloatDistribution::new(0.0, 1.0, false, None).unwrap(),
+        );
+        assert!(BruteForceSampler::enumerate_candidates(&dist).is_none());
+    }
+
+    #[test]
+    fn test_enumerate_float_step() {
+        let dist = Distribution::FloatDistribution(
+            FloatDistribution::new(0.0, 1.0, false, Some(0.25)).unwrap(),
+        );
+        let vals = BruteForceSampler::enumerate_candidates(&dist).unwrap();
+        assert_eq!(vals, vec![0.0, 0.25, 0.5, 0.75, 1.0]);
+    }
+
+    #[test]
+    fn test_enumerate_single_float() {
+        let dist = Distribution::FloatDistribution(
+            FloatDistribution::new(5.0, 5.0, false, None).unwrap(),
+        );
+        let vals = BruteForceSampler::enumerate_candidates(&dist).unwrap();
+        assert_eq!(vals, vec![5.0]);
+    }
+
+    #[test]
+    fn test_tree_count_unexpanded() {
+        let mut tree = TreeNode::new();
+        tree.expand(Some("x"), &[1.0, 2.0, 3.0]);
+        assert_eq!(tree.count_unexpanded(false), 3);
+        assert_eq!(tree.count_unexpanded(true), 3);
+
+        // Mark one child as leaf (visited).
+        tree.children.as_mut().unwrap()[0].1.set_leaf();
+        assert_eq!(tree.count_unexpanded(false), 2);
+
+        // Mark another as running.
+        tree.children.as_mut().unwrap()[1].1.set_running();
+        assert_eq!(tree.count_unexpanded(false), 2); // running still counts
+        assert_eq!(tree.count_unexpanded(true), 1); // exclude_running=true
+    }
+
+    #[test]
+    fn test_tree_add_path() {
+        let mut tree = TreeNode::new();
+        let path = vec![
+            ("x".to_string(), vec![1.0, 2.0], 1.0),
+            ("y".to_string(), vec![10.0, 20.0], 20.0),
+        ];
+        let leaf = tree.add_path(&path);
+        assert!(leaf.is_some());
+        leaf.unwrap().set_leaf();
+        // Tree: x has children [1.0, 2.0].
+        // x=1.0 is expanded with y=[10.0, 20.0]; y=20.0 is a leaf.
+        //   → x=1.0/y=10.0 is unexpanded (1)
+        // x=2.0 is unexpanded (1) — its children haven't been created.
+        // Total = 2
+        assert_eq!(tree.count_unexpanded(false), 2);
+    }
+
+    #[test]
+    fn test_sample_independent_basic() {
+        let sampler = BruteForceSampler::new(Some(42), false);
+        let dist = Distribution::IntDistribution(IntDistribution::new(1, 3, false, 1).unwrap());
+
+        let trial = FrozenTrial {
+            number: 0,
+            trial_id: 0,
+            state: TrialState::Running,
+            values: None,
+            datetime_start: None,
+            datetime_complete: None,
+            params: HashMap::new(),
+            distributions: HashMap::new(),
+            user_attrs: HashMap::new(),
+            system_attrs: HashMap::new(),
+            intermediate_values: HashMap::new(),
+        };
+
+        let val = sampler
+            .sample_independent(&[], &trial, "x", &dist)
+            .unwrap();
+        assert!([1.0, 2.0, 3.0].contains(&val));
+    }
+
+    #[test]
+    fn test_sample_independent_skips_visited() {
+        let sampler = BruteForceSampler::new(Some(42), false);
+        let dist = Distribution::IntDistribution(IntDistribution::new(1, 2, false, 1).unwrap());
+
+        let mut params = HashMap::new();
+        params.insert("x".to_string(), ParamValue::Int(1));
+        let mut dists = HashMap::new();
+        dists.insert("x".to_string(), dist.clone());
+
+        let completed = FrozenTrial {
+            number: 0,
+            trial_id: 0,
+            state: TrialState::Complete,
+            values: Some(vec![1.0]),
+            datetime_start: None,
+            datetime_complete: None,
+            params,
+            distributions: dists,
+            user_attrs: HashMap::new(),
+            system_attrs: HashMap::new(),
+            intermediate_values: HashMap::new(),
+        };
+
+        let current = FrozenTrial {
+            number: 1,
+            trial_id: 1,
+            state: TrialState::Running,
+            values: None,
+            datetime_start: None,
+            datetime_complete: None,
+            params: HashMap::new(),
+            distributions: HashMap::new(),
+            user_attrs: HashMap::new(),
+            system_attrs: HashMap::new(),
+            intermediate_values: HashMap::new(),
+        };
+
+        let val = sampler
+            .sample_independent(&[completed], &current, "x", &dist)
+            .unwrap();
+        assert_eq!(val, 2.0, "should skip visited x=1 and return x=2");
+    }
+
+    #[test]
+    fn test_sample_independent_exhausted_returns_random() {
+        let sampler = BruteForceSampler::new(Some(42), false);
+        let dist = Distribution::IntDistribution(IntDistribution::new(1, 1, false, 1).unwrap());
+
+        let mut params = HashMap::new();
+        params.insert("x".to_string(), ParamValue::Int(1));
+        let mut dists = HashMap::new();
+        dists.insert("x".to_string(), dist.clone());
+
+        let completed = FrozenTrial {
+            number: 0,
+            trial_id: 0,
+            state: TrialState::Complete,
+            values: Some(vec![1.0]),
+            datetime_start: None,
+            datetime_complete: None,
+            params,
+            distributions: dists,
+            user_attrs: HashMap::new(),
+            system_attrs: HashMap::new(),
+            intermediate_values: HashMap::new(),
+        };
+
+        let current = FrozenTrial {
+            number: 1,
+            trial_id: 1,
+            state: TrialState::Running,
+            values: None,
+            datetime_start: None,
+            datetime_complete: None,
+            params: HashMap::new(),
+            distributions: HashMap::new(),
+            user_attrs: HashMap::new(),
+            system_attrs: HashMap::new(),
+            intermediate_values: HashMap::new(),
+        };
+
+        // Should not error — returns random candidate (matches Python).
+        let val = sampler
+            .sample_independent(&[completed], &current, "x", &dist)
+            .unwrap();
+        assert_eq!(val, 1.0);
+    }
+
+    #[test]
+    fn test_continuous_float_errors() {
+        let sampler = BruteForceSampler::new(Some(42), false);
+        let dist = Distribution::FloatDistribution(
+            FloatDistribution::new(0.0, 1.0, false, None).unwrap(),
+        );
+
+        let trial = FrozenTrial {
+            number: 0,
+            trial_id: 0,
+            state: TrialState::Running,
+            values: None,
+            datetime_start: None,
+            datetime_complete: None,
+            params: HashMap::new(),
+            distributions: HashMap::new(),
+            user_attrs: HashMap::new(),
+            system_attrs: HashMap::new(),
+            intermediate_values: HashMap::new(),
+        };
+
+        let result = sampler.sample_independent(&[], &trial, "x", &dist);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_relative_returns_empty() {
+        let sampler = BruteForceSampler::new(None, false);
+        let result = sampler.sample_relative(&[], &HashMap::new()).unwrap();
+        assert!(result.is_empty());
+
+        // Even with a non-empty search space, should return empty.
+        let mut space = HashMap::new();
+        space.insert(
+            "x".to_string(),
+            Distribution::IntDistribution(IntDistribution::new(1, 3, false, 1).unwrap()),
+        );
+        let result = sampler.sample_relative(&[], &space).unwrap();
+        assert!(result.is_empty());
+    }
+
+    #[test]
+    fn test_after_trial_signals_stop() {
+        let sampler = BruteForceSampler::new(Some(42), false);
+        let dist = Distribution::IntDistribution(IntDistribution::new(1, 1, false, 1).unwrap());
+
+        let mut params = HashMap::new();
+        params.insert("x".to_string(), ParamValue::Int(1));
+        let mut dists = HashMap::new();
+        dists.insert("x".to_string(), dist.clone());
+
+        let trial = FrozenTrial {
+            number: 0,
+            trial_id: 0,
+            state: TrialState::Running,
+            values: Some(vec![1.0]),
+            datetime_start: None,
+            datetime_complete: None,
+            params,
+            distributions: dists,
+            user_attrs: HashMap::new(),
+            system_attrs: HashMap::new(),
+            intermediate_values: HashMap::new(),
+        };
+
+        // No stop requested yet.
+        assert!(!sampler.should_stop_study());
+
+        // after_trial should detect exhaustion.
+        sampler.after_trial(&[trial.clone()], &trial, TrialState::Complete, Some(&[1.0]));
+        assert!(sampler.should_stop_study());
+
+        // Flag should be cleared after reading.
+        assert!(!sampler.should_stop_study());
+    }
+
+    #[test]
+    fn test_after_trial_no_stop_when_not_exhausted() {
+        let sampler = BruteForceSampler::new(Some(42), false);
+        let dist = Distribution::IntDistribution(IntDistribution::new(1, 2, false, 1).unwrap());
+
+        let mut params = HashMap::new();
+        params.insert("x".to_string(), ParamValue::Int(1));
+        let mut dists = HashMap::new();
+        dists.insert("x".to_string(), dist.clone());
+
+        let trial = FrozenTrial {
+            number: 0,
+            trial_id: 0,
+            state: TrialState::Running,
+            values: Some(vec![1.0]),
+            datetime_start: None,
+            datetime_complete: None,
+            params,
+            distributions: dists,
+            user_attrs: HashMap::new(),
+            system_attrs: HashMap::new(),
+            intermediate_values: HashMap::new(),
+        };
+
+        // x=2 is still unvisited, so should not request stop.
+        sampler.after_trial(&[trial.clone()], &trial, TrialState::Complete, Some(&[1.0]));
+        assert!(!sampler.should_stop_study());
     }
 
     #[test]
     fn test_brute_force_exhausts_grid() {
-        let sampler: Arc<dyn Sampler> = Arc::new(BruteForceSampler::new(Some(42)));
+        use crate::study::{create_study, StudyDirection};
+        use std::sync::Arc;
+
+        let sampler: Arc<dyn Sampler> = Arc::new(BruteForceSampler::new(Some(42), false));
 
         let study = create_study(
             None,
@@ -252,109 +776,19 @@ mod tests {
                 };
                 Ok(n as f64 + c_val)
             },
-            Some(10), // More than 6 to trigger exhaustion
+            Some(20), // More than 6 to trigger exhaustion
             None,
             None,
         );
 
-        // Should have completed some trials (might error on exhaustion)
         let trials = study.trials().unwrap();
         assert!(!trials.is_empty());
-    }
-
-    /// 验证 enumerate_distribution 对 float+step 的枚举正确性
-    #[test]
-    fn test_brute_force_enumerate_float_step() {
-        let dist = Distribution::FloatDistribution(
-            FloatDistribution::new(0.0, 1.0, false, Some(0.25)).unwrap(),
+        // Study should stop well before 20 trials due to after_trial detecting exhaustion.
+        // With independent sampling there may be some duplicates before full exhaustion.
+        assert!(
+            trials.len() < 20,
+            "Expected study to stop before 20 trials, got {}",
+            trials.len()
         );
-        let vals = BruteForceSampler::enumerate_distribution(&dist).unwrap();
-        assert_eq!(vals, vec![0.0, 0.25, 0.5, 0.75, 1.0]);
-    }
-
-    /// 验证 enumerate_distribution 对 single-value float 返回唯一值
-    #[test]
-    fn test_brute_force_enumerate_single_float() {
-        let dist = Distribution::FloatDistribution(
-            FloatDistribution::new(5.0, 5.0, false, None).unwrap(),
-        );
-        let vals = BruteForceSampler::enumerate_distribution(&dist).unwrap();
-        assert_eq!(vals, vec![5.0]);
-    }
-
-    /// 验证 get_visited_combinations 正确收集已完成和运行中试验
-    #[test]
-    fn test_brute_force_get_visited_combinations() {
-        use std::collections::HashMap;
-        let param_names = vec!["x".to_string()];
-        let dist = Distribution::IntDistribution(IntDistribution::new(1, 3, false, 1).unwrap());
-
-        let mut params1 = HashMap::new();
-        params1.insert("x".to_string(), crate::distributions::ParamValue::Int(1));
-        let mut dists1 = HashMap::new();
-        dists1.insert("x".to_string(), dist.clone());
-
-        let trial1 = FrozenTrial {
-            number: 0,
-            trial_id: 0,
-            state: TrialState::Complete,
-            values: Some(vec![1.0]),
-            datetime_start: None,
-            datetime_complete: None,
-            params: params1,
-            distributions: dists1,
-            user_attrs: HashMap::new(),
-            system_attrs: HashMap::new(),
-            intermediate_values: HashMap::new(),
-        };
-
-        let visited = BruteForceSampler::get_visited_combinations(&[trial1], &param_names);
-        assert_eq!(visited.len(), 1, "完成的试验应被记录为已访问");
-    }
-
-    /// 验证 sample_relative 正确跳过已访问组合
-    #[test]
-    fn test_brute_force_sample_relative_skips_visited() {
-        let sampler = BruteForceSampler::new(Some(42));
-
-        let dist = Distribution::IntDistribution(IntDistribution::new(1, 2, false, 1).unwrap());
-        let mut search_space = HashMap::new();
-        search_space.insert("x".to_string(), dist.clone());
-
-        // 第一次调用: 无已访问组合 → 返回第一个 (x=1)
-        let r1 = sampler.sample_relative(&[], &search_space).unwrap();
-        assert_eq!(r1["x"], 1.0, "首次应返回第一个组合 x=1");
-
-        // 模拟 x=1 已被访问的试验
-        let mut params = std::collections::HashMap::new();
-        params.insert("x".to_string(), crate::distributions::ParamValue::Int(1));
-        let mut dists = std::collections::HashMap::new();
-        dists.insert("x".to_string(), dist.clone());
-
-        let visited_trial = FrozenTrial {
-            number: 0,
-            trial_id: 0,
-            state: TrialState::Complete,
-            values: Some(vec![1.0]),
-            datetime_start: None,
-            datetime_complete: None,
-            params,
-            distributions: dists,
-            user_attrs: std::collections::HashMap::new(),
-            system_attrs: std::collections::HashMap::new(),
-            intermediate_values: std::collections::HashMap::new(),
-        };
-
-        // 第二次调用: x=1 已访问 → 跳过，返回 x=2
-        let r2 = sampler.sample_relative(&[visited_trial], &search_space).unwrap();
-        assert_eq!(r2["x"], 2.0, "应跳过已访问的 x=1，返回 x=2");
-    }
-
-    /// 验证空搜索空间时 sample_relative 返回空 HashMap
-    #[test]
-    fn test_brute_force_empty_search_space() {
-        let sampler = BruteForceSampler::new(Some(42));
-        let result = sampler.sample_relative(&[], &HashMap::new()).unwrap();
-        assert!(result.is_empty());
     }
 }

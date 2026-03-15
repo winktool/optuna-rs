@@ -2,9 +2,41 @@
 
 ## 总览
 
-- **Rust 测试基线**: 745 all-features (含 2 ignored)
+- **Rust 测试基线**: 757 all-features (含 2 ignored)
 - **Python 交叉验证**: 118 tests (全部通过)
-- **最新提交**: Session 32 on gitlab/main
+- **最新提交**: Session 33-34 on gitlab/main
+
+## Session 33-34 修复摘要
+
+### Bug 修复 (12 项)
+1. **[HIGH] pruners/*.rs**: 所有 6 个 pruner 文件的中文错误消息 → 英文 (percentile, successive_halving, patient, hyperband, wilcoxon, threshold)
+2. **[HIGH] pruners/percentile.rs**: 添加 `n_warmup_steps >= 0` 验证 (对齐 Python ValueError)
+3. **[HIGH] samplers/grid.rs**: Grid 耗尽后发 warning + 随机复用 (而非返回 Error，对齐 Python)
+4. **[HIGH] samplers/grid.rs**: 实现 `after_trial` — grid 耗尽时通知 study 停止 (对齐 Python `study.stop()`)
+5. **[HIGH] samplers/grid.rs**: 实现 `should_stop_study()` 用于 GridSampler
+6. **[MEDIUM] samplers/grid.rs**: `seed=None` → `seed=0` (对齐 Python 确定性行为)
+7. **[HIGH] terminators.rs**: RegretBoundEvaluator 搜索空间使用所有试验 (而非仅完成试验)
+8. **[HIGH] terminators.rs**: RegretBoundEvaluator top-N 选择包含并列值 (对齐 Python np.partition)
+9. **[HIGH] terminators.rs**: EMMREvaluator 搜索空间使用所有试验
+10. **[HIGH] terminators.rs**: EMMREvaluator GP 拟合顺序修正 — 先拟合 t-1 再用其 cache 拟合 t (对齐 Python)
+11. **[MEDIUM] terminators.rs**: 标准化 std 最小阈值从 1e-10 改为 f64::MIN_POSITIVE (对齐 Python sys.float_info.min)
+12. **[HIGH] samplers/cmaes.rs**: sigma0 默认值改为从搜索空间边界动态计算 min_range/6 (对齐 Python)
+
+### 新增功能
+13. **[MEDIUM] samplers/cmaes.rs**: 添加 `warn_independent_sampling` 字段和警告逻辑 (对齐 Python)
+14. **[HIGH] study/core.rs**: `optimize_multi` / `optimize_multi_with_options` / `optimize_multi_with_terminators` 添加 SIGINT 信号处理器
+
+### 新增测试 (12 个新测试, 总计 757)
+- GridSampler: `test_grid_sampler_after_trial_signals_stop`, `test_grid_sampler_after_trial_no_stop_when_remaining`, `test_grid_sampler_exhausted_returns_valid_id`, `test_grid_sampler_seed_none_is_deterministic`
+- Terminator: `test_regret_bound_top_n_includes_ties`, `test_emmr_search_space_uses_all_trials`
+
+### 已知仍待对齐的差异
+- TPE 多目标 (MOTPE): 完全缺失
+- CMA-ES 状态持久化: 分布式不安全
+- CMA-ES 世代管理: 并行不安全
+- QMC sample_id: 分布式下序列重复
+- GridSampler `_same_search_space` 检查: 跨搜索空间 grid_id 隔离
+- `reseed_rng` trait 方法: 所有 sampler 缺失
 
 ## Session 32 修复摘要
 

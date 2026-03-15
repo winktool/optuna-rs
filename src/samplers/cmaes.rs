@@ -52,6 +52,8 @@ pub struct CmaEsSampler {
     lr_adapt: bool,
     /// Source trials for warm-starting from another study.
     source_trials: Option<Vec<FrozenTrial>>,
+    /// Whether to warn when independent sampling is used (default: true).
+    warn_independent_sampling: bool,
 }
 
 impl std::fmt::Debug for CmaEsSampler {
@@ -443,6 +445,7 @@ impl CmaEsSampler {
             with_margin,
             lr_adapt,
             source_trials,
+            warn_independent_sampling: true,
         }
     }
 
@@ -520,7 +523,19 @@ impl Sampler for CmaEsSampler {
 
         // Initialize state if needed
         if state_guard.is_none() {
-            let sigma = self.sigma0.unwrap_or(1.0 / 6.0);
+            // 对齐 Python: sigma0 默认值 = min(upper - lower) / 6
+            // 在变换空间中, bounds 通常为 [0, 1]，min_range = 1.0
+            let sigma = self.sigma0.unwrap_or_else(|| {
+                let bounds = transform.bounds();
+                let min_range = bounds.iter()
+                    .map(|[lo, hi]| hi - lo)
+                    .fold(f64::INFINITY, f64::min);
+                if min_range.is_finite() && min_range > 0.0 {
+                    min_range / 6.0
+                } else {
+                    1.0 / 6.0
+                }
+            });
             let lambda = self.popsize.unwrap_or_else(|| Self::default_popsize(n_dims));
 
             // Initialize mean: prefer x0, then best trial, then center of space
@@ -640,6 +655,18 @@ impl Sampler for CmaEsSampler {
         param_name: &str,
         distribution: &Distribution,
     ) -> Result<f64> {
+        // 对齐 Python: 当启动试验数已满足时，警告独立采样
+        if self.warn_independent_sampling {
+            let n_complete = trials.iter().filter(|t| t.state == TrialState::Complete).count();
+            if n_complete >= self.n_startup_trials {
+                crate::optuna_warn!(
+                    "Trial {} was sampled independently for param '{}'. \
+                     CmaEsSampler falls back to independent sampling for parameters \
+                     not included in the relative search space.",
+                    trial.number, param_name
+                );
+            }
+        }
         self.independent_sampler
             .sample_independent(trials, trial, param_name, distribution)
     }

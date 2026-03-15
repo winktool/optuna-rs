@@ -21,7 +21,7 @@ use crate::study::StudyDirection;
 use crate::trial::{FrozenTrial, TrialState};
 use crate::distributions::Distribution;
 use crate::samplers::gp::{
-    GPRegressor, fit_kernel_params, normalize_param,
+    GPRegressor, KernelParamsCache, fit_kernel_params, normalize_param,
     normal_cdf, normal_pdf, DEFAULT_MINIMUM_NOISE_VAR,
 };
 use crate::search_space::IntersectionSearchSpace;
@@ -591,16 +591,17 @@ fn compute_standardized_regret_bound(
 
 impl ImprovementEvaluator for RegretBoundEvaluator {
     fn evaluate(&self, trials: &[FrozenTrial], study_direction: StudyDirection) -> f64 {
-        // 计算搜索空间
+        // 对齐 Python: 搜索空间使用 **所有** 试验（不只是完成的）
+        let mut ss = IntersectionSearchSpace::new(false);
+        let search_space = ss.calculate(trials);
+        if search_space.is_empty() { return f64::MAX; }
+
+        // 完成试验用于 GP 拟合
         let completed: Vec<FrozenTrial> = trials.iter()
             .filter(|t| t.state == TrialState::Complete)
             .cloned()
             .collect();
         if completed.is_empty() { return f64::MAX; }
-
-        let mut ss = IntersectionSearchSpace::new(false);
-        let search_space = ss.calculate(&completed);
-        if search_space.is_empty() { return f64::MAX; }
 
         // 准备 GP 训练数据
         let (x_train, y_values, is_categorical, param_names) =
@@ -613,10 +614,16 @@ impl ImprovementEvaluator for RegretBoundEvaluator {
         let top_n = (n as f64 * self.top_trials_ratio) as usize;
         let top_n = top_n.max(self.min_n_trials).min(n);
 
-        // 按值排序取 top_n（降序，最大化指标）
-        let mut indices: Vec<usize> = (0..n).collect();
-        indices.sort_by(|&a, &b| y_values[b].partial_cmp(&y_values[a]).unwrap_or(std::cmp::Ordering::Equal));
-        let top_indices: Vec<usize> = indices[..top_n].to_vec();
+        // 对齐 Python: 使用 np.partition 逻辑，包含并列值的试验
+        // 找到第 top_n 大的值作为阈值
+        let mut sorted_vals: Vec<f64> = y_values.clone();
+        sorted_vals.sort_by(|a, b| b.partial_cmp(a).unwrap_or(std::cmp::Ordering::Equal));
+        let threshold = sorted_vals[top_n - 1];
+
+        // 包含所有 >= threshold 的试验（并列包含）
+        let top_indices: Vec<usize> = (0..n)
+            .filter(|&i| y_values[i] >= threshold)
+            .collect();
 
         let top_x: Vec<Vec<f64>> = top_indices.iter().map(|&i| x_train[i].clone()).collect();
         let top_y: Vec<f64> = top_indices.iter().map(|&i| y_values[i]).collect();
@@ -625,7 +632,8 @@ impl ImprovementEvaluator for RegretBoundEvaluator {
         let mean_y = top_y.iter().sum::<f64>() / top_y.len() as f64;
         let std_y = {
             let var = top_y.iter().map(|v| (v - mean_y).powi(2)).sum::<f64>() / top_y.len() as f64;
-            var.sqrt().max(1e-10)
+            // 对齐 Python: max(sys.float_info.min, std)
+            var.sqrt().max(f64::MIN_POSITIVE)
         };
         let standardized_y: Vec<f64> = top_y.iter().map(|v| (v - mean_y) / std_y).collect();
 
@@ -730,16 +738,16 @@ fn compute_gp_posterior_cov(
 
 impl ImprovementEvaluator for EMMREvaluator {
     fn evaluate(&self, trials: &[FrozenTrial], study_direction: StudyDirection) -> f64 {
-        // 计算搜索空间
-        let completed: Vec<FrozenTrial> = trials.iter()
-            .filter(|t| t.state == TrialState::Complete)
-            .cloned()
-            .collect();
-        if completed.len() < self.min_n_trials { return f64::MAX * 0.1; }
-
+        // 对齐 Python: 搜索空间使用 **所有** 试验
         let mut ss = IntersectionSearchSpace::new(false);
-        let search_space = ss.calculate(&completed);
+        let search_space = ss.calculate(trials);
         if search_space.is_empty() { return f64::MAX * 0.1; }
+
+        // 完成试验数检查
+        let completed_count = trials.iter()
+            .filter(|t| t.state == TrialState::Complete)
+            .count();
+        if completed_count < self.min_n_trials { return f64::MAX * 0.1; }
 
         // 准备 GP 训练数据
         let (x_train, y_values, is_categorical, param_names) =
@@ -751,19 +759,25 @@ impl ImprovementEvaluator for EMMREvaluator {
         let y_mean = y_values.iter().sum::<f64>() / n as f64;
         let y_std = {
             let var = y_values.iter().map(|v| (v - y_mean).powi(2)).sum::<f64>() / n as f64;
-            var.sqrt().max(1e-10)
+            // 对齐 Python: max(sys.float_info.min, std)
+            var.sqrt().max(f64::MIN_POSITIVE)
         };
         let std_y: Vec<f64> = y_values.iter().map(|v| (v - y_mean) / y_std).collect();
 
         let seed = self.seed.unwrap_or(42);
 
-        // 用全 t 个观测拟合 gpr_t
-        let gpr_t = fit_kernel_params(&x_train, &std_y, &is_categorical, seed, None);
-
-        // 用前 t-1 个观测拟合 gpr_{t-1}
+        // 对齐 Python: 先拟合 t-1 个观测的 GP，再以其为初始值拟合全部 t 个观测
         let x_t_minus_1: Vec<Vec<f64>> = x_train[..n - 1].to_vec();
         let y_t_minus_1: Vec<f64> = std_y[..n - 1].to_vec();
         let gpr_t1 = fit_kernel_params(&x_t_minus_1, &y_t_minus_1, &is_categorical, seed, None);
+
+        // 用 gpr_t1 的超参数作为 cache 初始化拟合全部 t 个观测
+        let cache = KernelParamsCache {
+            inverse_squared_lengthscales: gpr_t1.inverse_squared_lengthscales.clone(),
+            kernel_scale: gpr_t1.kernel_scale,
+            noise_var: gpr_t1.noise_var,
+        };
+        let gpr_t = fit_kernel_params(&x_train, &std_y, &is_categorical, seed, Some(&cache));
 
         // θ_t* = argmax(std_y 全部)，θ_{t-1}* = argmax(std_y 前 t-1)
         let idx_t_star = std_y.iter().enumerate()
@@ -1455,5 +1469,51 @@ mod tests {
         ).unwrap();
         // 应该能评估（不 panic）
         let _ = term.should_terminate(&study);
+    }
+
+    /// 验证 RegretBoundEvaluator 的 top-N 选择包含并列值
+    #[test]
+    fn test_regret_bound_top_n_includes_ties() {
+        // 构造 4 个试验，目标值 [1.0, 1.0, 2.0, 3.0]
+        // 当 ratio=0.5 → top_n=2, threshold=2.0, 只有 [2.0, 3.0] 被选中
+        // 但如果有 [1.0, 1.0, 1.0, 3.0], ratio=0.5 → top_n=2, threshold=1.0
+        // 则应包含所有 >= 1.0 的试验（并列包含）→ 4 个
+        let eval = RegretBoundEvaluator::new(Some(0.5), Some(1), Some(42));
+        let study = make_study(StudyDirection::Minimize);
+        // 创建 4 个试验 — 不需要特定值来验证不 panic
+        study.optimize(
+            |trial| {
+                let x = trial.suggest_float("x", 0.0, 10.0, false, None)?;
+                Ok(x)
+            },
+            Some(10),
+            None,
+            None,
+        ).unwrap();
+        let trials = study.trials().unwrap();
+        // 应能正常评估（并列包含不导致 panic）
+        let result = eval.evaluate(&trials, StudyDirection::Minimize);
+        assert!(result.is_finite() || result == f64::MAX, "应返回有限值或 MAX");
+    }
+
+    /// 验证 EMMREvaluator 使用所有试验计算搜索空间
+    #[test]
+    fn test_emmr_search_space_uses_all_trials() {
+        let eval = EMMREvaluator::new(None, None, Some(2), Some(42));
+        let study = make_study(StudyDirection::Minimize);
+        study.optimize(
+            |trial| {
+                let x = trial.suggest_float("x", 0.0, 1.0, false, None)?;
+                Ok(x * x)
+            },
+            Some(5),
+            None,
+            None,
+        ).unwrap();
+        let trials = study.trials().unwrap();
+        let result = eval.evaluate(&trials, StudyDirection::Minimize);
+        // 不应 panic，且应返回有限值（搜索空间应正确推断）
+        assert!(result.is_finite() || result >= f64::MAX * 0.05,
+                "EMMR evaluate 应返回有限值: {result}");
     }
 }

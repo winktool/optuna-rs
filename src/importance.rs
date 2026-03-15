@@ -6,7 +6,7 @@
 
 use indexmap::IndexMap;
 
-use crate::distributions::{CategoricalChoice, ParamValue};
+use crate::distributions::{CategoricalChoice, Distribution, ParamValue};
 use crate::error::{OptunaError, Result};
 use crate::study::Study;
 use crate::trial::{FrozenTrial, TrialState};
@@ -69,7 +69,8 @@ impl ImportanceEvaluator for FanovaEvaluator {
             let mut pairs: Vec<(f64, f64)> = Vec::new();
             for (i, trial) in trials.iter().enumerate() {
                 if let Some(pv) = trial.params.get(param_name) {
-                    let internal = param_value_to_f64(pv);
+                    let dist = trial.distributions.get(param_name);
+                    let internal = param_value_to_f64(pv, dist);
                     pairs.push((internal, target_values[i]));
                 }
             }
@@ -106,29 +107,40 @@ impl ImportanceEvaluator for FanovaEvaluator {
     }
 }
 
-/// Convert a ParamValue to f64 for importance computation.
-/// 分类变量使用 choice index（而非 hash），对齐 Python 的 one-hot 策略中的顺序索引。
-fn param_value_to_f64(pv: &ParamValue) -> f64 {
+/// Convert a ParamValue to f64 for importance computation, using the distribution
+/// to look up the choice index for categorical parameters.
+///
+/// 对齐 Python 的 `distribution.to_internal_repr(param)` — 分类变量返回 choice 在
+/// `choices` 列表中的位置索引 (0, 1, 2, ...)，而非 hash 或实际值。
+fn param_value_to_f64(pv: &ParamValue, dist: Option<&Distribution>) -> f64 {
     match pv {
         ParamValue::Float(v) => *v,
         ParamValue::Int(v) => *v as f64,
         ParamValue::Categorical(c) => {
-            // 使用 choice 的内部表示值（索引）而非 hash
-            // CategoricalChoice 在分布的 choices 中有确定位置
-            match c {
-                CategoricalChoice::Int(v) => *v as f64,
-                CategoricalChoice::Float(v) => *v,
-                CategoricalChoice::Str(s) => {
-                    // 字符串类型用确定性 hash （保持一致性）
-                    use std::hash::{Hash, Hasher};
-                    let mut hasher = std::collections::hash_map::DefaultHasher::new();
-                    s.hash(&mut hasher);
-                    hasher.finish() as f64
-                }
-                CategoricalChoice::Bool(b) => if *b { 1.0 } else { 0.0 },
-                CategoricalChoice::None => f64::NAN,
+            // 对齐 Python: 使用 choice 在 distribution.choices 中的位置索引
+            if let Some(Distribution::CategoricalDistribution(cat_dist)) = dist {
+                cat_dist.to_internal_repr(c).unwrap_or_else(|_| {
+                    // Fallback: choice 不在 distribution 中，使用简单编码
+                    categorical_choice_fallback(c)
+                })
+            } else {
+                categorical_choice_fallback(c)
             }
         }
+    }
+}
+
+/// Fallback encoding for categorical choices when no distribution is available.
+fn categorical_choice_fallback(c: &CategoricalChoice) -> f64 {
+    match c {
+        CategoricalChoice::Int(v) => *v as f64,
+        CategoricalChoice::Float(v) => *v,
+        CategoricalChoice::Bool(b) => if *b { 1.0 } else { 0.0 },
+        CategoricalChoice::None => f64::NAN,
+        // 对齐 Python: 字符串分类变量 *必须* 通过 distribution 查找索引。
+        // 无 distribution 可用时返回 0.0（不使用 hash，因为 hash 值无法产生
+        // 有意义的距离度量）。
+        CategoricalChoice::Str(_) => 0.0,
     }
 }
 
@@ -239,6 +251,32 @@ impl ImportanceEvaluator for MeanDecreaseImpurityEvaluator {
         let n_features = params.len();
 
         // 构建特征矩阵 X[n_samples, n_features]\n        // 对齐 Python: 只保留包含所有指定参数的试验（过滤而非填0）
+        // 对齐 Python: 使用 one-hot 编码分类变量。
+        // 1. 首先确定每个参数的编码列数和列映射
+        let mut column_to_param: Vec<usize> = Vec::new(); // encoded_column → param index
+        let mut param_n_columns: Vec<usize> = Vec::new(); // 每个参数占多少列
+        let n_encoded_features;
+        {
+            // 从第一个包含所有参数的 trial 获取分布信息
+            let ref_trial = trials.iter().find(|t| {
+                params.iter().all(|name| t.params.contains_key(name))
+            });
+            for (p_idx, param_name) in params.iter().enumerate() {
+                let dist = ref_trial.and_then(|t| t.distributions.get(param_name));
+                let n_cols = if let Some(Distribution::CategoricalDistribution(cat)) = dist {
+                    cat.choices.len() // one-hot: 每个 choice 一列
+                } else {
+                    1 // 数值类型: 一列
+                };
+                for _ in 0..n_cols {
+                    column_to_param.push(p_idx);
+                }
+                param_n_columns.push(n_cols);
+            }
+            n_encoded_features = column_to_param.len();
+        }
+
+        // 2. 构建 one-hot 编码的特征矩阵
         let mut x_matrix: Vec<Vec<f64>> = Vec::new();
         let mut filtered_targets: Vec<f64> = Vec::new();
         for (i, trial) in trials.iter().enumerate() {
@@ -246,10 +284,23 @@ impl ImportanceEvaluator for MeanDecreaseImpurityEvaluator {
             if !has_all {
                 continue;
             }
-            let mut row = Vec::with_capacity(n_features);
-            for param_name in params {
-                let val = trial.params.get(param_name).map(param_value_to_f64).unwrap();
-                row.push(val);
+            let mut row = vec![0.0_f64; n_encoded_features];
+            let mut col_offset = 0;
+            for (p_idx, param_name) in params.iter().enumerate() {
+                let pv = trial.params.get(param_name).unwrap();
+                let dist = trial.distributions.get(param_name);
+                let n_cols = param_n_columns[p_idx];
+                if n_cols > 1 {
+                    // Categorical: one-hot 编码
+                    let choice_idx = param_value_to_f64(pv, dist) as usize;
+                    if choice_idx < n_cols {
+                        row[col_offset + choice_idx] = 1.0;
+                    }
+                } else {
+                    // 数值类型: 直接使用值
+                    row[col_offset] = param_value_to_f64(pv, dist);
+                }
+                col_offset += n_cols;
             }
             x_matrix.push(row);
             filtered_targets.push(target_values[i]);
@@ -259,8 +310,8 @@ impl ImportanceEvaluator for MeanDecreaseImpurityEvaluator {
             return Ok(IndexMap::new());
         }
 
-        // 使用随机森林计算特征重要性
-        let importances = random_forest_feature_importances(
+        // 使用随机森林计算 encoded 特征重要性
+        let encoded_importances = random_forest_feature_importances(
             &x_matrix,
             &filtered_targets,
             self.n_trees,
@@ -269,6 +320,15 @@ impl ImportanceEvaluator for MeanDecreaseImpurityEvaluator {
             self.min_samples_leaf,
             self.seed,
         );
+
+        // 对齐 Python: 将 one-hot 列的重要性求和回原参数
+        // np.add.at(param_importances, trans.encoded_column_to_column, feature_importances)
+        let mut importances = vec![0.0_f64; n_features];
+        for (enc_col, &imp) in encoded_importances.iter().enumerate() {
+            if enc_col < column_to_param.len() {
+                importances[column_to_param[enc_col]] += imp;
+            }
+        }
 
         // 归一化并排序
         let total: f64 = importances.iter().sum();
@@ -1016,12 +1076,14 @@ impl ImportanceEvaluator for PedAnovaEvaluator {
             // 收集参数值
             let target_vals: Vec<f64> = target_indices.iter()
                 .filter_map(|&i| {
-                    trials[i].params.get(param_name).map(|pv| param_value_to_f64(pv))
+                    let dist = trials[i].distributions.get(param_name);
+                    trials[i].params.get(param_name).map(|pv| param_value_to_f64(pv, dist))
                 })
                 .collect();
             let region_vals: Vec<f64> = region_indices.iter()
                 .filter_map(|&i| {
-                    trials[i].params.get(param_name).map(|pv| param_value_to_f64(pv))
+                    let dist = trials[i].distributions.get(param_name);
+                    trials[i].params.get(param_name).map(|pv| param_value_to_f64(pv, dist))
                 })
                 .collect();
 
@@ -1032,7 +1094,10 @@ impl ImportanceEvaluator for PedAnovaEvaluator {
 
             // 确定参数范围
             let all_vals: Vec<f64> = trials.iter()
-                .filter_map(|t| t.params.get(param_name).map(|pv| param_value_to_f64(pv)))
+                .filter_map(|t| {
+                    let dist = t.distributions.get(param_name);
+                    t.params.get(param_name).map(|pv| param_value_to_f64(pv, dist))
+                })
                 .collect();
             let low = all_vals.iter().cloned().fold(f64::INFINITY, f64::min);
             let high = all_vals.iter().cloned().fold(f64::NEG_INFINITY, f64::max);

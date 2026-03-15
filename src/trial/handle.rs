@@ -9,7 +9,6 @@ use crate::pruners::Pruner;
 use crate::samplers::Sampler;
 use crate::storage::Storage;
 use crate::study::StudyDirection;
-use crate::trial::TrialState;
 
 /// 运行中试验的可变句柄。
 ///
@@ -81,6 +80,60 @@ impl Trial {
         })
     }
 
+    /// 对齐 Python `Trial.suggest_float(name, low, high, step=None, log=False)`。
+    pub fn suggest_float_py(
+        &mut self,
+        name: &str,
+        low: f64,
+        high: f64,
+        step: Option<f64>,
+        log: bool,
+    ) -> Result<f64> {
+        self.suggest_float(name, low, high, log, step)
+    }
+
+    /// 对齐 Python 默认参数形式：`suggest_float(name, low, high)`。
+    pub fn suggest_float_default(&mut self, name: &str, low: f64, high: f64) -> Result<f64> {
+        self.suggest_float_py(name, low, high, None, false)
+    }
+
+    /// 对齐 Python `suggest_float(..., step=...)` 的便捷入口。
+    pub fn suggest_float_step(
+        &mut self,
+        name: &str,
+        low: f64,
+        high: f64,
+        step: f64,
+    ) -> Result<f64> {
+        self.suggest_float_py(name, low, high, Some(step), false)
+    }
+
+    /// 对齐 Python `suggest_float(..., log=True)` 的便捷入口。
+    pub fn suggest_float_log(&mut self, name: &str, low: f64, high: f64) -> Result<f64> {
+        self.suggest_float_py(name, low, high, None, true)
+    }
+
+    /// 对齐 Python 已弃用别名 `suggest_uniform()`。
+    pub fn suggest_uniform(&mut self, name: &str, low: f64, high: f64) -> Result<f64> {
+        self.suggest_float_default(name, low, high)
+    }
+
+    /// 对齐 Python 已弃用别名 `suggest_loguniform()`。
+    pub fn suggest_loguniform(&mut self, name: &str, low: f64, high: f64) -> Result<f64> {
+        self.suggest_float_log(name, low, high)
+    }
+
+    /// 对齐 Python 已弃用别名 `suggest_discrete_uniform()`。
+    pub fn suggest_discrete_uniform(
+        &mut self,
+        name: &str,
+        low: f64,
+        high: f64,
+        q: f64,
+    ) -> Result<f64> {
+        self.suggest_float_step(name, low, high, q)
+    }
+
     /// Suggest an integer parameter.
     pub fn suggest_int(
         &mut self,
@@ -96,6 +149,39 @@ impl Trial {
             crate::distributions::ParamValue::Int(i) => i,
             _ => unreachable!(),
         })
+    }
+
+    /// 对齐 Python `Trial.suggest_int(name, low, high, step=1, log=False)`。
+    pub fn suggest_int_py(
+        &mut self,
+        name: &str,
+        low: i64,
+        high: i64,
+        step: i64,
+        log: bool,
+    ) -> Result<i64> {
+        self.suggest_int(name, low, high, log, step)
+    }
+
+    /// 对齐 Python 默认参数形式：`suggest_int(name, low, high)`。
+    pub fn suggest_int_default(&mut self, name: &str, low: i64, high: i64) -> Result<i64> {
+        self.suggest_int_py(name, low, high, 1, false)
+    }
+
+    /// 对齐 Python `suggest_int(..., step=...)` 的便捷入口。
+    pub fn suggest_int_step(
+        &mut self,
+        name: &str,
+        low: i64,
+        high: i64,
+        step: i64,
+    ) -> Result<i64> {
+        self.suggest_int_py(name, low, high, step, false)
+    }
+
+    /// 对齐 Python `suggest_int(..., log=True)` 的便捷入口。
+    pub fn suggest_int_log(&mut self, name: &str, low: i64, high: i64) -> Result<i64> {
+        self.suggest_int_py(name, low, high, 1, true)
     }
 
     /// Suggest a categorical parameter.
@@ -241,5 +327,113 @@ impl Trial {
     pub fn datetime_start(&self) -> Result<Option<chrono::DateTime<chrono::Utc>>> {
         let ft = self.storage.get_trial(self.trial_id)?;
         Ok(ft.datetime_start)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::distributions::Distribution;
+    use crate::study::{StudyDirection, create_study};
+
+    #[test]
+    fn test_trial_float_python_compat_wrappers() {
+        let study = create_study(
+            None,
+            None,
+            None,
+            None,
+            Some(StudyDirection::Minimize),
+            None,
+            false,
+        )
+        .unwrap();
+
+        let mut trial = study.ask(None).unwrap();
+        let _ = trial.suggest_float_default("x", 0.0, 1.0).unwrap();
+        let _ = trial.suggest_loguniform("y", 0.1, 10.0).unwrap();
+        let _ = trial.suggest_discrete_uniform("z", 0.0, 1.0, 0.25).unwrap();
+        let _ = trial.suggest_float_py("w", -1.0, 1.0, Some(0.5), false).unwrap();
+
+        let dists = trial.distributions().unwrap();
+
+        match dists.get("x").unwrap() {
+            Distribution::FloatDistribution(dist) => {
+                assert!(!dist.log);
+                assert_eq!(dist.step, None);
+            }
+            _ => panic!("x should use float distribution"),
+        }
+        match dists.get("y").unwrap() {
+            Distribution::FloatDistribution(dist) => {
+                assert!(dist.log);
+                assert_eq!(dist.step, None);
+            }
+            _ => panic!("y should use float distribution"),
+        }
+        match dists.get("z").unwrap() {
+            Distribution::FloatDistribution(dist) => {
+                assert!(!dist.log);
+                assert_eq!(dist.step, Some(0.25));
+            }
+            _ => panic!("z should use float distribution"),
+        }
+        match dists.get("w").unwrap() {
+            Distribution::FloatDistribution(dist) => {
+                assert!(!dist.log);
+                assert_eq!(dist.step, Some(0.5));
+            }
+            _ => panic!("w should use float distribution"),
+        }
+    }
+
+    #[test]
+    fn test_trial_int_python_compat_wrappers() {
+        let study = create_study(
+            None,
+            None,
+            None,
+            None,
+            Some(StudyDirection::Minimize),
+            None,
+            false,
+        )
+        .unwrap();
+
+        let mut trial = study.ask(None).unwrap();
+        let _ = trial.suggest_int_default("a", 1, 5).unwrap();
+        let _ = trial.suggest_int_log("b", 1, 8).unwrap();
+        let _ = trial.suggest_int_step("c", 0, 10, 2).unwrap();
+        let _ = trial.suggest_int_py("d", 3, 9, 3, false).unwrap();
+
+        let dists = trial.distributions().unwrap();
+
+        match dists.get("a").unwrap() {
+            Distribution::IntDistribution(dist) => {
+                assert!(!dist.log);
+                assert_eq!(dist.step, 1);
+            }
+            _ => panic!("a should use int distribution"),
+        }
+        match dists.get("b").unwrap() {
+            Distribution::IntDistribution(dist) => {
+                assert!(dist.log);
+                assert_eq!(dist.step, 1);
+            }
+            _ => panic!("b should use int distribution"),
+        }
+        match dists.get("c").unwrap() {
+            Distribution::IntDistribution(dist) => {
+                assert!(!dist.log);
+                assert_eq!(dist.step, 2);
+            }
+            _ => panic!("c should use int distribution"),
+        }
+        match dists.get("d").unwrap() {
+            Distribution::IntDistribution(dist) => {
+                assert!(!dist.log);
+                assert_eq!(dist.step, 3);
+            }
+            _ => panic!("d should use int distribution"),
+        }
     }
 }

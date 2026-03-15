@@ -56,6 +56,60 @@ impl FixedTrial {
         }
     }
 
+    /// 对齐 Python `FixedTrial.suggest_float(name, low, high, step=None, log=False)`。
+    pub fn suggest_float_py(
+        &mut self,
+        name: &str,
+        low: f64,
+        high: f64,
+        step: Option<f64>,
+        log: bool,
+    ) -> Result<f64> {
+        self.suggest_float(name, low, high, log, step)
+    }
+
+    /// 对齐 Python 默认参数形式：`suggest_float(name, low, high)`。
+    pub fn suggest_float_default(&mut self, name: &str, low: f64, high: f64) -> Result<f64> {
+        self.suggest_float_py(name, low, high, None, false)
+    }
+
+    /// 对齐 Python `suggest_float(..., step=...)` 的便捷入口。
+    pub fn suggest_float_step(
+        &mut self,
+        name: &str,
+        low: f64,
+        high: f64,
+        step: f64,
+    ) -> Result<f64> {
+        self.suggest_float_py(name, low, high, Some(step), false)
+    }
+
+    /// 对齐 Python `suggest_float(..., log=True)` 的便捷入口。
+    pub fn suggest_float_log(&mut self, name: &str, low: f64, high: f64) -> Result<f64> {
+        self.suggest_float_py(name, low, high, None, true)
+    }
+
+    /// 对齐 Python 已弃用别名 `suggest_uniform()`。
+    pub fn suggest_uniform(&mut self, name: &str, low: f64, high: f64) -> Result<f64> {
+        self.suggest_float_default(name, low, high)
+    }
+
+    /// 对齐 Python 已弃用别名 `suggest_loguniform()`。
+    pub fn suggest_loguniform(&mut self, name: &str, low: f64, high: f64) -> Result<f64> {
+        self.suggest_float_log(name, low, high)
+    }
+
+    /// 对齐 Python 已弃用别名 `suggest_discrete_uniform()`。
+    pub fn suggest_discrete_uniform(
+        &mut self,
+        name: &str,
+        low: f64,
+        high: f64,
+        q: f64,
+    ) -> Result<f64> {
+        self.suggest_float_step(name, low, high, q)
+    }
+
     /// Suggest an integer parameter.
     pub fn suggest_int(
         &mut self,
@@ -74,6 +128,39 @@ impl FixedTrial {
                 "param '{name}' is not an int"
             ))),
         }
+    }
+
+    /// 对齐 Python `FixedTrial.suggest_int(name, low, high, step=1, log=False)`。
+    pub fn suggest_int_py(
+        &mut self,
+        name: &str,
+        low: i64,
+        high: i64,
+        step: i64,
+        log: bool,
+    ) -> Result<i64> {
+        self.suggest_int(name, low, high, log, step)
+    }
+
+    /// 对齐 Python 默认参数形式：`suggest_int(name, low, high)`。
+    pub fn suggest_int_default(&mut self, name: &str, low: i64, high: i64) -> Result<i64> {
+        self.suggest_int_py(name, low, high, 1, false)
+    }
+
+    /// 对齐 Python `suggest_int(..., step=...)` 的便捷入口。
+    pub fn suggest_int_step(
+        &mut self,
+        name: &str,
+        low: i64,
+        high: i64,
+        step: i64,
+    ) -> Result<i64> {
+        self.suggest_int_py(name, low, high, step, false)
+    }
+
+    /// 对齐 Python `suggest_int(..., log=True)` 的便捷入口。
+    pub fn suggest_int_log(&mut self, name: &str, low: i64, high: i64) -> Result<i64> {
+        self.suggest_int_py(name, low, high, 1, true)
     }
 
     /// Suggest a categorical parameter.
@@ -278,5 +365,93 @@ mod tests {
     fn test_number() {
         let trial = FixedTrial::new(HashMap::new(), 7);
         assert_eq!(trial.number(), 7);
+    }
+
+    #[test]
+    fn test_python_compat_float_wrappers() {
+        let mut params = HashMap::new();
+        params.insert("x".into(), ParamValue::Float(0.25));
+        params.insert("y".into(), ParamValue::Float(2.0));
+        params.insert("z".into(), ParamValue::Float(0.75));
+        params.insert("w".into(), ParamValue::Float(1.5));
+        let mut trial = FixedTrial::new(params, 0);
+
+        assert_eq!(trial.suggest_float_default("x", 0.0, 1.0).unwrap(), 0.25);
+        assert_eq!(trial.suggest_loguniform("y", 1.0, 10.0).unwrap(), 2.0);
+        assert_eq!(trial.suggest_discrete_uniform("z", 0.0, 1.0, 0.25).unwrap(), 0.75);
+        assert_eq!(trial.suggest_float_py("w", 1.0, 2.0, Some(0.5), false).unwrap(), 1.5);
+
+        match trial.distributions().get("x").unwrap() {
+            Distribution::FloatDistribution(dist) => {
+                assert!(!dist.log);
+                assert_eq!(dist.step, None);
+            }
+            _ => panic!("x should use float distribution"),
+        }
+        match trial.distributions().get("y").unwrap() {
+            Distribution::FloatDistribution(dist) => {
+                assert!(dist.log);
+                assert_eq!(dist.step, None);
+            }
+            _ => panic!("y should use float distribution"),
+        }
+        match trial.distributions().get("z").unwrap() {
+            Distribution::FloatDistribution(dist) => {
+                assert!(!dist.log);
+                assert_eq!(dist.step, Some(0.25));
+            }
+            _ => panic!("z should use float distribution"),
+        }
+        match trial.distributions().get("w").unwrap() {
+            Distribution::FloatDistribution(dist) => {
+                assert!(!dist.log);
+                assert_eq!(dist.step, Some(0.5));
+            }
+            _ => panic!("w should use float distribution"),
+        }
+    }
+
+    #[test]
+    fn test_python_compat_int_wrappers() {
+        let mut params = HashMap::new();
+        params.insert("a".into(), ParamValue::Int(3));
+        params.insert("b".into(), ParamValue::Int(4));
+        params.insert("c".into(), ParamValue::Int(6));
+        params.insert("d".into(), ParamValue::Int(9));
+        let mut trial = FixedTrial::new(params, 0);
+
+        assert_eq!(trial.suggest_int_default("a", 1, 5).unwrap(), 3);
+        assert_eq!(trial.suggest_int_log("b", 1, 8).unwrap(), 4);
+        assert_eq!(trial.suggest_int_step("c", 0, 10, 2).unwrap(), 6);
+        assert_eq!(trial.suggest_int_py("d", 3, 9, 3, false).unwrap(), 9);
+
+        match trial.distributions().get("a").unwrap() {
+            Distribution::IntDistribution(dist) => {
+                assert!(!dist.log);
+                assert_eq!(dist.step, 1);
+            }
+            _ => panic!("a should use int distribution"),
+        }
+        match trial.distributions().get("b").unwrap() {
+            Distribution::IntDistribution(dist) => {
+                assert!(dist.log);
+                assert_eq!(dist.step, 1);
+            }
+            _ => panic!("b should use int distribution"),
+        }
+        match trial.distributions().get("c").unwrap() {
+            Distribution::IntDistribution(dist) => {
+                assert!(!dist.log);
+                assert_eq!(dist.step, 2);
+            }
+            _ => panic!("c should use int distribution"),
+        }
+        match trial.distributions().get("d").unwrap() {
+            Distribution::IntDistribution(dist) => {
+                assert!(!dist.log);
+                assert_eq!(dist.step, 3);
+            }
+            _ => panic!("d should use int distribution"),
+        }
     }
 }

@@ -226,6 +226,60 @@ impl FrozenTrial {
         }
     }
 
+    /// 兼容历史 Rust 调用顺序：`(name, low, high, log, step)`。
+    pub fn suggest_float_legacy(
+        &mut self,
+        name: &str,
+        low: f64,
+        high: f64,
+        log: bool,
+        step: Option<f64>,
+    ) -> Result<f64> {
+        self.suggest_float(name, low, high, step, log)
+    }
+
+    /// 对齐 Python 默认参数形式：`suggest_float(name, low, high)`。
+    pub fn suggest_float_default(&mut self, name: &str, low: f64, high: f64) -> Result<f64> {
+        self.suggest_float(name, low, high, None, false)
+    }
+
+    /// 对齐 Python `suggest_float(..., step=...)` 的便捷入口。
+    pub fn suggest_float_step(
+        &mut self,
+        name: &str,
+        low: f64,
+        high: f64,
+        step: f64,
+    ) -> Result<f64> {
+        self.suggest_float(name, low, high, Some(step), false)
+    }
+
+    /// 对齐 Python `suggest_float(..., log=True)` 的便捷入口。
+    pub fn suggest_float_log(&mut self, name: &str, low: f64, high: f64) -> Result<f64> {
+        self.suggest_float(name, low, high, None, true)
+    }
+
+    /// 对齐 Python 已弃用别名 `suggest_uniform()`。
+    pub fn suggest_uniform(&mut self, name: &str, low: f64, high: f64) -> Result<f64> {
+        self.suggest_float_default(name, low, high)
+    }
+
+    /// 对齐 Python 已弃用别名 `suggest_loguniform()`。
+    pub fn suggest_loguniform(&mut self, name: &str, low: f64, high: f64) -> Result<f64> {
+        self.suggest_float_log(name, low, high)
+    }
+
+    /// 对齐 Python 已弃用别名 `suggest_discrete_uniform()`。
+    pub fn suggest_discrete_uniform(
+        &mut self,
+        name: &str,
+        low: f64,
+        high: f64,
+        q: f64,
+    ) -> Result<f64> {
+        self.suggest_float_step(name, low, high, q)
+    }
+
     /// 对齐 Python `FrozenTrial.suggest_int(name, low, high, step=1, log=False)`。
     pub fn suggest_int(
         &mut self,
@@ -244,6 +298,39 @@ impl FrozenTrial {
             ParamValue::Float(v) => Ok(v as i64),
             _ => Ok(dist.to_internal_repr(&val)? as i64),
         }
+    }
+
+    /// 兼容历史 Rust 调用顺序：`(name, low, high, log, step)`。
+    pub fn suggest_int_legacy(
+        &mut self,
+        name: &str,
+        low: i64,
+        high: i64,
+        log: bool,
+        step: i64,
+    ) -> Result<i64> {
+        self.suggest_int(name, low, high, step, log)
+    }
+
+    /// 对齐 Python 默认参数形式：`suggest_int(name, low, high)`。
+    pub fn suggest_int_default(&mut self, name: &str, low: i64, high: i64) -> Result<i64> {
+        self.suggest_int(name, low, high, 1, false)
+    }
+
+    /// 对齐 Python `suggest_int(..., step=...)` 的便捷入口。
+    pub fn suggest_int_step(
+        &mut self,
+        name: &str,
+        low: i64,
+        high: i64,
+        step: i64,
+    ) -> Result<i64> {
+        self.suggest_int(name, low, high, step, false)
+    }
+
+    /// 对齐 Python `suggest_int(..., log=True)` 的便捷入口。
+    pub fn suggest_int_log(&mut self, name: &str, low: i64, high: i64) -> Result<i64> {
+        self.suggest_int(name, low, high, 1, true)
     }
 
     /// 对齐 Python `FrozenTrial.suggest_categorical(name, choices)`。
@@ -740,6 +827,274 @@ mod tests {
         let mut t = FrozenTrial::new(0, TrialState::Complete, Some(1.0), None,
             Some(now), Some(now), p, d, u, s, i, 0).unwrap();
         assert!(t.suggest_float("missing", 0.0, 1.0, None, false).is_err());
+    }
+
+    #[test]
+    fn test_python_compat_float_wrappers() {
+        let now = Utc::now();
+        let (_, _, u, s, i) = empty_maps();
+
+        let mut params_x = HashMap::new();
+        params_x.insert("x".into(), ParamValue::Float(0.25));
+        let mut dists_x = HashMap::new();
+        dists_x.insert(
+            "x".into(),
+            Distribution::FloatDistribution(FloatDistribution::new(0.0, 1.0, false, None).unwrap()),
+        );
+
+        let mut tx = FrozenTrial::new(
+            0,
+            TrialState::Complete,
+            Some(1.0),
+            None,
+            Some(now),
+            Some(now),
+            params_x,
+            dists_x,
+            u.clone(),
+            s.clone(),
+            i.clone(),
+            0,
+        )
+        .unwrap();
+        assert_eq!(tx.suggest_float_default("x", 0.0, 1.0).unwrap(), 0.25);
+        match tx.distributions.get("x").unwrap() {
+            Distribution::FloatDistribution(dist) => {
+                assert!(!dist.log);
+                assert_eq!(dist.step, None);
+            }
+            _ => panic!("x should use float distribution"),
+        }
+
+        let mut params_y = HashMap::new();
+        params_y.insert("y".into(), ParamValue::Float(2.0));
+        let mut dists_y = HashMap::new();
+        dists_y.insert(
+            "y".into(),
+            Distribution::FloatDistribution(FloatDistribution::new(1.0, 10.0, true, None).unwrap()),
+        );
+
+        let mut ty = FrozenTrial::new(
+            0,
+            TrialState::Complete,
+            Some(1.0),
+            None,
+            Some(now),
+            Some(now),
+            params_y,
+            dists_y,
+            u.clone(),
+            s.clone(),
+            i.clone(),
+            0,
+        )
+        .unwrap();
+        assert_eq!(ty.suggest_loguniform("y", 1.0, 10.0).unwrap(), 2.0);
+        match ty.distributions.get("y").unwrap() {
+            Distribution::FloatDistribution(dist) => {
+                assert!(dist.log);
+                assert_eq!(dist.step, None);
+            }
+            _ => panic!("y should use float distribution"),
+        }
+
+        let mut params_z = HashMap::new();
+        params_z.insert("z".into(), ParamValue::Float(0.75));
+        let mut dists_z = HashMap::new();
+        dists_z.insert(
+            "z".into(),
+            Distribution::FloatDistribution(FloatDistribution::new(0.0, 1.0, false, Some(0.25)).unwrap()),
+        );
+
+        let mut tz = FrozenTrial::new(
+            0,
+            TrialState::Complete,
+            Some(1.0),
+            None,
+            Some(now),
+            Some(now),
+            params_z,
+            dists_z,
+            u.clone(),
+            s.clone(),
+            i.clone(),
+            0,
+        )
+        .unwrap();
+        assert_eq!(tz.suggest_discrete_uniform("z", 0.0, 1.0, 0.25).unwrap(), 0.75);
+        match tz.distributions.get("z").unwrap() {
+            Distribution::FloatDistribution(dist) => {
+                assert!(!dist.log);
+                assert_eq!(dist.step, Some(0.25));
+            }
+            _ => panic!("z should use float distribution"),
+        }
+
+        let mut params_w = HashMap::new();
+        params_w.insert("w".into(), ParamValue::Float(1.5));
+        let mut dists_w = HashMap::new();
+        dists_w.insert(
+            "w".into(),
+            Distribution::FloatDistribution(FloatDistribution::new(1.0, 2.0, false, Some(0.5)).unwrap()),
+        );
+
+        let mut tw = FrozenTrial::new(
+            0,
+            TrialState::Complete,
+            Some(1.0),
+            None,
+            Some(now),
+            Some(now),
+            params_w,
+            dists_w,
+            u,
+            s,
+            i,
+            0,
+        )
+        .unwrap();
+        assert_eq!(tw.suggest_float_legacy("w", 1.0, 2.0, false, Some(0.5)).unwrap(), 1.5);
+        match tw.distributions.get("w").unwrap() {
+            Distribution::FloatDistribution(dist) => {
+                assert!(!dist.log);
+                assert_eq!(dist.step, Some(0.5));
+            }
+            _ => panic!("w should use float distribution"),
+        }
+    }
+
+    #[test]
+    fn test_python_compat_int_wrappers() {
+        let now = Utc::now();
+        let (_, _, u, s, i) = empty_maps();
+
+        let mut params_a = HashMap::new();
+        params_a.insert("a".into(), ParamValue::Int(3));
+        let mut dists_a = HashMap::new();
+        dists_a.insert(
+            "a".into(),
+            Distribution::IntDistribution(IntDistribution::new(1, 5, false, 1).unwrap()),
+        );
+
+        let mut ta = FrozenTrial::new(
+            0,
+            TrialState::Complete,
+            Some(1.0),
+            None,
+            Some(now),
+            Some(now),
+            params_a,
+            dists_a,
+            u.clone(),
+            s.clone(),
+            i.clone(),
+            0,
+        )
+        .unwrap();
+        assert_eq!(ta.suggest_int_default("a", 1, 5).unwrap(), 3);
+        match ta.distributions.get("a").unwrap() {
+            Distribution::IntDistribution(dist) => {
+                assert!(!dist.log);
+                assert_eq!(dist.step, 1);
+            }
+            _ => panic!("a should use int distribution"),
+        }
+
+        let mut params_b = HashMap::new();
+        params_b.insert("b".into(), ParamValue::Int(4));
+        let mut dists_b = HashMap::new();
+        dists_b.insert(
+            "b".into(),
+            Distribution::IntDistribution(IntDistribution::new(1, 8, true, 1).unwrap()),
+        );
+
+        let mut tb = FrozenTrial::new(
+            0,
+            TrialState::Complete,
+            Some(1.0),
+            None,
+            Some(now),
+            Some(now),
+            params_b,
+            dists_b,
+            u.clone(),
+            s.clone(),
+            i.clone(),
+            0,
+        )
+        .unwrap();
+        assert_eq!(tb.suggest_int_log("b", 1, 8).unwrap(), 4);
+        match tb.distributions.get("b").unwrap() {
+            Distribution::IntDistribution(dist) => {
+                assert!(dist.log);
+                assert_eq!(dist.step, 1);
+            }
+            _ => panic!("b should use int distribution"),
+        }
+
+        let mut params_c = HashMap::new();
+        params_c.insert("c".into(), ParamValue::Int(6));
+        let mut dists_c = HashMap::new();
+        dists_c.insert(
+            "c".into(),
+            Distribution::IntDistribution(IntDistribution::new(0, 10, false, 2).unwrap()),
+        );
+
+        let mut tc = FrozenTrial::new(
+            0,
+            TrialState::Complete,
+            Some(1.0),
+            None,
+            Some(now),
+            Some(now),
+            params_c,
+            dists_c,
+            u.clone(),
+            s.clone(),
+            i.clone(),
+            0,
+        )
+        .unwrap();
+        assert_eq!(tc.suggest_int_step("c", 0, 10, 2).unwrap(), 6);
+        match tc.distributions.get("c").unwrap() {
+            Distribution::IntDistribution(dist) => {
+                assert!(!dist.log);
+                assert_eq!(dist.step, 2);
+            }
+            _ => panic!("c should use int distribution"),
+        }
+
+        let mut params_d = HashMap::new();
+        params_d.insert("d".into(), ParamValue::Int(9));
+        let mut dists_d = HashMap::new();
+        dists_d.insert(
+            "d".into(),
+            Distribution::IntDistribution(IntDistribution::new(3, 9, false, 3).unwrap()),
+        );
+
+        let mut td = FrozenTrial::new(
+            0,
+            TrialState::Complete,
+            Some(1.0),
+            None,
+            Some(now),
+            Some(now),
+            params_d,
+            dists_d,
+            u,
+            s,
+            i,
+            0,
+        )
+        .unwrap();
+        assert_eq!(td.suggest_int_legacy("d", 3, 9, false, 3).unwrap(), 9);
+        match td.distributions.get("d").unwrap() {
+            Distribution::IntDistribution(dist) => {
+                assert!(!dist.log);
+                assert_eq!(dist.step, 3);
+            }
+            _ => panic!("d should use int distribution"),
+        }
     }
 
     // ── duration 测试 ──

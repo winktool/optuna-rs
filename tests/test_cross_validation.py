@@ -614,6 +614,317 @@ def test_normal_cdf_values():
     assert abs(norm.cdf(3.0) - 0.9986501019683699) < 1e-10
 
 # ═══════════════════════════════════════════════════════════════════════════
+#  17. Study ask/tell 工作流 — 对应 Rust study/core.rs ask/tell
+# ═══════════════════════════════════════════════════════════════════════════
+
+def test_study_ask_tell_basic():
+    """Rust: test_python_cross_ask_tell_basic"""
+    study = optuna.create_study(direction="minimize")
+    trial = study.ask()
+    x = trial.suggest_float("x", -5, 5)
+    study.tell(trial, x ** 2)
+    assert len(study.trials) == 1
+    assert study.trials[0].state == optuna.trial.TrialState.COMPLETE
+    assert study.trials[0].values[0] == x ** 2
+
+def test_study_ask_tell_pruned():
+    """Rust: test_python_cross_ask_tell_pruned"""
+    study = optuna.create_study()
+    trial = study.ask()
+    trial.suggest_float("x", 0, 1)
+    trial.report(99.0, 0)
+    study.tell(trial, state=optuna.trial.TrialState.PRUNED)
+    ft = study.trials[0]
+    assert ft.state == optuna.trial.TrialState.PRUNED
+
+def test_study_ask_tell_fail():
+    """Rust: test_python_cross_ask_tell_fail"""
+    study = optuna.create_study()
+    trial = study.ask()
+    trial.suggest_float("x", 0, 1)
+    study.tell(trial, state=optuna.trial.TrialState.FAIL)
+    ft = study.trials[0]
+    assert ft.state == optuna.trial.TrialState.FAIL
+    assert ft.values is None
+
+# ═══════════════════════════════════════════════════════════════════════════
+#  18. Study enqueue_trial — 对应 Rust study/core.rs enqueue_trial
+# ═══════════════════════════════════════════════════════════════════════════
+
+def test_study_enqueue_trial():
+    """Rust: test_python_cross_enqueue_trial"""
+    study = optuna.create_study(direction="minimize")
+    study.enqueue_trial({"x": 3.0, "y": 4.0})
+    study.enqueue_trial({"x": -1.0, "y": 2.0})
+    # 优化时使用预设参数
+    def objective(trial):
+        x = trial.suggest_float("x", -10, 10)
+        y = trial.suggest_float("y", -10, 10)
+        return x ** 2 + y ** 2
+    study.optimize(objective, n_trials=2)
+    assert study.trials[0].params["x"] == 3.0
+    assert study.trials[0].params["y"] == 4.0
+    assert study.trials[0].values[0] == 25.0  # 3^2 + 4^2
+    assert study.trials[1].params["x"] == -1.0
+    assert study.trials[1].values[0] == 5.0   # 1 + 4
+
+def test_study_enqueue_skip_if_exists():
+    """Rust: test_python_cross_enqueue_skip"""
+    study = optuna.create_study()
+    study.enqueue_trial({"x": 1.0})
+    study.enqueue_trial({"x": 1.0}, skip_if_exists=True)
+    # skip_if_exists 应该只保留一个排队试验
+    waiting = [t for t in study.trials if t.state == optuna.trial.TrialState.WAITING]
+    assert len(waiting) == 1
+
+# ═══════════════════════════════════════════════════════════════════════════
+#  19. 多目标优化 — 对应 Rust multi_objective + study
+# ═══════════════════════════════════════════════════════════════════════════
+
+def test_multi_objective_basic():
+    """Rust: test_python_cross_multi_objective"""
+    study = optuna.create_study(directions=["minimize", "maximize"])
+    assert len(study.directions) == 2
+    assert study.directions[0] == optuna.study.StudyDirection.MINIMIZE
+    assert study.directions[1] == optuna.study.StudyDirection.MAXIMIZE
+    def objective(trial):
+        x = trial.suggest_float("x", 0, 1)
+        return x, 1 - x  # minimize x, maximize 1-x → Pareto front
+    study.optimize(objective, n_trials=20)
+    best = study.best_trials
+    assert len(best) >= 1  # 至少有一个 Pareto 前沿解
+
+def test_multi_objective_best_trials():
+    """Rust: test_python_cross_multi_obj_best_trials"""
+    study = optuna.create_study(directions=["minimize", "minimize"])
+    # 手动添加已知试验
+    for vals in [(1.0, 3.0), (2.0, 2.0), (3.0, 1.0), (2.0, 3.0)]:
+        trial = study.ask()
+        trial.suggest_float("x", 0, 10)
+        study.tell(trial, list(vals))
+    bests = study.best_trials
+    # (1,3), (2,2), (3,1) 应在 Pareto 前沿; (2,3) 被 (2,2) 支配
+    best_values = [tuple(t.values) for t in bests]
+    assert (2.0, 3.0) not in best_values
+    assert len(bests) == 3
+
+# ═══════════════════════════════════════════════════════════════════════════
+#  20. MedianPruner — 对应 Rust pruners/median.rs
+# ═══════════════════════════════════════════════════════════════════════════
+
+def test_median_pruner_basic():
+    """Rust: test_python_cross_median_pruner"""
+    study = optuna.create_study(
+        pruner=optuna.pruners.MedianPruner(n_startup_trials=0, n_warmup_steps=0)
+    )
+    # 先完成一个好的 trial (中位数 = 5.0)
+    t0 = study.ask()
+    t0.suggest_float("x", 0, 10)
+    t0.report(5.0, 0)
+    study.tell(t0, 5.0)
+
+    # 第二个 trial 中间值 = 100.0 → 远高于中位数 → 应被剪枝
+    t1 = study.ask()
+    t1.suggest_float("x", 0, 10)
+    t1.report(100.0, 0)
+    assert t1.should_prune() == True
+
+def test_median_pruner_warmup():
+    """Rust: test_python_cross_median_warmup"""
+    # warmup 期间不剪枝
+    study = optuna.create_study(
+        pruner=optuna.pruners.MedianPruner(n_startup_trials=0, n_warmup_steps=5)
+    )
+    t0 = study.ask()
+    t0.suggest_float("x", 0, 10)
+    t0.report(1.0, 0)
+    study.tell(t0, 1.0)
+
+    t1 = study.ask()
+    t1.suggest_float("x", 0, 10)
+    t1.report(999.0, 2)  # step=2 < warmup=5
+    assert t1.should_prune() == False
+
+# ═══════════════════════════════════════════════════════════════════════════
+#  21. SuccessiveHalving — 对应 Rust pruners/successive_halving.rs
+# ═══════════════════════════════════════════════════════════════════════════
+
+def test_successive_halving_basic():
+    """Rust: test_python_cross_successive_halving"""
+    pruner = optuna.pruners.SuccessiveHalvingPruner(
+        min_resource=1, reduction_factor=2, min_early_stopping_rate=0
+    )
+    study = optuna.create_study(pruner=pruner)
+    # rung 0: min_resource=1 → step 0
+    # rung 1: 1 * 2^1 = 2 → step 1
+    results = []
+    for i in range(4):
+        trial = study.ask()
+        trial.suggest_float("x", 0, 10)
+        trial.report(float(i), 0)
+        pruned = trial.should_prune()
+        results.append(pruned)
+        if pruned:
+            study.tell(trial, state=optuna.trial.TrialState.PRUNED)
+        else:
+            study.tell(trial, float(i))
+    # 前几个试验不应该被剪（startup trial 限制）
+    assert results[0] == False  # 第一个试验不剪
+
+# ═══════════════════════════════════════════════════════════════════════════
+#  22. Study best_value / best_params — 对应 Rust study/core.rs
+# ═══════════════════════════════════════════════════════════════════════════
+
+def test_study_best_value_minimize():
+    """Rust: test_python_cross_best_value_min"""
+    study = optuna.create_study(direction="minimize")
+    study.optimize(lambda t: t.suggest_float("x", 0, 10), n_trials=30)
+    assert study.best_value == min(t.values[0] for t in study.trials)
+
+def test_study_best_value_maximize():
+    """Rust: test_python_cross_best_value_max"""
+    study = optuna.create_study(direction="maximize")
+    study.optimize(lambda t: t.suggest_float("x", 0, 10), n_trials=30)
+    assert study.best_value == max(t.values[0] for t in study.trials)
+
+def test_study_best_params():
+    """Rust: test_python_cross_best_params"""
+    study = optuna.create_study(direction="minimize")
+    study.optimize(lambda t: t.suggest_float("x", 0, 10), n_trials=30)
+    assert "x" in study.best_params
+    assert study.best_params["x"] == study.best_trial.params["x"]
+
+# ═══════════════════════════════════════════════════════════════════════════
+#  23. Study add_trial — 对应 Rust study/core.rs add_trial
+# ═══════════════════════════════════════════════════════════════════════════
+
+def test_study_add_trial():
+    """Rust: test_python_cross_add_trial"""
+    from optuna.trial import create_trial
+    study = optuna.create_study()
+    ft = create_trial(
+        state=optuna.trial.TrialState.COMPLETE,
+        values=[1.5],
+        params={"x": 0.5},
+        distributions={"x": FloatDistribution(0, 1)},
+    )
+    study.add_trial(ft)
+    assert len(study.trials) == 1
+    assert study.trials[0].values[0] == 1.5
+    assert study.trials[0].params["x"] == 0.5
+
+# ═══════════════════════════════════════════════════════════════════════════
+#  24. Study metric_names — 对应 Rust study/core.rs set_metric_names
+# ═══════════════════════════════════════════════════════════════════════════
+
+def test_study_metric_names():
+    """Rust: test_python_cross_metric_names"""
+    study = optuna.create_study(directions=["minimize", "maximize"])
+    study.set_metric_names(["loss", "accuracy"])
+    assert study.metric_names == ["loss", "accuracy"]
+
+# ═══════════════════════════════════════════════════════════════════════════
+#  25. IntersectionSearchSpace — 对应 Rust search_space/intersection.rs
+# ═══════════════════════════════════════════════════════════════════════════
+
+def test_intersection_search_space():
+    """Rust: test_python_cross_intersection_ss"""
+    from optuna.search_space import IntersectionSearchSpace
+    study = optuna.create_study()
+    # trial 0: x, y
+    t0 = study.ask()
+    t0.suggest_float("x", 0, 1)
+    t0.suggest_float("y", 0, 1)
+    study.tell(t0, 0.5)
+    # trial 1: x, z
+    t1 = study.ask()
+    t1.suggest_float("x", 0, 1)
+    t1.suggest_float("z", 0, 1)
+    study.tell(t1, 0.5)
+    # 交集应该只有 x
+    iss = IntersectionSearchSpace()
+    space = iss.calculate(study)
+    assert "x" in space
+    assert "y" not in space
+    assert "z" not in space
+
+# ═══════════════════════════════════════════════════════════════════════════
+#  26. TrialState — 对应 Rust trial/state.rs
+# ═══════════════════════════════════════════════════════════════════════════
+
+def test_trial_state_is_finished():
+    """Rust: test_python_cross_trial_state"""
+    from optuna.trial import TrialState
+    assert TrialState.RUNNING.is_finished() == False
+    assert TrialState.COMPLETE.is_finished() == True
+    assert TrialState.PRUNED.is_finished() == True
+    assert TrialState.FAIL.is_finished() == True
+    assert TrialState.WAITING.is_finished() == False
+
+# ═══════════════════════════════════════════════════════════════════════════
+#  27. FrozenTrial validate — 对应 Rust trial/frozen.rs validate
+# ═══════════════════════════════════════════════════════════════════════════
+
+def test_frozen_trial_validate_complete_no_values():
+    """Rust: test_python_cross_ft_validate_no_values"""
+    from optuna.trial import create_trial
+    try:
+        ft = create_trial(
+            state=optuna.trial.TrialState.COMPLETE,
+            values=None,
+        )
+        ft._validate()
+        assert False, "should raise"
+    except ValueError:
+        pass
+
+def test_frozen_trial_validate_complete_nan():
+    """Rust: test_python_cross_ft_validate_nan"""
+    from optuna.trial import create_trial
+    try:
+        ft = create_trial(
+            state=optuna.trial.TrialState.COMPLETE,
+            values=[float('nan')],
+        )
+        ft._validate()
+        assert False, "should raise"
+    except ValueError:
+        pass
+
+def test_frozen_trial_last_step():
+    """Rust: test_python_cross_ft_last_step"""
+    from optuna.trial import create_trial
+    ft = create_trial(
+        state=optuna.trial.TrialState.COMPLETE,
+        values=[1.0],
+        intermediate_values={0: 1.0, 5: 2.0, 3: 1.5},
+    )
+    assert ft.last_step == 5
+
+# ═══════════════════════════════════════════════════════════════════════════
+#  28. RetryFailedTrialCallback — 对应 Rust callbacks/mod.rs
+# ═══════════════════════════════════════════════════════════════════════════
+
+def test_retry_failed_trial_callback():
+    """Rust: test_python_cross_retry_callback"""
+    call_count = 0
+    def objective(trial):
+        nonlocal call_count
+        call_count += 1
+        x = trial.suggest_float("x", 0, 1)
+        if call_count <= 2:
+            raise RuntimeError("simulated failure")
+        return x
+
+    from optuna.study import MaxTrialsCallback
+    study = optuna.create_study()
+    cb = optuna.storages.RetryFailedTrialCallback(max_retry=3)
+    study.optimize(objective, n_trials=10, callbacks=[cb, MaxTrialsCallback(5)],
+                   catch=(RuntimeError,))
+    failed = [t for t in study.trials if t.state == optuna.trial.TrialState.FAIL]
+    assert len(failed) >= 1  # 至少有失败的试验被重试
+
+# ═══════════════════════════════════════════════════════════════════════════
 #  执行
 # ═══════════════════════════════════════════════════════════════════════════
 

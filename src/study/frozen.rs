@@ -15,3 +15,88 @@ pub struct FrozenStudy {
     pub user_attrs: HashMap<String, serde_json::Value>,
     pub system_attrs: HashMap<String, serde_json::Value>,
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 对齐 Python: FrozenStudy 基本构造
+    #[test]
+    fn test_frozen_study_basic() {
+        let fs = FrozenStudy {
+            study_id: 1,
+            study_name: "test_study".to_string(),
+            directions: vec![StudyDirection::Minimize],
+            user_attrs: HashMap::new(),
+            system_attrs: HashMap::new(),
+        };
+        assert_eq!(fs.study_id, 1);
+        assert_eq!(fs.study_name, "test_study");
+        assert_eq!(fs.directions.len(), 1);
+    }
+
+    /// 对齐 Python: FrozenStudy Clone
+    #[test]
+    fn test_frozen_study_clone() {
+        let fs = FrozenStudy {
+            study_id: 2,
+            study_name: "cloned".to_string(),
+            directions: vec![StudyDirection::Minimize, StudyDirection::Maximize],
+            user_attrs: HashMap::new(),
+            system_attrs: HashMap::new(),
+        };
+        let fs2 = fs.clone();
+        assert_eq!(fs2.study_id, 2);
+        assert_eq!(fs2.directions.len(), 2);
+    }
+
+    /// 对齐 Python: FrozenStudy 多目标方向
+    #[test]
+    fn test_frozen_study_multi_objective() {
+        let fs = FrozenStudy {
+            study_id: 3,
+            study_name: "multi".to_string(),
+            directions: vec![
+                StudyDirection::Minimize,
+                StudyDirection::Maximize,
+                StudyDirection::Minimize,
+            ],
+            user_attrs: HashMap::new(),
+            system_attrs: HashMap::new(),
+        };
+        assert_eq!(fs.directions[0], StudyDirection::Minimize);
+        assert_eq!(fs.directions[1], StudyDirection::Maximize);
+        assert_eq!(fs.directions[2], StudyDirection::Minimize);
+    }
+
+    /// 对齐 Python: FrozenStudy 带 user_attrs
+    #[test]
+    fn test_frozen_study_with_attrs() {
+        let mut ua = HashMap::new();
+        ua.insert("key".to_string(), serde_json::json!("value"));
+        let fs = FrozenStudy {
+            study_id: 4,
+            study_name: "attrs".to_string(),
+            directions: vec![StudyDirection::Minimize],
+            user_attrs: ua,
+            system_attrs: HashMap::new(),
+        };
+        assert_eq!(fs.user_attrs["key"], serde_json::json!("value"));
+    }
+
+    /// 对齐 Python: FrozenStudy serde 序列化/反序列化
+    #[test]
+    fn test_frozen_study_serde_roundtrip() {
+        let fs = FrozenStudy {
+            study_id: 5,
+            study_name: "serde_test".to_string(),
+            directions: vec![StudyDirection::Maximize],
+            user_attrs: HashMap::new(),
+            system_attrs: HashMap::new(),
+        };
+        let json = serde_json::to_string(&fs).unwrap();
+        let fs2: FrozenStudy = serde_json::from_str(&json).unwrap();
+        assert_eq!(fs2.study_id, 5);
+        assert_eq!(fs2.study_name, "serde_test");
+    }
+}

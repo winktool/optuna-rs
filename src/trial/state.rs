@@ -54,5 +54,39 @@ mod tests {
     fn test_display() {
         assert_eq!(format!("{}", TrialState::Running), "RUNNING");
         assert_eq!(format!("{}", TrialState::Complete), "COMPLETE");
+        assert_eq!(format!("{}", TrialState::Pruned), "PRUNED");
+        assert_eq!(format!("{}", TrialState::Fail), "FAIL");
+        assert_eq!(format!("{}", TrialState::Waiting), "WAITING");
+    }
+
+    /// 对齐 Python: TrialState repr 值
+    #[test]
+    fn test_repr_values() {
+        assert_eq!(TrialState::Running as u8, 0);
+        assert_eq!(TrialState::Complete as u8, 1);
+        assert_eq!(TrialState::Pruned as u8, 2);
+        assert_eq!(TrialState::Fail as u8, 3);
+        assert_eq!(TrialState::Waiting as u8, 4);
+    }
+
+    /// 对齐 Python: TrialState 可以 Hash
+    #[test]
+    fn test_hash() {
+        use std::collections::HashSet;
+        let mut set = HashSet::new();
+        set.insert(TrialState::Running);
+        set.insert(TrialState::Complete);
+        set.insert(TrialState::Running);  // 重复
+        assert_eq!(set.len(), 2);
+    }
+
+    /// 对齐 Python: TrialState 可以 Clone/Copy
+    #[test]
+    fn test_clone_copy() {
+        let s = TrialState::Running;
+        let s2 = s;  // Copy
+        let s3 = s.clone();  // Clone
+        assert_eq!(s, s2);
+        assert_eq!(s, s3);
     }
 }

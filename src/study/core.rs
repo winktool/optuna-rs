@@ -1778,4 +1778,205 @@ mod tests {
         let x = trial.suggest_float_default("x", 0.0, 1.0).unwrap();
         assert!((x - 0.33).abs() < 1e-12);
     }
+
+    // ── 对齐 Python 交叉验证 17: ask/tell 工作流 ──
+
+    /// 对齐 Python test_study_ask_tell_basic
+    #[test]
+    fn test_python_cross_ask_tell_basic() {
+        let study = create_study(
+            None, None, None, None, Some(StudyDirection::Minimize), None, false,
+        ).unwrap();
+        let mut trial = study.ask(None).unwrap();
+        let x = trial.suggest_float_default("x", -5.0, 5.0).unwrap();
+        study.tell(trial.trial_id(), TrialState::Complete, Some(&[x * x])).unwrap();
+        let trials = study.trials().unwrap();
+        assert_eq!(trials.len(), 1);
+        assert_eq!(trials[0].state, TrialState::Complete);
+        assert!((trials[0].values.as_ref().unwrap()[0] - x * x).abs() < 1e-12);
+    }
+
+    /// 对齐 Python test_study_ask_tell_pruned
+    #[test]
+    fn test_python_cross_ask_tell_pruned() {
+        let study = create_study(
+            None, None, None, None, Some(StudyDirection::Minimize), None, false,
+        ).unwrap();
+        let mut trial = study.ask(None).unwrap();
+        trial.suggest_float_default("x", 0.0, 1.0).unwrap();
+        trial.report(99.0, 0).unwrap();
+        study.tell(trial.trial_id(), TrialState::Pruned, None).unwrap();
+        let ft = &study.trials().unwrap()[0];
+        assert_eq!(ft.state, TrialState::Pruned);
+    }
+
+    /// 对齐 Python test_study_ask_tell_fail
+    #[test]
+    fn test_python_cross_ask_tell_fail() {
+        let study = create_study(
+            None, None, None, None, Some(StudyDirection::Minimize), None, false,
+        ).unwrap();
+        let mut trial = study.ask(None).unwrap();
+        trial.suggest_float_default("x", 0.0, 1.0).unwrap();
+        study.tell(trial.trial_id(), TrialState::Fail, None).unwrap();
+        let ft = &study.trials().unwrap()[0];
+        assert_eq!(ft.state, TrialState::Fail);
+        assert!(ft.values.is_none());
+    }
+
+    // ── 对齐 Python 交叉验证 18: enqueue_trial ──
+
+    /// 对齐 Python test_study_enqueue_trial
+    #[test]
+    fn test_python_cross_enqueue_trial() {
+        let study = create_study(
+            None, None, None, None, Some(StudyDirection::Minimize), None, false,
+        ).unwrap();
+        use crate::distributions::ParamValue;
+        let mut p1 = HashMap::new();
+        p1.insert("x".to_string(), ParamValue::Float(3.0));
+        p1.insert("y".to_string(), ParamValue::Float(4.0));
+        study.enqueue_trial(p1, None, false).unwrap();
+        let mut p2 = HashMap::new();
+        p2.insert("x".to_string(), ParamValue::Float(-1.0));
+        p2.insert("y".to_string(), ParamValue::Float(2.0));
+        study.enqueue_trial(p2, None, false).unwrap();
+
+        study.optimize(|trial| {
+            let x = trial.suggest_float("x", -10.0, 10.0, false, None)?;
+            let y = trial.suggest_float("y", -10.0, 10.0, false, None)?;
+            Ok(x * x + y * y)
+        }, Some(2), None, None).unwrap();
+
+        let trials = study.trials().unwrap();
+        let x0 = match &trials[0].params["x"] { ParamValue::Float(v) => *v, _ => panic!() };
+        assert!((x0 - 3.0).abs() < 1e-12);
+        assert!((trials[0].values.as_ref().unwrap()[0] - 25.0).abs() < 1e-12);
+        let x1 = match &trials[1].params["x"] { ParamValue::Float(v) => *v, _ => panic!() };
+        assert!((x1 - (-1.0)).abs() < 1e-12);
+        assert!((trials[1].values.as_ref().unwrap()[0] - 5.0).abs() < 1e-12);
+    }
+
+    // ── 对齐 Python 交叉验证 19: 多目标 ──
+
+    /// 对齐 Python test_multi_objective_basic
+    #[test]
+    fn test_python_cross_multi_objective() {
+        let study = create_study(
+            None, None, None, None, None,
+            Some(vec![StudyDirection::Minimize, StudyDirection::Maximize]),
+            false,
+        ).unwrap();
+        assert_eq!(study.directions().len(), 2);
+        assert_eq!(study.directions()[0], StudyDirection::Minimize);
+        assert_eq!(study.directions()[1], StudyDirection::Maximize);
+
+        study.optimize_multi(|trial| {
+            let x = trial.suggest_float("x", 0.0, 1.0, false, None)?;
+            Ok(vec![x, 1.0 - x])
+        }, Some(20), None, None).unwrap();
+
+        let best = study.best_trials().unwrap();
+        assert!(!best.is_empty());
+    }
+
+    /// 对齐 Python test_multi_objective_best_trials
+    #[test]
+    fn test_python_cross_multi_obj_best_trials() {
+        let study = create_study(
+            None, None, None, None, None,
+            Some(vec![StudyDirection::Minimize, StudyDirection::Minimize]),
+            false,
+        ).unwrap();
+        let test_values: Vec<(f64, f64)> = vec![(1.0, 3.0), (2.0, 2.0), (3.0, 1.0), (2.0, 3.0)];
+        for (v1, v2) in &test_values {
+            let mut trial = study.ask(None).unwrap();
+            trial.suggest_float_default("x", 0.0, 10.0).unwrap();
+            study.tell(trial.trial_id(), TrialState::Complete, Some(&[*v1, *v2])).unwrap();
+        }
+        let bests = study.best_trials().unwrap();
+        let best_values: Vec<(f64, f64)> = bests.iter()
+            .map(|t| (t.values.as_ref().unwrap()[0], t.values.as_ref().unwrap()[1]))
+            .collect();
+        // (2,3) 被 (2,2) 支配，不应在 Pareto 前沿
+        assert!(!best_values.contains(&(2.0, 3.0)));
+        assert_eq!(bests.len(), 3);
+    }
+
+    // ── 对齐 Python 交叉验证 22: best_value ──
+
+    /// 对齐 Python test_study_best_value_minimize
+    #[test]
+    fn test_python_cross_best_value_min() {
+        let study = create_study(
+            None, None, None, None, Some(StudyDirection::Minimize), None, false,
+        ).unwrap();
+        study.optimize(|trial| {
+            let x = trial.suggest_float("x", 0.0, 10.0, false, None)?;
+            Ok(x)
+        }, Some(30), None, None).unwrap();
+        let best = study.best_value().unwrap();
+        let min_val = study.trials().unwrap().iter()
+            .map(|t| t.values.as_ref().unwrap()[0])
+            .fold(f64::INFINITY, f64::min);
+        assert!((best - min_val).abs() < 1e-12);
+    }
+
+    /// 对齐 Python test_study_best_value_maximize
+    #[test]
+    fn test_python_cross_best_value_max() {
+        let study = create_study(
+            None, None, None, None, Some(StudyDirection::Maximize), None, false,
+        ).unwrap();
+        study.optimize(|trial| {
+            let x = trial.suggest_float("x", 0.0, 10.0, false, None)?;
+            Ok(x)
+        }, Some(30), None, None).unwrap();
+        let best = study.best_value().unwrap();
+        let max_val = study.trials().unwrap().iter()
+            .map(|t| t.values.as_ref().unwrap()[0])
+            .fold(f64::NEG_INFINITY, f64::max);
+        assert!((best - max_val).abs() < 1e-12);
+    }
+
+    // ── 对齐 Python 交叉验证 23: add_trial ──
+
+    /// 对齐 Python test_study_add_trial
+    #[test]
+    fn test_python_cross_add_trial() {
+        let study = create_study(
+            None, None, None, None, Some(StudyDirection::Minimize), None, false,
+        ).unwrap();
+        use crate::distributions::{FloatDistribution, ParamValue};
+        let mut params = HashMap::new();
+        params.insert("x".to_string(), ParamValue::Float(0.5));
+        let mut dists = HashMap::new();
+        dists.insert("x".to_string(),
+            Distribution::FloatDistribution(FloatDistribution::new(0.0, 1.0, false, None).unwrap()));
+        let now = chrono::Utc::now();
+        let ft = FrozenTrial::new(
+            0, TrialState::Complete, Some(1.5), None,
+            Some(now), Some(now), params, dists,
+            HashMap::new(), HashMap::new(), HashMap::new(), 0,
+        ).unwrap();
+        study.add_trial(&ft).unwrap();
+        let trials = study.trials().unwrap();
+        assert_eq!(trials.len(), 1);
+        assert!((trials[0].values.as_ref().unwrap()[0] - 1.5).abs() < 1e-12);
+    }
+
+    // ── 对齐 Python 交叉验证 24: metric_names ──
+
+    /// 对齐 Python test_study_metric_names
+    #[test]
+    fn test_python_cross_metric_names() {
+        let study = create_study(
+            None, None, None, None, None,
+            Some(vec![StudyDirection::Minimize, StudyDirection::Maximize]),
+            false,
+        ).unwrap();
+        study.set_metric_names(&["loss", "accuracy"]).unwrap();
+        let names = study.metric_names().unwrap().unwrap();
+        assert_eq!(names, vec!["loss".to_string(), "accuracy".to_string()]);
+    }
 }

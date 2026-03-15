@@ -53,4 +53,34 @@ mod tests {
         assert!(OptunaError::ValueError("bad".into()).to_string().contains("bad"));
         assert!(OptunaError::InvalidDistribution("x".into()).to_string().contains("x"));
     }
+
+    /// 对齐 Python: DuplicatedStudyError 包含研究名
+    #[test]
+    fn test_duplicated_study_error() {
+        let e = OptunaError::DuplicatedStudyError("my_study".into());
+        assert!(e.to_string().contains("my_study"));
+    }
+
+    /// 对齐 Python: StorageInternalError 信息传递
+    #[test]
+    fn test_storage_internal_error() {
+        let e = OptunaError::StorageInternalError("db crash".into());
+        assert!(e.to_string().contains("db crash"));
+    }
+
+    /// 对齐 Python: UpdateFinishedTrialError 信息传递
+    #[test]
+    fn test_update_finished_trial_error() {
+        let e = OptunaError::UpdateFinishedTrialError("trial #5".into());
+        assert!(e.to_string().contains("trial #5"));
+    }
+
+    /// 确保 Result 类型别名工作正常
+    #[test]
+    fn test_result_alias() {
+        let ok: Result<i32> = Ok(42);
+        assert_eq!(ok.unwrap(), 42);
+        let err: Result<i32> = Err(OptunaError::TrialPruned);
+        assert!(err.is_err());
+    }
 }

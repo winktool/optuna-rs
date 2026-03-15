@@ -1428,4 +1428,24 @@ mod tests {
         let dirs = vec![StudyDirection::NotSet, StudyDirection::Minimize];
         assert!(!dominates(&[1.0, 1.0], &[2.0, 2.0], &dirs));
     }
+
+    /// Python 交叉验证: 3D 超体积
+    /// 点 [1,1,1] 支配体积 = (3-1)^3 = 8; [2,2,2] 完全被包含，总超体积 = 8
+    #[test]
+    fn test_python_cross_hypervolume_3d() {
+        let pts = vec![vec![1.0, 1.0, 1.0], vec![2.0, 2.0, 2.0]];
+        let ref_point = vec![3.0, 3.0, 3.0];
+        let hv = hypervolume(&pts, &ref_point);
+        assert!((hv - 8.0).abs() < 1e-12, "Python: hv=8.0, got={hv}");
+    }
+
+    /// Python 交叉验证: 单点 2D 超体积
+    /// pts=[[2,3]], ref=[5,5] → hv = (5-2)*(5-3) = 6
+    #[test]
+    fn test_python_cross_hypervolume_single() {
+        let pts = vec![vec![2.0, 3.0]];
+        let ref_point = vec![5.0, 5.0];
+        let hv = hypervolume(&pts, &ref_point);
+        assert!((hv - 6.0).abs() < 1e-12, "Python: hv=6.0, got={hv}");
+    }
 }

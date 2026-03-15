@@ -109,11 +109,18 @@ impl SearchSpaceTransform {
 
             match (dist, value) {
                 (Distribution::CategoricalDistribution(d), ParamValue::Categorical(choice)) => {
-                    let idx = d
-                        .choices
-                        .iter()
-                        .position(|c| c == choice)
-                        .unwrap_or(0);
+                    // 对齐 Python: 分类参数必须在 choices 中，否则为配置错误。
+                    // Python 使用 to_internal_repr 会抛 ValueError；这里回退到 index 0 并警告。
+                    let idx = match d.choices.iter().position(|c| c == choice) {
+                        Some(i) => i,
+                        None => {
+                            crate::optuna_warn!(
+                                "Categorical value {:?} not found in choices {:?}, defaulting to index 0.",
+                                choice, d.choices
+                            );
+                            0
+                        }
+                    };
                     encoded[range.start + idx] = 1.0;
                 }
                 (Distribution::FloatDistribution(d), ParamValue::Float(v)) => {
@@ -636,6 +643,105 @@ mod tests {
         let decoded = t.untransform(&encoded).unwrap();
         match decoded.get("x").unwrap() {
             ParamValue::Float(v) => assert!((*v - 0.5).abs() < 1e-10, "Python: untransform_step_x=0.5"),
+            _ => panic!("expected float"),
+        }
+    }
+
+    /// Python 交叉验证: CategoricalDistribution one-hot 编码
+    /// Python: transform({"c": "b"}) == [0, 1, 0]; untransform([0, 1, 0]) == "b"
+    #[test]
+    fn test_python_cross_transform_cat() {
+        let mut space = IndexMap::new();
+        space.insert(
+            "c".into(),
+            Distribution::CategoricalDistribution(
+                CategoricalDistribution::new(vec![
+                    CategoricalChoice::Str("a".into()),
+                    CategoricalChoice::Str("b".into()),
+                    CategoricalChoice::Str("c".into()),
+                ]).unwrap(),
+            ),
+        );
+        let t = SearchSpaceTransform::with_defaults(space);
+        let mut params = IndexMap::new();
+        params.insert("c".into(), ParamValue::Categorical(CategoricalChoice::Str("b".into())));
+        let encoded = t.transform(&params);
+        assert_eq!(encoded.len(), 3);
+        assert!((encoded[0] - 0.0).abs() < 1e-12);
+        assert!((encoded[1] - 1.0).abs() < 1e-12);
+        assert!((encoded[2] - 0.0).abs() < 1e-12);
+        let decoded = t.untransform(&encoded).unwrap();
+        assert_eq!(
+            decoded.get("c").unwrap(),
+            &ParamValue::Categorical(CategoricalChoice::Str("b".into()))
+        );
+    }
+
+    /// Python 交叉验证: IntDistribution(1, 100, log=True) transform
+    /// Python: transform({"n": 10}) == ln(10); untransform → 10
+    #[test]
+    fn test_python_cross_transform_int_log() {
+        let mut space = IndexMap::new();
+        space.insert(
+            "n".into(),
+            Distribution::IntDistribution(IntDistribution::new(1, 100, true, 1).unwrap()),
+        );
+        let t = SearchSpaceTransform::with_defaults(space);
+        let mut params = IndexMap::new();
+        params.insert("n".into(), ParamValue::Int(10));
+        let encoded = t.transform(&params);
+        assert!((encoded[0] - 10.0_f64.ln()).abs() < 1e-12);
+        let decoded = t.untransform(&encoded).unwrap();
+        assert_eq!(decoded.get("n").unwrap(), &ParamValue::Int(10));
+    }
+
+    /// Python 交叉验证: FloatDistribution(0.0, 1.0, step=0.25) bounds
+    /// Python: bounds = [-0.125, 1.125] (half_step = 0.125)
+    #[test]
+    fn test_python_cross_transform_bounds() {
+        let mut space = IndexMap::new();
+        space.insert(
+            "x".into(),
+            Distribution::FloatDistribution(FloatDistribution::new(0.0, 1.0, false, Some(0.25)).unwrap()),
+        );
+        let t = SearchSpaceTransform::with_defaults(space);
+        let bounds = t.bounds();
+        assert!((bounds[0][0] - (-0.125)).abs() < 1e-12, "lo={}", bounds[0][0]);
+        assert!((bounds[0][1] - 1.125).abs() < 1e-12, "hi={}", bounds[0][1]);
+    }
+
+    /// Python 交叉验证: IntDistribution(0, 10, step=2) bounds
+    /// Python: bounds = [-1.0, 11.0] (half_step = 1.0)
+    #[test]
+    fn test_python_cross_transform_int_step_bounds() {
+        let mut space = IndexMap::new();
+        space.insert(
+            "n".into(),
+            Distribution::IntDistribution(IntDistribution::new(0, 10, false, 2).unwrap()),
+        );
+        let t = SearchSpaceTransform::with_defaults(space);
+        let bounds = t.bounds();
+        assert!((bounds[0][0] - (-1.0)).abs() < 1e-12);
+        assert!((bounds[0][1] - 11.0).abs() < 1e-12);
+    }
+
+    /// Python 交叉验证: transform_0_1=true 缩放到 [0,1]
+    /// Python: transform({"x": 5.0}) == 0.5 for FloatDist(0, 10)
+    #[test]
+    fn test_python_cross_transform_01() {
+        let mut space = IndexMap::new();
+        space.insert(
+            "x".into(),
+            Distribution::FloatDistribution(FloatDistribution::new(0.0, 10.0, false, None).unwrap()),
+        );
+        let t = SearchSpaceTransform::new(space, true, true, true);
+        let mut params = IndexMap::new();
+        params.insert("x".into(), ParamValue::Float(5.0));
+        let encoded = t.transform(&params);
+        assert!((encoded[0] - 0.5).abs() < 1e-12, "Python: 0-1 scaled = 0.5");
+        let decoded = t.untransform(&encoded).unwrap();
+        match decoded.get("x").unwrap() {
+            ParamValue::Float(v) => assert!((*v - 5.0).abs() < 1e-10),
             _ => panic!("expected float"),
         }
     }

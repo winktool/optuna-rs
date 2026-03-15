@@ -358,4 +358,22 @@ mod tests {
         assert!((p50 - 5.5).abs()  < 1e-10, "Python: percentile_50=5.5, got {p50}");
         assert!((p75 - 7.75).abs() < 1e-10, "Python: percentile_75=7.75, got {p75}");
     }
+
+    /// Python 交叉验证: 边界情况
+    /// Python: np.percentile([5.0], 50) = 5.0
+    /// Python: np.percentile([1.0, 3.0], 50) = 2.0
+    /// Python: np.percentile([1.0, 3.0], 25) = 1.5
+    #[test]
+    fn test_python_cross_percentile_edge() {
+        // 单个值
+        assert!((nan_percentile(&[5.0], 50.0) - 5.0).abs() < 1e-12);
+        assert!((nan_percentile(&[5.0], 0.0) - 5.0).abs() < 1e-12);
+        assert!((nan_percentile(&[5.0], 100.0) - 5.0).abs() < 1e-12);
+        // 两个值的线性插值
+        assert!((nan_percentile(&[1.0, 3.0], 50.0) - 2.0).abs() < 1e-12);
+        assert!((nan_percentile(&[1.0, 3.0], 25.0) - 1.5).abs() < 1e-12);
+        // 不均匀间距
+        let p50 = nan_percentile(&[1.0, 10.0, 100.0], 50.0);
+        assert!((p50 - 10.0).abs() < 1e-12, "Python: p50=10.0, got {p50}");
+    }
 }

@@ -47,11 +47,11 @@ pub fn default_weights(n: usize) -> Vec<f64> {
     let mut w = Vec::with_capacity(n);
     let ramp_len = n - 25;
     // 对齐 Python np.linspace(1.0/n, 1.0, num=ramp_len)
+    // 注意: np.linspace(start, stop, num=1) 返回 [start]，而非 [stop]
+    let start = 1.0 / n as f64;
     if ramp_len == 1 {
-        // np.linspace(start, 1.0, num=1) returns [1.0]
-        w.push(1.0);
+        w.push(start);
     } else {
-        let start = 1.0 / n as f64;
         let step = (1.0 - start) / (ramp_len as f64 - 1.0);
         for i in 0..ramp_len {
             w.push(start + step * i as f64);
@@ -940,10 +940,19 @@ mod tests {
 
     #[test]
     fn test_default_weights_edge_n26_matches_python() {
-        // Python: n=26 => np.linspace(1/26, 1.0, num=1) + ones(25) => all 1.0
+        // Python: n=26 => np.linspace(1/26, 1.0, num=1) = [1/26] (num=1时返回start)
+        // 后接 ones(25)
         let w = default_weights(26);
         assert_eq!(w.len(), 26);
-        assert!(w.iter().all(|x| (*x - 1.0).abs() < 1e-12));
+        // 第一个权重 = 1/26 ≈ 0.0385
+        assert!(
+            (w[0] - 1.0 / 26.0).abs() < 1e-12,
+            "w[0]={}, expected={}",
+            w[0],
+            1.0 / 26.0
+        );
+        // 后 25 个权重全为 1.0
+        assert!(w[1..].iter().all(|x| (*x - 1.0).abs() < 1e-12));
     }
 
     #[test]
@@ -952,5 +961,38 @@ mod tests {
         let w = default_weights(100);
         assert_eq!(w.len(), 100);
         assert!((w[74] - 1.0).abs() < 1e-12);
+    }
+
+    /// Python 交叉验证: n=0/1/24/25/30 的权重
+    #[test]
+    fn test_python_cross_default_weights_all_cases() {
+        // n=0 → 空
+        assert!(default_weights(0).is_empty());
+        // n=1 → [1.0]
+        assert_eq!(default_weights(1), vec![1.0]);
+        // n=24 → 全 1.0
+        let w24 = default_weights(24);
+        assert_eq!(w24.len(), 24);
+        assert!(w24.iter().all(|x| (*x - 1.0).abs() < 1e-12));
+        // n=25 → 全 1.0（边界: ramp_len=0 走 n<25 分支）
+        let w25 = default_weights(25);
+        assert_eq!(w25.len(), 25);
+        // n=30 → 5 个斜坡 + 25 个 flat
+        // Python: np.linspace(1/30, 1.0, num=5) ≈ [0.0333, 0.275, 0.5167, 0.7583, 1.0]
+        let w30 = default_weights(30);
+        assert_eq!(w30.len(), 30);
+        let start = 1.0 / 30.0;
+        let step = (1.0 - start) / 4.0;
+        for i in 0..5 {
+            let expected = start + step * i as f64;
+            assert!(
+                (w30[i] - expected).abs() < 1e-12,
+                "w30[{i}]={}, expected={expected}", w30[i]
+            );
+        }
+        // 最后一个斜坡值必须是 1.0
+        assert!((w30[4] - 1.0).abs() < 1e-12);
+        // flat 部分全 1.0
+        assert!(w30[5..].iter().all(|x| (*x - 1.0).abs() < 1e-12));
     }
 }

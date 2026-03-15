@@ -301,4 +301,27 @@ mod tests {
         assert!(d.to_internal_repr(-1).is_err());
         assert!(d.to_internal_repr(1).is_ok());
     }
+
+    /// Python 交叉验证: IntDistribution(0, 100, step=5) repr 往返
+    #[test]
+    fn test_python_cross_int_repr() {
+        let d = IntDistribution::new(0, 100, false, 5).unwrap();
+        for v in [0i64, 5, 50, 95, 100] {
+            let internal = d.to_internal_repr(v).unwrap();
+            let external = d.to_external_repr(internal);
+            assert_eq!(external, v, "roundtrip failed for {v}");
+        }
+    }
+
+    /// Python 交叉验证: IntDistribution(0, 20, step=7)
+    /// Python: high=14, contains(0)=T, contains(7)=T, contains(14)=T, contains(20)=F
+    #[test]
+    fn test_python_cross_int_step7() {
+        let d = IntDistribution::new(0, 20, false, 7).unwrap();
+        assert_eq!(d.high, 14, "Python: high=14");
+        assert!(d.contains(0.0));
+        assert!(d.contains(7.0));
+        assert!(d.contains(14.0));
+        assert!(!d.contains(20.0));
+    }
 }

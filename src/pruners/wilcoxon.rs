@@ -521,4 +521,38 @@ mod tests {
         assert!(p >= 0.0 && p <= 1.0, "p 值超出 [0,1] 范围: {}", p);
         assert!(p < 0.1, "全正差值应显著 (p < 0.1), 实际 p = {}", p);
     }
+
+    /// Python 交叉验证: 大量并列值
+    /// Python: wilcoxon([1,1,1,-1,-1,2,2,-2,3,0], alt='greater', zsplit).pvalue ≈ 0.171875
+    #[test]
+    fn test_python_cross_wilcoxon_tied() {
+        let diff = vec![1.0, 1.0, 1.0, -1.0, -1.0, 2.0, 2.0, -2.0, 3.0, 0.0];
+        let p = wilcoxon_signed_rank_test(&diff, StudyDirection::Minimize);
+        // Python 精确值: 0.171875; 正态近似允许 0.05 容差
+        assert!(
+            (p - 0.172).abs() < 0.05,
+            "Python p≈0.172, got {p}"
+        );
+    }
+
+    /// Python 交叉验证: normal_cdf 精度
+    /// 对比 scipy.stats.norm.cdf 的精确值
+    /// Abramowitz & Stegun 公式精度约 1.5e-7
+    #[test]
+    fn test_python_cross_normal_cdf() {
+        // Python: norm.cdf(0) = 0.5
+        assert!((normal_cdf(0.0) - 0.5).abs() < 1e-7, "cdf(0)={}", normal_cdf(0.0));
+        // Python: norm.cdf(-3) = 0.001349898031630093
+        assert!((normal_cdf(-3.0) - 0.001349898031630093).abs() < 1e-7);
+        // Python: norm.cdf(3) = 0.9986501019683699
+        assert!((normal_cdf(3.0) - 0.9986501019683699).abs() < 1e-7);
+        // Python: norm.cdf(-1) = 0.15865525393145707
+        assert!((normal_cdf(-1.0) - 0.15865525393145707).abs() < 1e-7);
+        // Python: norm.cdf(1) = 0.8413447460685429
+        assert!((normal_cdf(1.0) - 0.8413447460685429).abs() < 1e-7);
+        // Python: norm.cdf(-2) = 0.022750131948179198
+        assert!((normal_cdf(-2.0) - 0.022750131948179198).abs() < 1e-7);
+        // Python: norm.cdf(2) = 0.9772498680518208
+        assert!((normal_cdf(2.0) - 0.9772498680518208).abs() < 1e-7);
+    }
 }

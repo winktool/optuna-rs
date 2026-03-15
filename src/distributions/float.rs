@@ -324,4 +324,39 @@ mod tests {
         let d = FloatDistribution::new(5.0, 5.0, false, None).unwrap();
         assert!(d.single(), "Python: single=true");
     }
+
+    /// Python 交叉验证: FloatDistribution(0.0, 1.0, step=0.7)
+    /// Python: high=0.7, contains(0.7)=true, contains(0.0)=true, contains(1.0)=false
+    #[test]
+    fn test_python_cross_float_step07() {
+        let d = FloatDistribution::new(0.0, 1.0, false, Some(0.7)).unwrap();
+        assert!((d.high - 0.7).abs() < 1e-12, "Python: high=0.7");
+        assert!(d.contains(0.7), "Python: contains(0.7)=true");
+        assert!(d.contains(0.0), "Python: contains(0.0)=true");
+        assert!(!d.contains(1.0), "Python: contains(1.0)=false");
+    }
+
+    /// Python 交叉验证: repr 往返一致性
+    /// Python: to_external_repr(to_internal_repr(v)) == v
+    #[test]
+    fn test_python_cross_float_repr() {
+        let d = FloatDistribution::new(1.0, 10.0, false, None).unwrap();
+        for v in [1.0, 5.5, 9.999] {
+            let internal = d.to_internal_repr(v).unwrap();
+            let external = d.to_external_repr(internal);
+            assert!((external - v).abs() < 1e-12, "roundtrip failed for {v}");
+        }
+    }
+
+    /// Python 交叉验证: log repr 往返
+    /// Python: to_external_repr(to_internal_repr(v)) == v for log dist
+    #[test]
+    fn test_python_cross_float_log_repr() {
+        let d = FloatDistribution::new(0.01, 100.0, true, None).unwrap();
+        for v in [0.01, 1.0, 50.0, 100.0] {
+            let internal = d.to_internal_repr(v).unwrap();
+            let external = d.to_external_repr(internal);
+            assert!((external - v).abs() < 1e-12);
+        }
+    }
 }

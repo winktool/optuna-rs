@@ -233,14 +233,18 @@ fn wilcoxon_signed_rank_test(diff_values: &[f64], direction: StudyDirection) -> 
     let std_dev = var.sqrt();
 
     // 根据方向选择检验统计量
+    // 对齐 Python scipy: 应用连续性修正 (continuity correction)
     let t_stat = match direction {
         StudyDirection::Maximize => {
             // alternative="less": 检验 current < best → 使用 R-
-            (r_minus - mean) / std_dev
+            let z = (r_minus - mean) / std_dev;
+            // 连续性修正：向零方向收缩 0.5/std_dev
+            if z > 0.0 { (z - 0.5 / std_dev).max(0.0) } else { z + 0.5 / std_dev }
         }
         _ => {
             // alternative="greater": 检验 current > best → 使用 R+
-            (r_plus - mean) / std_dev
+            let z = (r_plus - mean) / std_dev;
+            if z > 0.0 { (z - 0.5 / std_dev).max(0.0) } else { z + 0.5 / std_dev }
         }
     };
 

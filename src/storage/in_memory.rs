@@ -561,6 +561,52 @@ impl Storage for InMemoryStorage {
         let (_, trial_number) = Self::resolve_trial(&inner, trial_id)?;
         Ok(trial_number)
     }
+
+    /// 对齐 Python: 在单一锁作用域内完成 best_trial 查找，避免死锁。
+    /// 使用 `f64::total_cmp` 防止 NaN 导致 panic。
+    fn get_best_trial(&self, study_id: i64) -> Result<FrozenTrial> {
+        let inner = self.inner.lock();
+        let study = Self::get_study(&inner, study_id)?;
+
+        if study.directions.len() > 1 {
+            return Err(OptunaError::ValueError(
+                "best trial can be obtained only for single-objective optimization".into(),
+            ));
+        }
+        let direction = study.directions[0];
+
+        let mut best: Option<&FrozenTrial> = None;
+        for trial in study.trials.iter() {
+            if trial.state != TrialState::Complete {
+                continue;
+            }
+            let v = match trial.values.as_ref().and_then(|vs| vs.first()) {
+                Some(v) => *v,
+                None => continue,
+            };
+            match best {
+                None => best = Some(trial),
+                Some(b) => {
+                    let bv = b.values.as_ref().unwrap()[0];
+                    let is_better = match direction {
+                        StudyDirection::Minimize | StudyDirection::NotSet => {
+                            v.total_cmp(&bv) == std::cmp::Ordering::Less
+                        }
+                        StudyDirection::Maximize => {
+                            v.total_cmp(&bv) == std::cmp::Ordering::Greater
+                        }
+                    };
+                    if is_better {
+                        best = Some(trial);
+                    }
+                }
+            }
+        }
+
+        best.cloned().ok_or_else(|| {
+            OptunaError::ValueError("no trials are completed yet".into())
+        })
+    }
 }
 
 #[cfg(test)]
@@ -1132,5 +1178,69 @@ mod tests {
         storage.set_trial_system_attr(tid, "test_key", serde_json::json!(42)).unwrap();
         let trial = storage.get_trial(tid).unwrap();
         assert_eq!(trial.system_attrs["test_key"], serde_json::json!(42));
+    }
+
+    /// 对齐 Python: get_best_trial 不会死锁（单锁作用域）
+    #[test]
+    fn test_get_best_trial_override_no_deadlock() {
+        let storage = InMemoryStorage::new();
+        let sid = storage.create_new_study(&[StudyDirection::Minimize], None).unwrap();
+        // 创建两个已完成试验
+        let tid1 = storage.create_new_trial(sid, None).unwrap();
+        storage.set_trial_state_values(tid1, TrialState::Complete, Some(&[3.0])).unwrap();
+        let tid2 = storage.create_new_trial(sid, None).unwrap();
+        storage.set_trial_state_values(tid2, TrialState::Complete, Some(&[1.0])).unwrap();
+        // 应返回值最小的试验
+        let best = storage.get_best_trial(sid).unwrap();
+        assert_eq!(best.values, Some(vec![1.0]));
+    }
+
+    /// 对齐 Python: get_best_trial override 在 Maximize 方向返回最大值
+    #[test]
+    fn test_get_best_trial_override_maximize() {
+        let storage = InMemoryStorage::new();
+        let sid = storage.create_new_study(&[StudyDirection::Maximize], None).unwrap();
+        let tid1 = storage.create_new_trial(sid, None).unwrap();
+        storage.set_trial_state_values(tid1, TrialState::Complete, Some(&[3.0])).unwrap();
+        let tid2 = storage.create_new_trial(sid, None).unwrap();
+        storage.set_trial_state_values(tid2, TrialState::Complete, Some(&[5.0])).unwrap();
+        let best = storage.get_best_trial(sid).unwrap();
+        assert_eq!(best.values, Some(vec![5.0]));
+    }
+
+    /// 对齐 Python: get_best_trial 无已完成试验时报 ValueError
+    #[test]
+    fn test_get_best_trial_override_no_complete() {
+        let storage = InMemoryStorage::new();
+        let sid = storage.create_new_study(&[StudyDirection::Minimize], None).unwrap();
+        let _tid = storage.create_new_trial(sid, None).unwrap();
+        // 只有 Running 试验，无 Complete
+        let result = storage.get_best_trial(sid);
+        assert!(result.is_err());
+    }
+
+    /// 对齐 Python: get_best_trial override 多目标时报 ValueError
+    #[test]
+    fn test_get_best_trial_override_multi_objective_error() {
+        let storage = InMemoryStorage::new();
+        let sid = storage.create_new_study(
+            &[StudyDirection::Minimize, StudyDirection::Maximize], None
+        ).unwrap();
+        let result = storage.get_best_trial(sid);
+        assert!(result.is_err());
+    }
+
+    /// 对齐 Python: get_best_trial override 处理 NaN 值不 panic（使用 total_cmp）
+    #[test]
+    fn test_get_best_trial_override_nan_safety() {
+        let storage = InMemoryStorage::new();
+        let sid = storage.create_new_study(&[StudyDirection::Minimize], None).unwrap();
+        let tid1 = storage.create_new_trial(sid, None).unwrap();
+        storage.set_trial_state_values(tid1, TrialState::Complete, Some(&[f64::NAN])).unwrap();
+        let tid2 = storage.create_new_trial(sid, None).unwrap();
+        storage.set_trial_state_values(tid2, TrialState::Complete, Some(&[2.0])).unwrap();
+        // 不应 panic
+        let best = storage.get_best_trial(sid).unwrap();
+        assert_eq!(best.values, Some(vec![2.0]));
     }
 }

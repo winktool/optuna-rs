@@ -33,44 +33,24 @@ use scirs2_core::ndarray::ArrayView1;
 
 #[cfg(feature = "gp-lbfgsb")]
 use crate::samplers::gp::{
-    GPRegressor, DEFAULT_MINIMUM_NOISE_VAR,
+    GPRegressor, KernelParamsCache, DEFAULT_MINIMUM_NOISE_VAR, default_log_prior,
 };
-
-/// Python `optuna.samplers._gp.prior.default_log_prior` 的忠实移植。
-///
-/// 先验分布:
-/// - `inverse_squared_lengthscales`: 自定义惩罚 `-(0.1/x + 0.1*x)`
-/// - `kernel_scale`: Gamma(concentration=2, rate=1)
-/// - `noise_var`: Gamma(concentration=1.1, rate=30)
-#[cfg(feature = "gp-lbfgsb")]
-fn default_log_prior(
-    inverse_squared_lengthscales: &[f64],
-    kernel_scale: f64,
-    noise_var: f64,
-) -> f64 {
-    // inv_sq_ls 先验: -(0.1/x + 0.1*x) 对每个维度求和
-    let ls_prior: f64 = inverse_squared_lengthscales.iter()
-        .map(|&x| -(0.1 / x + 0.1 * x))
-        .sum();
-
-    // kernel_scale ~ Gamma(α=2, β=1): log_prior = (α-1)*log(x) - β*x
-    let ks_prior = (2.0 - 1.0) * kernel_scale.ln() - 1.0 * kernel_scale;
-
-    // noise_var ~ Gamma(α=1.1, β=30): 鼓励小噪声
-    let nv_prior = (1.1 - 1.0) * noise_var.ln() - 30.0 * noise_var;
-
-    ls_prior + ks_prior + nv_prior
-}
 
 /// 从 raw 参数向量 (log 空间) 解码出 GP 超参数。
 ///
 /// 布局: `[log(inv_sq_ls[0]), ..., log(inv_sq_ls[n-1]), log(kernel_scale), log(noise_var - min_noise)]`
+/// 对于 deterministic_objective 模式，只有 d+1 个参数（无 noise_var）。
 #[cfg(feature = "gp-lbfgsb")]
-fn decode_params(params: &[f64], n_dims: usize) -> (Vec<f64>, f64, f64) {
+fn decode_params(params: &[f64], n_dims: usize, deterministic: bool) -> (Vec<f64>, f64, f64) {
     let inv_sq_ls: Vec<f64> = params[..n_dims].iter().map(|&x| x.exp()).collect();
     let kernel_scale = params[n_dims].exp();
-    // noise_var = exp(raw) + minimum_noise，确保 >= minimum_noise
-    let noise_var = DEFAULT_MINIMUM_NOISE_VAR + params[n_dims + 1].exp();
+    let noise_var = if deterministic {
+        DEFAULT_MINIMUM_NOISE_VAR
+    } else {
+        // 对应 Python: noise_var = exp(raw) + 0.99 * minimum_noise
+        // 确保 noise_var >= minimum_noise
+        DEFAULT_MINIMUM_NOISE_VAR + params[n_dims + 1].exp()
+    };
     (inv_sq_ls, kernel_scale, noise_var)
 }
 
@@ -84,8 +64,9 @@ fn neg_log_posterior(
     x_train: &[Vec<f64>],
     y_train: &[f64],
     is_categorical: &[bool],
+    deterministic: bool,
 ) -> f64 {
-    let (inv_sq_ls, kernel_scale, noise_var) = decode_params(params, n_dims);
+    let (inv_sq_ls, kernel_scale, noise_var) = decode_params(params, n_dims, deterministic);
 
     // 防止数值溢出
     if inv_sq_ls.iter().any(|&x| !x.is_finite() || x > 1e10)
@@ -114,111 +95,123 @@ fn neg_log_posterior(
     -(lml + lp)
 }
 
-/// 通过有限差分计算梯度。
+/// 通过中心差分计算梯度。
 ///
-/// Python 用 PyTorch autograd，Rust 使用前向差分近似:
-/// `∂f/∂x_i ≈ (f(x+h*e_i) - f(x)) / h`
+/// Python 用 PyTorch autograd，Rust 使用中心差分近似:
+/// `∂f/∂x_i ≈ (f(x+h*e_i) - f(x-h*e_i)) / (2h)`
 #[cfg(feature = "gp-lbfgsb")]
-fn gradient_finite_diff(
+fn _gradient_finite_diff(
     params: &[f64],
     n_dims: usize,
     x_train: &[Vec<f64>],
     y_train: &[f64],
     is_categorical: &[bool],
+    deterministic: bool,
 ) -> Vec<f64> {
     let h = 1e-5;
     let n = params.len();
-    let f0 = neg_log_posterior(params, n_dims, x_train, y_train, is_categorical);
     let mut grad = vec![0.0; n];
 
     for i in 0..n {
-        let mut params_h = params.to_vec();
-        params_h[i] += h;
-        let f_h = neg_log_posterior(&params_h, n_dims, x_train, y_train, is_categorical);
-        grad[i] = (f_h - f0) / h;
+        let mut params_fwd = params.to_vec();
+        let mut params_bwd = params.to_vec();
+        params_fwd[i] += h;
+        params_bwd[i] -= h;
+        let f_fwd = neg_log_posterior(&params_fwd, n_dims, x_train, y_train, is_categorical, deterministic);
+        let f_bwd = neg_log_posterior(&params_bwd, n_dims, x_train, y_train, is_categorical, deterministic);
+        grad[i] = (f_fwd - f_bwd) / (2.0 * h);
     }
 
     grad
 }
 
+/// 将缓存的核参数编码到 log 空间。
+#[cfg(feature = "gp-lbfgsb")]
+fn encode_cache(cache: &KernelParamsCache, deterministic: bool) -> Vec<f64> {
+    let mut params: Vec<f64> = cache.inverse_squared_lengthscales
+        .iter()
+        .map(|&x| x.ln())
+        .collect();
+    params.push(cache.kernel_scale.ln());
+    if !deterministic {
+        let raw_noise = (cache.noise_var - DEFAULT_MINIMUM_NOISE_VAR).max(1e-12);
+        params.push(raw_noise.ln());
+    }
+    params
+}
+
 /// 使用 L-BFGS-B 优化 GP 核超参数。
 ///
-/// 忠实对应 Python `optuna.samplers._gp.gp._fit_kernel_params`:
+/// 对应 Python `optuna.samplers._gp.gp.fit_kernel_params`:
+/// - 先尝试 gpr_cache 作为初始值，失败则用默认值
 /// - `scipy.optimize.minimize(method='l-bfgs-b', jac=True, options={'gtol': 1e-2})`
 /// - 包含 log-prior (from `prior.py`)
-/// - 多次随机重启选最优
-///
-/// # 参数
-/// * `x_train` - 训练输入 (N × D)
-/// * `y_train` - 训练目标 (N,)
-/// * `is_categorical` - 每个维度是否为分类参数
-/// * `seed` - 随机种子（用于多次重启的初始化）
-///
-/// # 返回
-/// 优化后的 GPRegressor 实例
 #[cfg(feature = "gp-lbfgsb")]
 pub(crate) fn fit_kernel_params_lbfgsb(
     x_train: &[Vec<f64>],
     y_train: &[f64],
     is_categorical: &[bool],
-    seed: u64,
+    _seed: u64,
+    gpr_cache: Option<&KernelParamsCache>,
+    deterministic_objective: bool,
 ) -> GPRegressor {
-    use rand::SeedableRng;
-    use rand::Rng;
-    use rand_chacha::ChaCha8Rng;
     use scirs2_optimize::unconstrained::OptimizeResult;
 
     let d = x_train.first().map_or(0, |row| row.len());
 
-    // 数据为空或太少时回退到默认参数
     if x_train.is_empty() || y_train.is_empty() {
         return GPRegressor::new(
-            x_train.to_vec(),
-            y_train.to_vec(),
-            is_categorical.to_vec(),
-            vec![1.0; d],
-            1.0,
-            DEFAULT_MINIMUM_NOISE_VAR,
+            x_train.to_vec(), y_train.to_vec(), is_categorical.to_vec(),
+            vec![1.0; d], 1.0, DEFAULT_MINIMUM_NOISE_VAR,
         );
     }
 
-    let n_params = d + 2; // d 个 inv_sq_ls + kernel_scale + noise_var
-    let mut rng = ChaCha8Rng::seed_from_u64(seed);
-
-    // 克隆训练数据供闭包使用
     let x_train_owned = x_train.to_vec();
     let y_train_owned = y_train.to_vec();
     let is_cat_owned = is_categorical.to_vec();
 
+    // 对应 Python: for gpr_cache_to_use in [gpr_cache, default_gpr_cache]
+    // 先用 cache（若有），再用默认值 — 共 2 次尝试
+    let default_cache = KernelParamsCache {
+        inverse_squared_lengthscales: vec![1.0; d],
+        kernel_scale: 1.0,
+        noise_var: DEFAULT_MINIMUM_NOISE_VAR + 0.01,
+    };
+
+    let attempts: Vec<Vec<f64>> = if let Some(cache) = gpr_cache {
+        vec![
+            encode_cache(cache, deterministic_objective),
+            encode_cache(&default_cache, deterministic_objective),
+        ]
+    } else {
+        vec![encode_cache(&default_cache, deterministic_objective)]
+    };
+
     let mut best_gpr: Option<GPRegressor> = None;
-    let mut best_lml = f64::NEG_INFINITY;
+    let mut best_score = f64::NEG_INFINITY;
 
-    // 多次随机重启 + L-BFGS-B 优化（匹配 Python 的多重启策略）
-    let n_restarts = 10;
-    for _ in 0..n_restarts {
-        // 随机初始化（在 log 空间），匹配 Python 的 np.random.uniform(-1, 1) 范围
-        let init_params: Vec<f64> = (0..n_params)
-            .map(|_| rng.gen_range(-1.0_f64..1.0))
-            .collect();
+    let score_gpr = |gpr: &GPRegressor| -> f64 {
+        let lml = gpr.log_marginal_likelihood();
+        if !lml.is_finite() { return f64::NEG_INFINITY; }
+        lml + default_log_prior(&gpr.inverse_squared_lengthscales, gpr.kernel_scale, gpr.noise_var)
+    };
 
-        // 构造目标函数闭包（scirs2-optimize API: fn(&ArrayView1<f64>) -> f64）
+    for init_params in attempts {
         let x_t = x_train_owned.clone();
         let y_t = y_train_owned.clone();
         let is_c = is_cat_owned.clone();
         let dims = d;
+        let det = deterministic_objective;
 
         let objective = |x: &ArrayView1<f64>| -> f64 {
             let params: Vec<f64> = x.iter().copied().collect();
-            neg_log_posterior(&params, dims, &x_t, &y_t, &is_c)
+            neg_log_posterior(&params, dims, &x_t, &y_t, &is_c, det)
         };
 
-        // 配置优化器: gtol=1e-2 匹配 Python 的 options={'gtol': 1e-2}
         let mut options = Options::default();
-        options.max_iter = 50;  // 核参数拟合通常 50 轮足够
+        options.max_iter = 50;
         options.gtol = 1e-2;
 
-        // 执行 BFGS 优化 (L-BFGS-B 无界等价于 BFGS)
-        // Python: `scipy.optimize.minimize(method='l-bfgs-b')` 无 bounds
         let result: Result<OptimizeResult<f64>, _> = minimize(
             objective,
             &init_params,
@@ -226,16 +219,13 @@ pub(crate) fn fit_kernel_params_lbfgsb(
             Some(options),
         );
 
-        // 从优化结果构建 GPR
         let final_params: Vec<f64> = match result {
-            Ok(ref res) if res.success => res.x.to_vec(),
-            Ok(ref res) => res.x.to_vec(), // 即使未收敛也用最后的参数
-            Err(_) => continue,             // 优化出错，跳过
+            Ok(ref res) => res.x.to_vec(),
+            Err(_) => continue,
         };
 
-        let (inv_sq_ls, kernel_scale, noise_var) = decode_params(&final_params, d);
+        let (inv_sq_ls, kernel_scale, noise_var) = decode_params(&final_params, d, deterministic_objective);
 
-        // 检查参数有效性
         if inv_sq_ls.iter().any(|&v| !v.is_finite())
             || !kernel_scale.is_finite()
             || !noise_var.is_finite()
@@ -244,29 +234,20 @@ pub(crate) fn fit_kernel_params_lbfgsb(
         }
 
         let gpr = GPRegressor::new(
-            x_train.to_vec(),
-            y_train.to_vec(),
-            is_categorical.to_vec(),
-            inv_sq_ls,
-            kernel_scale,
-            noise_var,
+            x_train.to_vec(), y_train.to_vec(), is_categorical.to_vec(),
+            inv_sq_ls, kernel_scale, noise_var,
         );
 
-        let lml = gpr.log_marginal_likelihood();
-        if lml.is_finite() && lml > best_lml {
-            best_lml = lml;
+        let s = score_gpr(&gpr);
+        if s > best_score {
+            best_score = s;
             best_gpr = Some(gpr);
         }
     }
 
-    // 回退到默认参数
     best_gpr.unwrap_or_else(|| GPRegressor::new(
-        x_train.to_vec(),
-        y_train.to_vec(),
-        is_categorical.to_vec(),
-        vec![1.0; d],
-        1.0,
-        DEFAULT_MINIMUM_NOISE_VAR,
+        x_train.to_vec(), y_train.to_vec(), is_categorical.to_vec(),
+        vec![1.0; d], 1.0, DEFAULT_MINIMUM_NOISE_VAR,
     ))
 }
 
@@ -277,8 +258,10 @@ pub(crate) fn fit_kernel_params_lbfgsb(
     y_train: &[f64],
     is_categorical: &[bool],
     seed: u64,
+    gpr_cache: Option<&crate::samplers::gp::KernelParamsCache>,
+    deterministic_objective: bool,
 ) -> crate::samplers::gp::GPRegressor {
-    crate::samplers::gp::fit_kernel_params(x_train, y_train, is_categorical, seed)
+    crate::samplers::gp::fit_kernel_params(x_train, y_train, is_categorical, seed, gpr_cache, deterministic_objective)
 }
 
 #[cfg(test)]
@@ -287,14 +270,12 @@ mod tests {
 
     #[test]
     fn test_fit_kernel_params_lbfgsb_basic() {
-        // 简单测试：确保不 panic 且后验合理
         let x = vec![vec![0.0], vec![0.5], vec![1.0]];
         let y = vec![0.0, 0.25, 1.0];
         let is_cat = vec![false];
 
-        let gpr = fit_kernel_params_lbfgsb(&x, &y, &is_cat, 42);
+        let gpr = fit_kernel_params_lbfgsb(&x, &y, &is_cat, 42, None, false);
         let (mean, _var) = gpr.posterior(&[0.5]);
-        // 在训练点附近，后验均值应接近训练值
         assert!((mean - 0.25).abs() < 0.5, "mean={mean}, expected ~0.25");
     }
 
@@ -303,26 +284,34 @@ mod tests {
         let x: Vec<Vec<f64>> = vec![];
         let y: Vec<f64> = vec![];
         let is_cat: Vec<bool> = vec![];
-        let _ = fit_kernel_params_lbfgsb(&x, &y, &is_cat, 42);
+        let _ = fit_kernel_params_lbfgsb(&x, &y, &is_cat, 42, None, false);
     }
 
     #[cfg(feature = "gp-lbfgsb")]
     #[test]
     fn test_log_prior_at_unity() {
+        use crate::samplers::gp::DEFAULT_MINIMUM_NOISE_VAR;
         // inv_sq_ls = [1.0] 是先验的最优值
         let lp1 = default_log_prior(&[1.0], 1.0, DEFAULT_MINIMUM_NOISE_VAR);
         let lp2 = default_log_prior(&[2.0], 1.0, DEFAULT_MINIMUM_NOISE_VAR);
-        // 在 inv_sq_ls=1 附近先验应更高
         assert!(lp1 > lp2, "lprio at 1.0={lp1} should be > at 2.0={lp2}");
     }
 
     #[cfg(feature = "gp-lbfgsb")]
     #[test]
     fn test_decode_encode_roundtrip() {
+        use crate::samplers::gp::DEFAULT_MINIMUM_NOISE_VAR;
         let raw = vec![0.0, 0.5, -1.0]; // log(1.0), log(exp(0.5)), log(exp(-1))
-        let (inv, ks, nv) = decode_params(&raw, 1);
+        let (inv, ks, nv) = decode_params(&raw, 1, false);
         assert!((inv[0] - 1.0).abs() < 1e-10);
         assert!((ks - 0.5_f64.exp()).abs() < 1e-10);
         assert!((nv - (DEFAULT_MINIMUM_NOISE_VAR + (-1.0_f64).exp())).abs() < 1e-10);
+
+        // deterministic mode: noise_var is fixed
+        let raw_det = vec![0.0, 0.5]; // only d+1 params
+        let (inv2, ks2, nv2) = decode_params(&raw_det, 1, true);
+        assert!((inv2[0] - 1.0).abs() < 1e-10);
+        assert!((ks2 - 0.5_f64.exp()).abs() < 1e-10);
+        assert!((nv2 - DEFAULT_MINIMUM_NOISE_VAR).abs() < 1e-10);
     }
 }

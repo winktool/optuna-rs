@@ -2,6 +2,8 @@ use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Mutex;
 
+use indexmap::IndexMap;
+
 use rand::rngs::StdRng;
 use rand::seq::SliceRandom;
 use rand::SeedableRng;
@@ -341,15 +343,15 @@ impl Sampler for BruteForceSampler {
     fn infer_relative_search_space(
         &self,
         _trials: &[FrozenTrial],
-    ) -> HashMap<String, Distribution> {
-        HashMap::new()
+    ) -> IndexMap<String, Distribution> {
+        IndexMap::new()
     }
 
     // Python returns {} — all logic is in sample_independent.
     fn sample_relative(
         &self,
         _trials: &[FrozenTrial],
-        _search_space: &HashMap<String, Distribution>,
+        _search_space: &IndexMap<String, Distribution>,
     ) -> Result<HashMap<String, f64>> {
         Ok(HashMap::new())
     }
@@ -664,11 +666,11 @@ mod tests {
     #[test]
     fn test_relative_returns_empty() {
         let sampler = BruteForceSampler::new(None, false);
-        let result = sampler.sample_relative(&[], &HashMap::new()).unwrap();
+        let result = sampler.sample_relative(&[], &IndexMap::new()).unwrap();
         assert!(result.is_empty());
 
         // Even with a non-empty search space, should return empty.
-        let mut space = HashMap::new();
+        let mut space = IndexMap::new();
         space.insert(
             "x".to_string(),
             Distribution::IntDistribution(IntDistribution::new(1, 3, false, 1).unwrap()),

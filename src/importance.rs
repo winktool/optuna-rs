@@ -85,22 +85,14 @@ impl ImportanceEvaluator for FanovaEvaluator {
             raw_importances.push((param_name.clone(), importance));
         }
 
-        // Normalize importances to sum to 1.0
+        // 对齐 Python: 返回原始未归一化的重要性值，归一化由 get_param_importances 统一处理
         let total: f64 = raw_importances.iter().map(|(_, v)| *v).sum();
         let mut result = IndexMap::new();
 
-        if total > 0.0 {
-            // Sort by importance descending
-            raw_importances.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
-            for (name, imp) in raw_importances {
-                result.insert(name, imp / total);
-            }
-        } else {
-            // All importances are zero — assign equal weight
-            let uniform = 1.0 / params.len() as f64;
-            for name in params {
-                result.insert(name.clone(), uniform);
-            }
+        // Sort by importance descending
+        raw_importances.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+        for (name, imp) in raw_importances {
+            result.insert(name, if total > 0.0 { imp } else { 0.0 });
         }
 
         Ok(result)
@@ -330,24 +322,16 @@ impl ImportanceEvaluator for MeanDecreaseImpurityEvaluator {
             }
         }
 
-        // 归一化并排序
-        let total: f64 = importances.iter().sum();
+        // 对齐 Python: 返回原始未归一化的重要性值
         let mut result = IndexMap::new();
-        if total > 0.0 {
-            let mut indexed: Vec<(String, f64)> = params
-                .iter()
-                .zip(importances.iter())
-                .map(|(name, &imp)| (name.clone(), imp / total))
-                .collect();
-            indexed.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
-            for (name, imp) in indexed {
-                result.insert(name, imp);
-            }
-        } else {
-            let uniform = 1.0 / params.len() as f64;
-            for name in params {
-                result.insert(name.clone(), uniform);
-            }
+        let mut indexed: Vec<(String, f64)> = params
+            .iter()
+            .zip(importances.iter())
+            .map(|(name, &imp)| (name.clone(), imp))
+            .collect();
+        indexed.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+        for (name, imp) in indexed {
+            result.insert(name, imp);
         }
 
         Ok(result)
@@ -1134,20 +1118,11 @@ impl ImportanceEvaluator for PedAnovaEvaluator {
             raw_importances.push((param_name.clone(), importance));
         }
 
-        // 归一化
-        let total: f64 = raw_importances.iter().map(|(_, v)| *v).sum();
+        // 对齐 Python: 返回原始未归一化的重要性值
         let mut result = IndexMap::new();
-
-        if total > 0.0 {
-            raw_importances.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
-            for (name, imp) in raw_importances {
-                result.insert(name, imp / total);
-            }
-        } else {
-            let uniform = 1.0 / params.len() as f64;
-            for name in params {
-                result.insert(name.clone(), uniform);
-            }
+        raw_importances.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+        for (name, imp) in raw_importances {
+            result.insert(name, imp);
         }
 
         Ok(result)

@@ -2,32 +2,48 @@
 
 ## 总览
 
-- **Rust 测试基线**: 757 all-features (含 2 ignored)
-- **Python 交叉验证**: 118 tests (全部通过)
-- **最新提交**: Session 33-34 on gitlab/main
+- **Rust 测试基线**: 771 all-features (含 2 ignored)
+- **Python 交叉验证**: 125 tests (全部通过)
+- **最新提交**: Session 35 on gitlab/main
 
-## Session 33-34 修复摘要
+## Session 35 修复摘要 (全模块深度审计)
 
-### Bug 修复 (12 项)
-1. **[HIGH] pruners/*.rs**: 所有 6 个 pruner 文件的中文错误消息 → 英文 (percentile, successive_halving, patient, hyperband, wilcoxon, threshold)
-2. **[HIGH] pruners/percentile.rs**: 添加 `n_warmup_steps >= 0` 验证 (对齐 Python ValueError)
-3. **[HIGH] samplers/grid.rs**: Grid 耗尽后发 warning + 随机复用 (而非返回 Error，对齐 Python)
-4. **[HIGH] samplers/grid.rs**: 实现 `after_trial` — grid 耗尽时通知 study 停止 (对齐 Python `study.stop()`)
-5. **[HIGH] samplers/grid.rs**: 实现 `should_stop_study()` 用于 GridSampler
-6. **[MEDIUM] samplers/grid.rs**: `seed=None` → `seed=0` (对齐 Python 确定性行为)
-7. **[HIGH] terminators.rs**: RegretBoundEvaluator 搜索空间使用所有试验 (而非仅完成试验)
-8. **[HIGH] terminators.rs**: RegretBoundEvaluator top-N 选择包含并列值 (对齐 Python np.partition)
-9. **[HIGH] terminators.rs**: EMMREvaluator 搜索空间使用所有试验
-10. **[HIGH] terminators.rs**: EMMREvaluator GP 拟合顺序修正 — 先拟合 t-1 再用其 cache 拟合 t (对齐 Python)
-11. **[MEDIUM] terminators.rs**: 标准化 std 最小阈值从 1e-10 改为 f64::MIN_POSITIVE (对齐 Python sys.float_info.min)
-12. **[HIGH] samplers/cmaes.rs**: sigma0 默认值改为从搜索空间边界动态计算 min_range/6 (对齐 Python)
+### 审计范围
+- distributions, trial, study, storage, search_space, callbacks, samplers, pruners, importance, visualization
 
-### 新增功能
-13. **[MEDIUM] samplers/cmaes.rs**: 添加 `warn_independent_sampling` 字段和警告逻辑 (对齐 Python)
-14. **[HIGH] study/core.rs**: `optimize_multi` / `optimize_multi_with_options` / `optimize_multi_with_terminators` 添加 SIGINT 信号处理器
+### Bug 修复 (15 项)
+1. **[HIGH] storage/in_memory.rs**: InMemoryStorage get_best_trial override — 单锁作用域防死锁
+2. **[HIGH] storage/mod.rs**: get_best_trial 默认实现 partial_cmp().unwrap() → total_cmp() 防 NaN panic
+3. **[HIGH] study/mod.rs**: create_study 多目标时默认使用 NSGAIISampler (对齐 Python)
+4. **[HIGH] distributions/mod.rs**: CategoricalDistribution to_internal_repr 支持 ParamValue::Int/Float (JSON 反序列化兼容)
+5. **[MEDIUM] study/mod.rs**: create_study 空方向列表验证
+6. **[MEDIUM] study/frozen.rs**: 添加 FrozenStudy.direction() 方法 + PartialEq
+7. **[MEDIUM] trial/frozen.rs**: _suggest 范围检查从静默忽略改为 warning
+8. **[MEDIUM] search_space/intersection.rs**: next_cached_trial_number 初始化为 -1 (对齐 Python)
+9. **[MEDIUM] search_space/intersection.rs**: 移除不可达的 Pruned 检查代码
+10. **[MEDIUM] search_space/transform.rs**: 添加空搜索空间 assert (对齐 Python)
+11. **[MEDIUM] search_space/group_decomposed.rs**: study_id 不匹配时 panic 消息更清晰
+12. **[MEDIUM] callbacks/mod.rs**: TerminatorCallback 添加终止日志 (对齐 Python)
+13. **[MEDIUM] samplers/cmaes.rs**: 添加 6 项参数组合互斥验证
+14. **[MEDIUM] samplers/gp.rs**: 添加 warn_and_convert_inf — Inf 目标值裁剪为 MAX/MIN
+15. **[MEDIUM] samplers/gp.rs**: 添加 warn_independent_sampling 警告
+16. **[MEDIUM] pruners/wilcoxon.rs**: Wilcoxon 统计量添加连续性修正 (对齐 scipy)
+17. **[MEDIUM] importance.rs**: FanovaEvaluator/MDI/PedAnova 移除内部归一化, 由 get_param_importances 统一处理
 
-### 新增测试 (12 个新测试, 总计 757)
-- GridSampler: `test_grid_sampler_after_trial_signals_stop`, `test_grid_sampler_after_trial_no_stop_when_remaining`, `test_grid_sampler_exhausted_returns_valid_id`, `test_grid_sampler_seed_none_is_deterministic`
+### 新增测试 (14 个 Rust, 7 个 Python)
+- storage/in_memory.rs: +5 (get_best_trial override: no_deadlock, maximize, no_complete, multi_obj_error, nan_safety)
+- study/frozen.rs: +3 (direction_single, direction_multi_error, partial_eq)
+- study/mod.rs: +2 (empty_directions_error, both_direction_directions_error)
+- search_space/transform.rs: +1 (empty_panic)
+- samplers/cmaes.rs: +3 (source_x0_conflict, separable_margin_conflict, lr_separable_conflict)
+- Python cross-validation: +7 (frozen_study_direction, create_study_errors, default_sampler, importance_normalize)
+
+### 已知架构差异 (非本次修复范围)
+- GP: 使用随机搜索拟合超参而非 L-BFGS-B + 先验; 不支持多目标
+- TPE: 缺失多目标 MOTPE 分割逻辑 (非支配排序 + HSSP)
+- FanovaEvaluator: 使用朴素 bin-variance 算法而非真正的 fANOVA 树分解
+- Pruners: direction 在构造时绑定而非 prune 时读取 study
+- CMA-ES: 状态不可序列化/恢复, 无分布式支持
 - Terminator: `test_regret_bound_top_n_includes_ties`, `test_emmr_search_space_uses_all_trials`
 
 ### 已知仍待对齐的差异

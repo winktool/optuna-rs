@@ -367,11 +367,21 @@ impl FrozenTrial {
             ))
         })?;
 
-        // 2. 范围检查（超出范围仅警告）
-        if let Ok(internal) = distribution.to_internal_repr(&value) {
-            if !distribution.contains(internal) {
+        // 2. 范围检查（对齐 Python: 超出范围仅警告，转换失败也警告）
+        match distribution.to_internal_repr(&value) {
+            Ok(internal) => {
+                if !distribution.contains(internal) {
+                    crate::optuna_warn!(
+                        "The value {:?} of the parameter '{}' is out of the range of the distribution {:?}.",
+                        value,
+                        name,
+                        distribution
+                    );
+                }
+            }
+            Err(_) => {
                 crate::optuna_warn!(
-                    "The value {:?} of the parameter '{}' is out of the range of the distribution {:?}.",
+                    "The value {:?} of the parameter '{}' could not be converted for distribution {:?}.",
                     value,
                     name,
                     distribution

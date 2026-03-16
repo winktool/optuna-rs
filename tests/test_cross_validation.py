@@ -1650,6 +1650,71 @@ def test_best_trial_constraint_error_message():
         assert "feasible" in str(e).lower(), f"错误消息不匹配: {e}"
 
 # ═══════════════════════════════════════════════════════════════════════════
+#  Session 35: FrozenStudy.direction() / create_study 验证
+# ═══════════════════════════════════════════════════════════════════════════
+
+def test_frozen_study_direction_single():
+    """对齐 Rust: FrozenStudy.direction() 单目标返回方向"""
+    study = optuna.create_study(direction="minimize")
+    assert study.direction == optuna.study.StudyDirection.MINIMIZE
+
+def test_frozen_study_direction_multi_error():
+    """对齐 Rust: FrozenStudy.direction 多目标报 RuntimeError"""
+    study = optuna.create_study(directions=["minimize", "maximize"])
+    try:
+        _ = study.direction
+        assert False, "应抛出 RuntimeError"
+    except RuntimeError:
+        pass
+
+def test_create_study_empty_directions_error():
+    """对齐 Rust: create_study 空方向列表报 ValueError"""
+    try:
+        optuna.create_study(directions=[])
+        assert False, "应抛出 ValueError"
+    except ValueError:
+        pass
+
+def test_create_study_both_direction_directions_error():
+    """对齐 Rust: 同时指定 direction 和 directions 报错"""
+    try:
+        optuna.create_study(direction="minimize", directions=["minimize"])
+        assert False, "应抛出 ValueError"
+    except ValueError:
+        pass
+
+def test_create_study_multi_default_sampler():
+    """对齐 Rust: 多目标时默认使用 NSGAIISampler"""
+    study = optuna.create_study(directions=["minimize", "maximize"])
+    assert isinstance(study.sampler, optuna.samplers.NSGAIISampler)
+
+def test_importance_normalize_false():
+    """对齐 Rust: normalize=False 返回未归一化的重要性值"""
+    study = optuna.create_study(direction="minimize")
+    for _ in range(30):
+        trial = study.ask()
+        x = trial.suggest_float("x", -10, 10)
+        y = trial.suggest_float("y", -10, 10)
+        study.tell(trial, x**2 + 0.01*y)
+    importances = optuna.importance.get_param_importances(study, normalize=False)
+    # normalize=False 时值不一定加和为 1
+    assert len(importances) == 2
+    # x 应比 y 更重要
+    assert importances["x"] > importances["y"]
+
+def test_importance_normalize_true():
+    """对齐 Rust: normalize=True 值加和为 1"""
+    study = optuna.create_study(direction="minimize")
+    for _ in range(30):
+        trial = study.ask()
+        x = trial.suggest_float("x", -10, 10)
+        y = trial.suggest_float("y", -10, 10)
+        study.tell(trial, x**2 + 0.01*y)
+    importances = optuna.importance.get_param_importances(study, normalize=True)
+    total = sum(importances.values())
+    assert abs(total - 1.0) < 1e-10, f"归一化后应为1.0, 实际={total}"
+
+# ═══════════════════════════════════════════════════════════════════════════
 #  执行
 # ═══════════════════════════════════════════════════════════════════════════
 

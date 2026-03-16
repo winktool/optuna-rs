@@ -555,12 +555,12 @@ pub mod commands {
                     .map_err(|e| e.to_string())?;
 
                 // 解析搜索空间 JSON（可选）
-                let distributions: std::collections::HashMap<String, crate::distributions::Distribution> =
+                let distributions: indexmap::IndexMap<String, crate::distributions::Distribution> =
                     if let Some(ss_json) = search_space {
                         serde_json::from_str(&ss_json)
                             .map_err(|e| format!("invalid search_space JSON: {e}"))?
                     } else {
-                        std::collections::HashMap::new()
+                        indexmap::IndexMap::new()
                     };
 
                 let fixed = if distributions.is_empty() { None } else { Some(distributions) };

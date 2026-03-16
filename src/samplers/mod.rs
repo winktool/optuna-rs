@@ -25,6 +25,8 @@ pub use tpe::{TpeSampler, TpeSamplerBuilder};
 
 use std::collections::HashMap;
 
+use indexmap::IndexMap;
+
 use crate::distributions::Distribution;
 use crate::error::Result;
 use crate::trial::{FrozenTrial, TrialState};
@@ -35,14 +37,15 @@ use crate::trial::{FrozenTrial, TrialState};
 pub trait Sampler: Send + Sync {
     /// Infer the search space for relative sampling from completed trials.
     ///
-    /// Returns a map from param name to distribution for parameters that
+    /// Returns an ordered map from param name to distribution for parameters that
     /// should be sampled together (relative sampling).
+    /// 对齐 Python: 返回 IndexMap 保持键排序 (等同 Python dict(sorted(...))).
     fn infer_relative_search_space(
         &self,
         trials: &[FrozenTrial],
-    ) -> HashMap<String, Distribution> {
+    ) -> IndexMap<String, Distribution> {
         let _ = trials;
-        HashMap::new()
+        IndexMap::new()
     }
 
     /// Sample parameters jointly in the relative search space.
@@ -51,7 +54,7 @@ pub trait Sampler: Send + Sync {
     fn sample_relative(
         &self,
         trials: &[FrozenTrial],
-        search_space: &HashMap<String, Distribution>,
+        search_space: &IndexMap<String, Distribution>,
     ) -> Result<HashMap<String, f64>> {
         let _ = (trials, search_space);
         Ok(HashMap::new())
@@ -151,7 +154,7 @@ mod tests {
     #[test]
     fn test_default_sample_relative() {
         let s = DummySampler;
-        let result = s.sample_relative(&[], &HashMap::new()).unwrap();
+        let result = s.sample_relative(&[], &IndexMap::new()).unwrap();
         assert!(result.is_empty());
     }
 

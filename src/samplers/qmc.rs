@@ -74,7 +74,7 @@ pub struct QmcSampler {
     qmc_type: QmcType,
     /// 冻结的初始搜索空间 (排除分类参数)。
     /// 对应 Python `self._initial_search_space`
-    initial_search_space: Mutex<Option<HashMap<String, Distribution>>>,
+    initial_search_space: Mutex<Option<IndexMap<String, Distribution>>>,
     /// 是否在独立采样时输出警告
     /// 对应 Python `self._warn_independent_sampling`
     warn_independent_sampling: bool,
@@ -145,7 +145,7 @@ impl QmcSampler {
 
     /// 从第一个完成试验推断初始搜索空间 (排除分类参数)。
     /// 对应 Python `_infer_initial_search_space`。
-    fn infer_initial_search_space(trial: &FrozenTrial) -> HashMap<String, Distribution> {
+    fn infer_initial_search_space(trial: &FrozenTrial) -> IndexMap<String, Distribution> {
         trial
             .distributions
             .iter()
@@ -340,7 +340,7 @@ impl Sampler for QmcSampler {
     fn infer_relative_search_space(
         &self,
         trials: &[FrozenTrial],
-    ) -> HashMap<String, Distribution> {
+    ) -> IndexMap<String, Distribution> {
         // 若已冻结，直接返回
         {
             let guard = self.initial_search_space.lock();
@@ -356,7 +356,7 @@ impl Sampler for QmcSampler {
             .collect();
         if past.is_empty() {
             // 无已完成试验 — 第一次试验由 independent_sampler 处理
-            return HashMap::new();
+            return IndexMap::new();
         }
         let first = past.iter().min_by_key(|t| t.number).unwrap();
         let ss = Self::infer_initial_search_space(first);
@@ -381,7 +381,7 @@ impl Sampler for QmcSampler {
     fn sample_relative(
         &self,
         _trials: &[FrozenTrial],
-        search_space: &HashMap<String, Distribution>,
+        search_space: &IndexMap<String, Distribution>,
     ) -> Result<HashMap<String, f64>> {
         if search_space.is_empty() {
             return Ok(HashMap::new());
@@ -774,7 +774,7 @@ mod tests {
     #[test]
     fn test_qmc_sample_relative_empty_search_space_returns_empty() {
         let sampler = QmcSampler::new(None, None, Some(11), None, None, None);
-        let out = sampler.sample_relative(&[], &HashMap::new()).unwrap();
+        let out = sampler.sample_relative(&[], &IndexMap::new()).unwrap();
         assert!(out.is_empty());
     }
 
@@ -785,7 +785,7 @@ mod tests {
 
         let sampler = QmcSampler::new(Some(QmcType::Sobol), Some(false), Some(42), None, None, None);
 
-        let mut search_space = HashMap::new();
+        let mut search_space = IndexMap::new();
         search_space.insert(
             "x".to_string(),
             Distribution::FloatDistribution(FloatDistribution {
@@ -817,7 +817,7 @@ mod tests {
                 p.insert("y".to_string(), crate::distributions::ParamValue::Float(1.0));
                 p
             },
-            distributions: search_space.clone(),
+            distributions: search_space.iter().map(|(k, v)| (k.clone(), v.clone())).collect(),
             user_attrs: HashMap::new(),
             system_attrs: HashMap::new(),
             intermediate_values: HashMap::new(),
@@ -853,7 +853,7 @@ mod tests {
 
         let sampler = QmcSampler::new(Some(QmcType::Halton), Some(false), Some(42), None, None, None);
 
-        let mut search_space = HashMap::new();
+        let mut search_space = IndexMap::new();
         search_space.insert(
             "a".to_string(),
             Distribution::FloatDistribution(FloatDistribution {
@@ -874,7 +874,7 @@ mod tests {
                 p.insert("a".to_string(), crate::distributions::ParamValue::Float(5.0));
                 p
             },
-            distributions: search_space.clone(),
+            distributions: search_space.iter().map(|(k, v)| (k.clone(), v.clone())).collect(),
             user_attrs: HashMap::new(),
             system_attrs: HashMap::new(),
             intermediate_values: HashMap::new(),
@@ -897,7 +897,7 @@ mod tests {
         let s2 = QmcSampler::new(Some(QmcType::Sobol), Some(true), Some(2), None, None, None);
 
         use crate::distributions::FloatDistribution;
-        let mut ss = HashMap::new();
+        let mut ss = IndexMap::new();
         ss.insert(
             "x".to_string(),
             Distribution::FloatDistribution(FloatDistribution {
@@ -917,7 +917,7 @@ mod tests {
                 p.insert("x".to_string(), crate::distributions::ParamValue::Float(0.5));
                 p
             },
-            distributions: ss.clone(),
+            distributions: ss.iter().map(|(k, v)| (k.clone(), v.clone())).collect(),
             user_attrs: HashMap::new(),
             system_attrs: HashMap::new(),
             intermediate_values: HashMap::new(),

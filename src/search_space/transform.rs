@@ -40,6 +40,12 @@ impl SearchSpaceTransform {
         transform_step: bool,
         transform_0_1: bool,
     ) -> Self {
+        // 对齐 Python: assert len(search_space) > 0
+        assert!(
+            !search_space.is_empty(),
+            "Cannot transform if no distributions are given."
+        );
+
         let mut raw_bounds = Vec::new();
         let mut column_to_encoded_columns = Vec::new();
         let mut encoded_column_to_column = Vec::new();
@@ -777,5 +783,13 @@ mod tests {
         let trans = 3.0_f64.ln(); // exp(ln(3)) = 3.0
         let result = untransform_numerical_int(trans, &d, true);
         assert_eq!(result, 3, "exp(ln(3)) round = 3");
+    }
+
+    /// 对齐 Python: 空搜索空间应 panic
+    #[test]
+    #[should_panic(expected = "Cannot transform if no distributions are given")]
+    fn test_search_space_transform_empty_panic() {
+        let empty: IndexMap<String, Distribution> = IndexMap::new();
+        SearchSpaceTransform::new(empty, true, true, false);
     }
 }

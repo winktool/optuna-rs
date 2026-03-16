@@ -191,6 +191,8 @@ pub trait Storage: Send + Sync {
     }
 
     /// Get the best trial for a single-objective study.
+    /// **注意**: 使用 Mutex-based storage 时必须覆写此默认实现，
+    /// 因为它调用了 `get_all_trials` 和 `get_study_directions` 可能导致死锁。
     fn get_best_trial(&self, study_id: i64) -> Result<FrozenTrial> {
         let trials =
             self.get_all_trials(study_id, Some(&[TrialState::Complete]))?;
@@ -213,9 +215,9 @@ pub trait Storage: Send + Sync {
                 let vb = b.value().unwrap().unwrap();
                 match direction {
                     StudyDirection::Minimize | StudyDirection::NotSet => {
-                        va.partial_cmp(&vb).unwrap()
+                        va.total_cmp(&vb)
                     }
-                    StudyDirection::Maximize => vb.partial_cmp(&va).unwrap(),
+                    StudyDirection::Maximize => vb.total_cmp(&va),
                 }
             })
             .unwrap();

@@ -1,5 +1,7 @@
 use std::collections::HashMap;
 
+use indexmap::IndexMap;
+
 use crate::distributions::Distribution;
 use crate::trial::{FrozenTrial, TrialState};
 
@@ -29,7 +31,8 @@ impl IntersectionSearchSpace {
     ///
     /// Returns a sorted map of param name → distribution for parameters
     /// that have identical distributions across all relevant trials.
-    pub fn calculate(&mut self, trials: &[FrozenTrial]) -> HashMap<String, Distribution> {
+    /// 对齐 Python: 返回 IndexMap (保留键排序，等同 Python dict(sorted(...)))
+    pub fn calculate(&mut self, trials: &[FrozenTrial]) -> IndexMap<String, Distribution> {
         let (space, cached) = calculate_inner(
             trials,
             self.include_pruned,
@@ -40,7 +43,7 @@ impl IntersectionSearchSpace {
         self.cached_trial_number = cached;
 
         let result = self.search_space.clone().unwrap_or_default();
-        // Return sorted by key
+        // Return sorted by key — IndexMap 保留插入顺序
         let mut sorted: Vec<_> = result.into_iter().collect();
         sorted.sort_by(|a, b| a.0.cmp(&b.0));
         sorted.into_iter().collect()
@@ -64,7 +67,8 @@ fn calculate_inner(
     mut search_space: Option<HashMap<String, Distribution>>,
     cached_trial_number: i64,
 ) -> (Option<HashMap<String, Distribution>>, i64) {
-    let mut next_cached_trial_number = cached_trial_number;
+    // 对齐 Python: 始终初始化为 -1，确保与 Python 行为一致
+    let mut next_cached_trial_number: i64 = -1;
 
     // Iterate in reverse (newest first)
     for trial in trials.iter().rev() {
@@ -72,8 +76,8 @@ fn calculate_inner(
             continue;
         }
 
-        // First valid trial sets the next cache point
-        if next_cached_trial_number == cached_trial_number {
+        // 对齐 Python: 第一个有效 trial 设置缓存点
+        if next_cached_trial_number == -1 {
             next_cached_trial_number = trial.number + 1;
         }
 
@@ -86,11 +90,6 @@ fn calculate_inner(
         // advance cache past them (they need processing when they finish)
         if !trial.state.is_finished() {
             next_cached_trial_number = trial.number;
-            continue;
-        }
-
-        // Skip Pruned if not included
-        if trial.state == TrialState::Pruned && !include_pruned {
             continue;
         }
 
@@ -118,7 +117,7 @@ fn calculate_inner(
 pub fn intersection_search_space(
     trials: &[FrozenTrial],
     include_pruned: bool,
-) -> HashMap<String, Distribution> {
+) -> IndexMap<String, Distribution> {
     let (space, _) = calculate_inner(trials, include_pruned, None, -1);
     let result = space.unwrap_or_default();
     let mut sorted: Vec<_> = result.into_iter().collect();

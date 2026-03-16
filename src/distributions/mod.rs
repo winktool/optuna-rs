@@ -50,6 +50,10 @@ impl Distribution {
     }
 
     /// Convert an external `ParamValue` to an internal `f64` representation.
+    ///
+    /// 对齐 Python: CategoricalDistribution 接受任意类型的值并在 choices 中查找索引。
+    /// 当 ParamValue 通过 JSON 反序列化时，整数/浮点分类选项可能被解析为
+    /// `ParamValue::Int(1)` 而非 `ParamValue::Categorical(CategoricalChoice::Int(1))`。
     pub fn to_internal_repr(&self, value: &ParamValue) -> Result<f64> {
         match (self, value) {
             (Self::FloatDistribution(d), ParamValue::Float(v)) => d.to_internal_repr(*v),
@@ -58,6 +62,13 @@ impl Distribution {
             (Self::IntDistribution(d), ParamValue::Float(v)) => d.to_internal_repr(*v as i64),
             (Self::CategoricalDistribution(d), ParamValue::Categorical(v)) => {
                 d.to_internal_repr(v)
+            }
+            // 对齐 Python: 当分类选项为 Int/Float/Bool 时，ParamValue 可能不是 Categorical 变体
+            (Self::CategoricalDistribution(d), ParamValue::Int(v)) => {
+                d.to_internal_repr(&CategoricalChoice::Int(*v))
+            }
+            (Self::CategoricalDistribution(d), ParamValue::Float(v)) => {
+                d.to_internal_repr(&CategoricalChoice::Float(*v))
             }
             _ => Err(OptunaError::ValueError(
                 "parameter value type mismatch for distribution".to_string(),

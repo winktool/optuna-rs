@@ -445,12 +445,12 @@ impl Sampler for TpeSampler {
     fn infer_relative_search_space(
         &self,
         trials: &[FrozenTrial],
-    ) -> HashMap<String, Distribution> {
+    ) -> IndexMap<String, Distribution> {
         if !self.multivariate {
-            return HashMap::new();
+            return IndexMap::new();
         }
         if self.is_startup(trials) {
-            return HashMap::new();
+            return IndexMap::new();
         }
 
         if self.group {
@@ -464,7 +464,7 @@ impl Sampler for TpeSampler {
             }
             // Return the union as the relative space, filtering out single() distributions
             // 对齐 Python: if distribution.single(): continue
-            let mut result = HashMap::new();
+            let mut result = IndexMap::new();
             for space in gs.search_spaces() {
                 for (k, v) in space.iter() {
                     if !v.single() {
@@ -489,7 +489,7 @@ impl Sampler for TpeSampler {
     fn sample_relative(
         &self,
         trials: &[FrozenTrial],
-        search_space: &HashMap<String, Distribution>,
+        search_space: &IndexMap<String, Distribution>,
     ) -> Result<HashMap<String, f64>> {
         if search_space.is_empty() {
             return Ok(HashMap::new());
@@ -522,13 +522,8 @@ impl Sampler for TpeSampler {
             return Ok(params);
         }
 
-        // Convert to IndexMap for ordered iteration.
-        let ordered: IndexMap<String, Distribution> = search_space
-            .iter()
-            .map(|(k, v)| (k.clone(), v.clone()))
-            .collect();
-
-        self.tpe_sample(trials, &ordered, None)
+        // search_space is already IndexMap with correct ordering
+        self.tpe_sample(trials, search_space, None)
     }
 
     fn sample_independent(
@@ -872,7 +867,7 @@ mod tests {
             trials.push(make_complete_trial(i, x, params));
         }
 
-        let mut search_space = HashMap::new();
+        let mut search_space = IndexMap::new();
         search_space.insert(
             "x".to_string(),
             Distribution::FloatDistribution(FloatDistribution::new(-10.0, 10.0, false, None).unwrap()),
@@ -929,7 +924,7 @@ mod tests {
 
             // TPE: use sample_relative if past startup.
             let x_tpe = if i >= 10 {
-                let mut search_space = HashMap::new();
+                let mut search_space = IndexMap::new();
                 search_space.insert("x".to_string(), dist.clone());
                 let result = sampler.sample_relative(&tpe_trials, &search_space).unwrap();
                 result["x"]
@@ -979,7 +974,7 @@ mod tests {
     fn test_tpe_empty_search_space() {
         let sampler = TpeSampler::with_defaults(StudyDirection::Minimize, Some(42));
         let result = sampler
-            .sample_relative(&[], &HashMap::new())
+            .sample_relative(&[], &IndexMap::new())
             .unwrap();
         assert!(result.is_empty());
     }

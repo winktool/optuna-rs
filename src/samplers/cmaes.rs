@@ -423,6 +423,26 @@ impl CmaEsSampler {
         lr_adapt: bool,
         source_trials: Option<Vec<FrozenTrial>>,
     ) -> Self {
+        // 对齐 Python: 参数组合验证
+        if source_trials.is_some() && x0.is_some() {
+            panic!("Cannot specify both `source_trials` and `x0`.");
+        }
+        if source_trials.is_some() && sigma0.is_some() {
+            panic!("Cannot specify both `source_trials` and `sigma0`.");
+        }
+        if source_trials.is_some() && use_separable_cma {
+            panic!("Cannot use `source_trials` with `use_separable_cma`.");
+        }
+        if lr_adapt && use_separable_cma {
+            panic!("Cannot use `lr_adapt` with `use_separable_cma`.");
+        }
+        if lr_adapt && with_margin {
+            panic!("Cannot use `lr_adapt` with `with_margin`.");
+        }
+        if use_separable_cma && with_margin {
+            panic!("Cannot use `use_separable_cma` with `with_margin`.");
+        }
+
         let rng = match seed {
             Some(s) => ChaCha8Rng::seed_from_u64(s),
             None => ChaCha8Rng::from_entropy(),
@@ -458,7 +478,7 @@ impl Sampler for CmaEsSampler {
     fn infer_relative_search_space(
         &self,
         trials: &[FrozenTrial],
-    ) -> HashMap<String, Distribution> {
+    ) -> IndexMap<String, Distribution> {
         let n_complete = trials
             .iter()
             .filter(|t| {
@@ -468,7 +488,7 @@ impl Sampler for CmaEsSampler {
             .count();
 
         if n_complete < self.n_startup_trials {
-            return HashMap::new();
+            return IndexMap::new();
         }
 
         // 对齐 Python: 过滤掉 CategoricalDistribution 和 single-value 分布
@@ -483,7 +503,7 @@ impl Sampler for CmaEsSampler {
     fn sample_relative(
         &self,
         trials: &[FrozenTrial],
-        search_space: &HashMap<String, Distribution>,
+        search_space: &IndexMap<String, Distribution>,
     ) -> Result<HashMap<String, f64>> {
         if search_space.is_empty() {
             return Ok(HashMap::new());
@@ -1079,5 +1099,38 @@ mod tests {
         assert_eq!(CmaEsSampler::default_popsize(1), 5);
         // n=10: 4 + floor(3*2.302) = 4 + 6 = 10
         assert_eq!(CmaEsSampler::default_popsize(10), 10);
+    }
+
+    /// 对齐 Python: source_trials + x0 互斥
+    #[test]
+    #[should_panic(expected = "Cannot specify both")]
+    fn test_cmaes_source_trials_x0_conflict() {
+        let mut x0 = HashMap::new();
+        x0.insert("x".to_string(), 0.5);
+        CmaEsSampler::new(
+            StudyDirection::Minimize, None, None, None, None, None,
+            Some(x0), false, false, false, false,
+            Some(vec![]),
+        );
+    }
+
+    /// 对齐 Python: use_separable_cma + with_margin 互斥
+    #[test]
+    #[should_panic(expected = "Cannot use")]
+    fn test_cmaes_separable_margin_conflict() {
+        CmaEsSampler::new(
+            StudyDirection::Minimize, None, None, None, None, None,
+            None, false, true, true, false, None,
+        );
+    }
+
+    /// 对齐 Python: lr_adapt + use_separable_cma 互斥
+    #[test]
+    #[should_panic(expected = "Cannot use")]
+    fn test_cmaes_lr_adapt_separable_conflict() {
+        CmaEsSampler::new(
+            StudyDirection::Minimize, None, None, None, None, None,
+            None, false, true, false, true, None,
+        );
     }
 }

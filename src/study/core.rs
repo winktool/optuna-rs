@@ -3,6 +3,8 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use indexmap::IndexMap;
+
 use crate::callbacks::Callback;
 use crate::distributions::Distribution;
 use crate::error::{OptunaError, Result};
@@ -320,7 +322,7 @@ impl Study {
     /// be pre-sampled for those distributions.
     pub fn ask(
         &self,
-        fixed_distributions: Option<&HashMap<String, Distribution>>,
+        fixed_distributions: Option<&IndexMap<String, Distribution>>,
     ) -> Result<Trial> {
         // Try to pop a WAITING trial first
         let trial_id = match self.pop_waiting_trial()? {
@@ -1822,7 +1824,7 @@ mod tests {
         )
         .unwrap();
 
-        let mut fixed = HashMap::new();
+        let mut fixed = IndexMap::new();
         fixed.insert(
             "x".to_string(),
             Distribution::FloatDistribution(

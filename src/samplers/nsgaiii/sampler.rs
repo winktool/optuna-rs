@@ -27,7 +27,7 @@ pub type EliteSelectionStrategy =
 /// 子代生成策略。
 /// 对应 Python `NSGAIIChildGenerationStrategy`。
 pub type ChildGenerationStrategy =
-    Arc<dyn Fn(&HashMap<String, Distribution>, &[FrozenTrial]) -> HashMap<String, f64> + Send + Sync>;
+    Arc<dyn Fn(&IndexMap<String, Distribution>, &[FrozenTrial]) -> HashMap<String, f64> + Send + Sync>;
 
 /// after_trial 回调策略。
 /// 对应 Python `NSGAIIAfterTrialStrategy`。
@@ -286,14 +286,14 @@ impl Sampler for NSGAIIISampler {
     fn infer_relative_search_space(
         &self,
         trials: &[FrozenTrial],
-    ) -> HashMap<String, Distribution> {
+    ) -> IndexMap<String, Distribution> {
         self.search_space.lock().calculate(trials)
     }
 
     fn sample_relative(
         &self,
         trials: &[FrozenTrial],
-        search_space: &HashMap<String, Distribution>,
+        search_space: &IndexMap<String, Distribution>,
     ) -> Result<HashMap<String, f64>> {
         if search_space.is_empty() {
             return Ok(HashMap::new());

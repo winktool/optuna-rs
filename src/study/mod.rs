@@ -12,7 +12,7 @@ use std::sync::Arc;
 
 use crate::error::{OptunaError, Result};
 use crate::pruners::{MedianPruner, Pruner};
-use crate::samplers::{Sampler, TpeSamplerBuilder};
+use crate::samplers::{NSGAIISamplerBuilder, Sampler, TpeSamplerBuilder};
 use crate::storage::{InMemoryStorage, Storage};
 
 /// 创建新的研究。
@@ -48,6 +48,11 @@ pub fn create_study(
     let dirs = if let Some(d) = direction {
         vec![d]
     } else if let Some(ds) = directions {
+        if ds.is_empty() {
+            return Err(OptunaError::ValueError(
+                "directions must have at least one element".into(),
+            ));
+        }
         ds
     } else {
         vec![StudyDirection::Minimize]
@@ -73,9 +78,14 @@ pub fn create_study(
     let name = storage.get_study_name_from_id(study_id)?;
     let stored_dirs = storage.get_study_directions(study_id)?;
 
-    // 与 Python 对齐：默认采样器为 TpeSampler，默认剪枝器为 MedianPruner
-    let sampler =
-        sampler.unwrap_or_else(|| Arc::new(TpeSamplerBuilder::new(dirs[0]).build()));
+    // 对齐 Python: 多目标默认 NSGAIISampler，单目标默认 TPESampler
+    let sampler = sampler.unwrap_or_else(|| {
+        if dirs.len() > 1 {
+            Arc::new(NSGAIISamplerBuilder::new(dirs.clone()).build())
+        } else {
+            Arc::new(TpeSamplerBuilder::new(dirs[0]).build())
+        }
+    });
     let pruner = pruner.unwrap_or_else(|| {
         Arc::new(MedianPruner::new(5, 0, 1, 1, dirs[0]))
     });
@@ -323,5 +333,28 @@ mod tests {
             false,
         ).unwrap();
         assert_eq!(study.directions().len(), 2);
+    }
+
+    /// 对齐 Python: create_study 空方向列表报 ValueError
+    #[test]
+    fn test_create_study_empty_directions_error() {
+        let result = create_study(
+            None, None, None, None, None,
+            Some(vec![]),
+            false,
+        );
+        assert!(result.is_err());
+    }
+
+    /// 对齐 Python: create_study 同时指定 direction 和 directions 报错
+    #[test]
+    fn test_create_study_both_direction_directions_error() {
+        let result = create_study(
+            None, None, None, None,
+            Some(StudyDirection::Minimize),
+            Some(vec![StudyDirection::Minimize]),
+            false,
+        );
+        assert!(result.is_err());
     }
 }

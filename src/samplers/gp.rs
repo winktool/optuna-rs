@@ -12,6 +12,7 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
+use indexmap::IndexMap;
 use parking_lot::Mutex;
 use rand::Rng;
 use rand_chacha::ChaCha8Rng;
@@ -263,8 +264,30 @@ pub(crate) struct KernelParamsCache {
     pub(crate) noise_var: f64,
 }
 
-/// 拟合 GP 超参数 — 使用简单网格搜索 + 随机重启。
+/// Python `optuna.samplers._gp.prior.default_log_prior` 的忠实移植。
+///
+/// 先验分布:
+/// - `inverse_squared_lengthscales`: 自定义惩罚 `-(0.1/x + 0.1*x)` ← 鼓励 ≈ 1
+/// - `kernel_scale`: Gamma(concentration=2, rate=1) → `log(x) - x`
+/// - `noise_var`: Gamma(concentration=1.1, rate=30) → `0.1*log(x) - 30*x`
+pub(crate) fn default_log_prior(
+    inverse_squared_lengthscales: &[f64],
+    kernel_scale: f64,
+    noise_var: f64,
+) -> f64 {
+    let ls_prior: f64 = inverse_squared_lengthscales.iter()
+        .map(|&x| -(0.1 / x + 0.1 * x))
+        .sum();
+    // Gamma(α=2, β=1): (α-1)*ln(x) - β*x
+    let ks_prior = kernel_scale.ln() - kernel_scale;
+    // Gamma(α=1.1, β=30): (α-1)*ln(x) - β*x
+    let nv_prior = 0.1 * noise_var.ln() - 30.0 * noise_var;
+    ls_prior + ks_prior + nv_prior
+}
+
+/// 拟合 GP 超参数 — 使用随机重启 + log_prior 评估。
 /// `gpr_cache`: 上一轮拟合的核参数缓存，作为额外的初始候选点。
+/// `deterministic_objective`: 是否为确定性目标（若 true，固定 noise_var）。
 /// 对应 Python `gp.fit_kernel_params(..., gpr_cache=cache)`。
 pub(crate) fn fit_kernel_params(
     x_train: &[Vec<f64>],
@@ -272,27 +295,59 @@ pub(crate) fn fit_kernel_params(
     is_categorical: &[bool],
     seed: u64,
     gpr_cache: Option<&KernelParamsCache>,
+    deterministic_objective: bool,
 ) -> GPRegressor {
     let n_params = if x_train.is_empty() { 0 } else { x_train[0].len() };
     let mut rng = ChaCha8Rng::seed_from_u64(seed);
 
     let mut best_gpr: Option<GPRegressor> = None;
-    let mut best_lml = f64::NEG_INFINITY;
+    let mut best_score = f64::NEG_INFINITY;
+
+    // 评估函数: log_marginal_likelihood + log_prior (对应 Python 的 log posterior)
+    let score_gpr = |gpr: &GPRegressor| -> f64 {
+        let lml = gpr.log_marginal_likelihood();
+        if !lml.is_finite() { return f64::NEG_INFINITY; }
+        let lp = default_log_prior(
+            &gpr.inverse_squared_lengthscales,
+            gpr.kernel_scale,
+            gpr.noise_var,
+        );
+        lml + lp
+    };
 
     // 若有缓存，先用缓存的核参数作为初始值尝试一次
     // 对应 Python: for gpr_cache_to_use in [gpr_cache, default_gpr_cache]
     if let Some(cache) = gpr_cache {
+        let noise = if deterministic_objective { DEFAULT_MINIMUM_NOISE_VAR } else { cache.noise_var };
         let gpr = GPRegressor::new(
             x_train.to_vec(),
             y_train.to_vec(),
             is_categorical.to_vec(),
             cache.inverse_squared_lengthscales.clone(),
             cache.kernel_scale,
-            cache.noise_var,
+            noise,
         );
-        let lml = gpr.log_marginal_likelihood();
-        if lml > best_lml {
-            best_lml = lml;
+        let s = score_gpr(&gpr);
+        if s > best_score {
+            best_score = s;
+            best_gpr = Some(gpr);
+        }
+    }
+
+    // 默认参数候选 (对应 Python 的 default gpr_cache: all-ones)
+    {
+        let noise = if deterministic_objective { DEFAULT_MINIMUM_NOISE_VAR } else { DEFAULT_MINIMUM_NOISE_VAR + 0.01 };
+        let gpr = GPRegressor::new(
+            x_train.to_vec(),
+            y_train.to_vec(),
+            is_categorical.to_vec(),
+            vec![1.0; n_params],
+            1.0,
+            noise,
+        );
+        let s = score_gpr(&gpr);
+        if s > best_score {
+            best_score = s;
             best_gpr = Some(gpr);
         }
     }
@@ -300,12 +355,16 @@ pub(crate) fn fit_kernel_params(
     // 多次随机重启优化
     let n_restarts = 10;
     for _ in 0..n_restarts {
-        // 随机初始化超参数
+        // 随机初始化超参数 (log 空间 uniform(-1, 1) 然后 exp)
         let inv_sq_ls: Vec<f64> = (0..n_params)
-            .map(|_| rng.gen_range(0.0_f64..1.0).exp())
+            .map(|_| rng.gen_range(-1.0_f64..1.0).exp())
             .collect();
-        let kernel_scale = (rng.gen_range(0.0_f64..1.0) * 2.0 - 1.0).exp();
-        let noise_var = DEFAULT_MINIMUM_NOISE_VAR + rng.gen_range(0.0..1.0) * 0.1;
+        let kernel_scale = rng.gen_range(-1.0_f64..1.0).exp();
+        let noise_var = if deterministic_objective {
+            DEFAULT_MINIMUM_NOISE_VAR
+        } else {
+            DEFAULT_MINIMUM_NOISE_VAR + rng.gen_range(-1.0_f64..1.0).exp() * 0.01
+        };
 
         let gpr = GPRegressor::new(
             x_train.to_vec(),
@@ -316,9 +375,9 @@ pub(crate) fn fit_kernel_params(
             noise_var,
         );
 
-        let lml = gpr.log_marginal_likelihood();
-        if lml > best_lml {
-            best_lml = lml;
+        let s = score_gpr(&gpr);
+        if s > best_score {
+            best_score = s;
             best_gpr = Some(gpr);
         }
     }
@@ -457,7 +516,7 @@ pub struct GpSampler {
     /// 局部搜索次数
     n_local_search: usize,
     /// 是否为确定性目标
-    _deterministic_objective: bool,
+    deterministic_objective: bool,
     /// 约束函数
     constraints_func: Option<ConstraintsFn>,
     /// 搜索空间计算器
@@ -505,7 +564,7 @@ impl GpSampler {
             n_startup_trials: n_startup_trials.unwrap_or(10),
             n_preliminary_samples: 2048,
             n_local_search: 10,
-            _deterministic_objective: deterministic_objective,
+            deterministic_objective: deterministic_objective,
             constraints_func,
             search_space: Mutex::new(IntersectionSearchSpace::new(false)),
             rng: Mutex::new(ChaCha8Rng::seed_from_u64(s)),
@@ -518,7 +577,7 @@ impl GpSampler {
     fn sample_relative_impl(
         &self,
         completed_trials: &[FrozenTrial],
-        search_space: &HashMap<String, Distribution>,
+        search_space: &IndexMap<String, Distribution>,
     ) -> Result<HashMap<String, f64>> {
         let param_names: Vec<String> = search_space.keys().cloned().collect();
         let n_params = param_names.len();
@@ -548,12 +607,22 @@ impl GpSampler {
                 }
                 if complete {
                     x_train.push(row);
-                    // 对齐 Python: _sign = -1.0 if MINIMIZE else 1.0\n                    // 统一为「越大越好」以便 logEI 正确工作
+                    // 对齐 Python: _sign = -1.0 if MINIMIZE else 1.0
+                    // 统一为「越大越好」以便 logEI 正确工作
                     let sign = match self.direction {
                         StudyDirection::Minimize | StudyDirection::NotSet => -1.0,
                         StudyDirection::Maximize => 1.0,
                     };
-                    y_train.push(vals[0] * sign); // 单目标
+                    let mut v = vals[0] * sign;
+                    // 对齐 Python warn_and_convert_inf: 将 ±Inf 裁剪为 ±f64::MAX
+                    if v.is_infinite() {
+                        crate::optuna_warn!(
+                            "Trial {} has infinite objective value; clipping to finite bound.",
+                            trial.number
+                        );
+                        v = if v > 0.0 { f64::MAX } else { f64::MIN };
+                    }
+                    y_train.push(v);
                 }
             }
         }
@@ -598,6 +667,7 @@ impl GpSampler {
         let gpr = fit_kernel_params(
             &x_train, &standardized_y, &is_categorical, seed,
             obj_cache.as_ref(),
+            self.deterministic_objective,
         );
 
         // 存储本轮拟合的核参数到缓存
@@ -771,6 +841,7 @@ impl GpSampler {
             let gpr = fit_kernel_params(
                 x_train, &standardized, is_categorical, seed + 100 + idx as u64,
                 c_cache.as_ref(),
+                false, // constraints are not deterministic
             );
 
             // 存储核参数用于下次复用
@@ -794,7 +865,7 @@ impl Sampler for GpSampler {
     fn infer_relative_search_space(
         &self,
         trials: &[FrozenTrial],
-    ) -> HashMap<String, Distribution> {
+    ) -> IndexMap<String, Distribution> {
         // 对齐 Python: 过滤掉 single() 分布（只有一个可能值的分布无需 GP 建模）
         self.search_space
             .lock()
@@ -807,7 +878,7 @@ impl Sampler for GpSampler {
     fn sample_relative(
         &self,
         trials: &[FrozenTrial],
-        search_space: &HashMap<String, Distribution>,
+        search_space: &IndexMap<String, Distribution>,
     ) -> Result<HashMap<String, f64>> {
         if search_space.is_empty() {
             return Ok(HashMap::new());
@@ -834,6 +905,15 @@ impl Sampler for GpSampler {
         param_name: &str,
         distribution: &Distribution,
     ) -> Result<f64> {
+        // 对齐 Python: 当已有足够完成试验但仍回退到独立采样时发出警告
+        let n_complete = trials.iter().filter(|t| t.state == TrialState::Complete).count();
+        if n_complete >= self.n_startup_trials {
+            crate::optuna_warn!(
+                "GpSampler is falling back to independent sampling for param '{}' in trial {}.",
+                param_name,
+                trial.number
+            );
+        }
         self.independent_sampler.sample_independent(trials, trial, param_name, distribution)
     }
 
@@ -1000,7 +1080,7 @@ mod tests {
             });
         }
 
-        let mut search_space = HashMap::new();
+        let mut search_space = IndexMap::new();
         search_space.insert("x".to_string(),
             Distribution::FloatDistribution(
                 crate::distributions::FloatDistribution {
@@ -1070,7 +1150,7 @@ mod tests {
         let is_cat = vec![false];
 
         // 无缓存拟合
-        let gpr1 = fit_kernel_params(&x, &y, &is_cat, 42, None);
+        let gpr1 = fit_kernel_params(&x, &y, &is_cat, 42, None, false);
         let lml1 = gpr1.log_marginal_likelihood();
 
         // 用 gpr1 的参数作为缓存
@@ -1079,7 +1159,7 @@ mod tests {
             kernel_scale: gpr1.kernel_scale,
             noise_var: gpr1.noise_var,
         };
-        let gpr2 = fit_kernel_params(&x, &y, &is_cat, 42, Some(&cache));
+        let gpr2 = fit_kernel_params(&x, &y, &is_cat, 42, Some(&cache), false);
         let lml2 = gpr2.log_marginal_likelihood();
 
         // 有缓存的结果不应该更差（缓存提供了一个额外的候选初始点）

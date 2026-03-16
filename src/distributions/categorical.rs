@@ -89,6 +89,14 @@ impl CategoricalDistribution {
 
     /// Convert an internal representation (index as f64) back to an external value.
     pub fn to_external_repr(&self, value: f64) -> Result<CategoricalChoice> {
+        // Guard against NaN/negative/inf: `f64 as usize` saturates (NaN→0, neg→0),
+        // which would silently return the wrong choice.
+        // Python's `int(float('nan'))` raises ValueError.
+        if value.is_nan() || value < 0.0 || value.is_infinite() {
+            return Err(OptunaError::ValueError(format!(
+                "invalid internal repr {value} for categorical distribution"
+            )));
+        }
         let index = value as usize;
         self.choices.get(index).cloned().ok_or_else(|| {
             OptunaError::ValueError(format!("index {index} out of range for choices"))

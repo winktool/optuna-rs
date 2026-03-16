@@ -1,6 +1,8 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
+use indexmap::IndexMap;
+
 use crate::distributions::{
     CategoricalChoice, CategoricalDistribution, Distribution, FloatDistribution, IntDistribution,
     ParamValue,
@@ -28,7 +30,7 @@ pub struct Trial {
     /// Relative param values pre-sampled by the sampler (internal repr).
     relative_params: HashMap<String, f64>,
     /// Relative search space inferred by sampler.
-    relative_search_space: HashMap<String, Distribution>,
+    relative_search_space: IndexMap<String, Distribution>,
     /// Fixed params injected by enqueue_trial (external repr).
     fixed_params: HashMap<String, ParamValue>,
 }
@@ -45,7 +47,7 @@ impl Trial {
         pruner: Arc<dyn Pruner>,
         directions: Vec<StudyDirection>,
         relative_params: HashMap<String, f64>,
-        relative_search_space: HashMap<String, Distribution>,
+        relative_search_space: IndexMap<String, Distribution>,
         fixed_params: HashMap<String, ParamValue>,
     ) -> Self {
         Self {
@@ -407,6 +409,8 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Arc;
 
+    use indexmap::IndexMap;
+
     use crate::distributions::Distribution;
     use crate::error::Result;
     use crate::pruners::Pruner;
@@ -570,7 +574,7 @@ mod tests {
 
     #[test]
     fn test_relative_params_accessor() {
-        let mut fixed = HashMap::new();
+        let mut fixed = IndexMap::new();
         fixed.insert(
             "x".to_string(),
             Distribution::FloatDistribution(
@@ -650,8 +654,8 @@ mod tests {
         fn infer_relative_search_space(
             &self,
             _trials: &[FrozenTrial],
-        ) -> HashMap<String, Distribution> {
-            let mut m = HashMap::new();
+        ) -> IndexMap<String, Distribution> {
+            let mut m = IndexMap::new();
             m.insert(
                 "x".to_string(),
                 Distribution::FloatDistribution(
@@ -664,7 +668,7 @@ mod tests {
         fn sample_relative(
             &self,
             _trials: &[FrozenTrial],
-            _search_space: &HashMap<String, Distribution>,
+            _search_space: &IndexMap<String, Distribution>,
         ) -> Result<HashMap<String, f64>> {
             let mut m = HashMap::new();
             // 故意返回超范围值，触发 Trial::suggest 的 independent 回退路径。

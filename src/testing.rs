@@ -5,6 +5,7 @@
 
 use std::collections::HashMap;
 
+use indexmap::IndexMap;
 use chrono::Utc;
 
 use crate::distributions::{Distribution, ParamValue};
@@ -40,14 +41,14 @@ impl Sampler for DeterministicSampler {
     fn infer_relative_search_space(
         &self,
         _trials: &[FrozenTrial],
-    ) -> HashMap<String, Distribution> {
-        HashMap::new()
+    ) -> IndexMap<String, Distribution> {
+        IndexMap::new()
     }
 
     fn sample_relative(
         &self,
         _trials: &[FrozenTrial],
-        _search_space: &HashMap<String, Distribution>,
+        _search_space: &IndexMap<String, Distribution>,
     ) -> Result<HashMap<String, f64>> {
         Ok(HashMap::new())
     }

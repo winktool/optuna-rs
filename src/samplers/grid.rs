@@ -1,6 +1,7 @@
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
 
+use indexmap::IndexMap;
 use parking_lot::Mutex;
 use rand::seq::SliceRandom;
 use rand::SeedableRng;
@@ -206,9 +207,9 @@ impl Sampler for GridSampler {
     fn infer_relative_search_space(
         &self,
         _trials: &[FrozenTrial],
-    ) -> HashMap<String, Distribution> {
+    ) -> IndexMap<String, Distribution> {
         // GridSampler doesn't use relative sampling; everything goes through sample_independent.
-        HashMap::new()
+        IndexMap::new()
     }
 
     fn sample_independent(

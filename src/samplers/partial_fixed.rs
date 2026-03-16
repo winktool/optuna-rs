@@ -1,6 +1,8 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
+use indexmap::IndexMap;
+
 use crate::distributions::{Distribution, ParamValue};
 use crate::error::Result;
 use crate::optuna_warn;
@@ -71,11 +73,11 @@ impl Sampler for PartialFixedSampler {
     fn infer_relative_search_space(
         &self,
         trials: &[FrozenTrial],
-    ) -> HashMap<String, Distribution> {
+    ) -> IndexMap<String, Distribution> {
         let mut space = self.base_sampler.infer_relative_search_space(trials);
         // Remove fixed params from the relative search space
         for name in self.fixed_params.keys() {
-            space.remove(name);
+            space.shift_remove(name);
         }
         space
     }
@@ -83,7 +85,7 @@ impl Sampler for PartialFixedSampler {
     fn sample_relative(
         &self,
         trials: &[FrozenTrial],
-        search_space: &HashMap<String, Distribution>,
+        search_space: &IndexMap<String, Distribution>,
     ) -> Result<HashMap<String, f64>> {
         // 对齐 Python: sample_relative 中不注入固定参数
         // 固定参数通过 sample_independent 路径返回
@@ -332,7 +334,7 @@ mod tests {
         fixed.insert("x".to_string(), 0.5);
 
         let sampler = PartialFixedSampler::new(fixed, base);
-        let result = sampler.sample_relative(&[], &HashMap::new()).unwrap();
+        let result = sampler.sample_relative(&[], &IndexMap::new()).unwrap();
         // 固定参数不应在 sample_relative 结果中
         assert!(!result.contains_key("x"), "固定参数不应被注入到 sample_relative");
     }

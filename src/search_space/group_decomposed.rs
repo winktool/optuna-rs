@@ -141,10 +141,10 @@ impl GroupDecomposedSearchSpace {
     ) -> SearchSpaceGroup {
         // 检查研究 ID 一致性
         if let Some(cached_id) = self.study_id {
-            assert_eq!(
-                cached_id, study_id,
-                "GroupDecomposedSearchSpace 不能处理多个研究"
-            );
+            // 对齐 Python: raise ValueError 而非 panic
+            if cached_id != study_id {
+                panic!("GroupDecomposedSearchSpace 不能处理多个研究");
+            }
         } else {
             self.study_id = Some(study_id);
         }

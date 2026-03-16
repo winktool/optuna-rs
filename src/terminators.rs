@@ -26,6 +26,7 @@ use crate::samplers::gp::{
 };
 use crate::search_space::IntersectionSearchSpace;
 
+use indexmap::IndexMap;
 use rand::Rng;
 use rand::SeedableRng;
 use rand_chacha::ChaCha8Rng;
@@ -442,7 +443,7 @@ impl ImprovementEvaluator for BestValueStagnationEvaluator {
 /// y_values 未标准化（raw sign-adjusted values），调用者负责标准化。
 fn prepare_gp_data(
     trials: &[FrozenTrial],
-    search_space: &std::collections::HashMap<String, Distribution>,
+    search_space: &IndexMap<String, Distribution>,
     study_direction: StudyDirection,
 ) -> (Vec<Vec<f64>>, Vec<f64>, Vec<bool>, Vec<String>) {
     let param_names: Vec<String> = search_space.keys().cloned().collect();
@@ -538,7 +539,7 @@ fn compute_standardized_regret_bound(
     n_optimize_samples: usize,
     rng: &mut ChaCha8Rng,
     is_categorical: &[bool],
-    search_space: &std::collections::HashMap<String, Distribution>,
+    search_space: &IndexMap<String, Distribution>,
     param_names: &[String],
 ) -> f64 {
     let delta = 0.1_f64;
@@ -639,7 +640,7 @@ impl ImprovementEvaluator for RegretBoundEvaluator {
 
         // 拟合 GP
         let seed = self.seed.unwrap_or(42);
-        let gpr = fit_kernel_params(&top_x, &standardized_y, &is_categorical, seed, None);
+        let gpr = fit_kernel_params(&top_x, &standardized_y, &is_categorical, seed, None, false);
 
         // 计算标准化 regret bound
         let mut rng = ChaCha8Rng::seed_from_u64(seed);
@@ -769,7 +770,7 @@ impl ImprovementEvaluator for EMMREvaluator {
         // 对齐 Python: 先拟合 t-1 个观测的 GP，再以其为初始值拟合全部 t 个观测
         let x_t_minus_1: Vec<Vec<f64>> = x_train[..n - 1].to_vec();
         let y_t_minus_1: Vec<f64> = std_y[..n - 1].to_vec();
-        let gpr_t1 = fit_kernel_params(&x_t_minus_1, &y_t_minus_1, &is_categorical, seed, None);
+        let gpr_t1 = fit_kernel_params(&x_t_minus_1, &y_t_minus_1, &is_categorical, seed, None, false);
 
         // 用 gpr_t1 的超参数作为 cache 初始化拟合全部 t 个观测
         let cache = KernelParamsCache {
@@ -777,7 +778,7 @@ impl ImprovementEvaluator for EMMREvaluator {
             kernel_scale: gpr_t1.kernel_scale,
             noise_var: gpr_t1.noise_var,
         };
-        let gpr_t = fit_kernel_params(&x_train, &std_y, &is_categorical, seed, Some(&cache));
+        let gpr_t = fit_kernel_params(&x_train, &std_y, &is_categorical, seed, Some(&cache), false);
 
         // θ_t* = argmax(std_y 全部)，θ_{t-1}* = argmax(std_y 前 t-1)
         let idx_t_star = std_y.iter().enumerate()

@@ -222,6 +222,8 @@ impl Callback for TerminatorCallback {
     fn on_trial_complete(&self, study: &Study, _trial: &FrozenTrial) {
         // 检查终止器条件
         if self.terminator.should_terminate(study) {
+            // 对齐 Python: 输出终止日志
+            crate::optuna_info!("The study has been stopped by the terminator.");
             study.stop();
         }
     }

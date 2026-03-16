@@ -203,7 +203,7 @@ pub trait Storage: Send + Sync {
         }
         let directions = self.get_study_directions(study_id)?;
         if directions.len() > 1 {
-            return Err(OptunaError::ValueError(
+            return Err(OptunaError::RuntimeError(
                 "best trial can be obtained only for single-objective optimization".into(),
             ));
         }
@@ -238,6 +238,32 @@ pub trait Storage: Send + Sync {
 
     /// No-op session cleanup hook.
     fn remove_session(&self) {}
+
+    // ── 便捷方法 (对应 Python BaseStorage 默认实现) ─────────────────
+
+    /// 获取试验参数。对应 Python `BaseStorage.get_trial_params`。
+    fn get_trial_params(
+        &self,
+        trial_id: i64,
+    ) -> Result<HashMap<String, crate::distributions::ParamValue>> {
+        Ok(self.get_trial(trial_id)?.params)
+    }
+
+    /// 获取试验用户属性。对应 Python `BaseStorage.get_trial_user_attrs`。
+    fn get_trial_user_attrs(
+        &self,
+        trial_id: i64,
+    ) -> Result<HashMap<String, serde_json::Value>> {
+        Ok(self.get_trial(trial_id)?.user_attrs)
+    }
+
+    /// 获取试验系统属性。对应 Python `BaseStorage.get_trial_system_attrs`。
+    fn get_trial_system_attrs(
+        &self,
+        trial_id: i64,
+    ) -> Result<HashMap<String, serde_json::Value>> {
+        Ok(self.get_trial(trial_id)?.system_attrs)
+    }
 }
 
 #[cfg(test)]

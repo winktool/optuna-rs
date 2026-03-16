@@ -31,6 +31,10 @@ pub enum OptunaError {
     /// 对应 Python `NotImplementedError`。
     #[error("not implemented: {0}")]
     NotImplemented(String),
+
+    /// 对应 Python `RuntimeError` — 通用运行时错误。
+    #[error("runtime error: {0}")]
+    RuntimeError(String),
 }
 
 /// Convenience alias used throughout the crate.

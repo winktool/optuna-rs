@@ -18,10 +18,10 @@ pub struct FrozenStudy {
 
 impl FrozenStudy {
     /// 对齐 Python `FrozenStudy.direction` property:
-    /// 单目标时返回唯一方向，多目标时报错。
+    /// 单目标时返回唯一方向，多目标时报 RuntimeError。
     pub fn direction(&self) -> crate::error::Result<StudyDirection> {
         if self.directions.len() != 1 {
-            return Err(crate::error::OptunaError::ValueError(
+            return Err(crate::error::OptunaError::RuntimeError(
                 "This attribute is not available during multi-objective optimization.".into(),
             ));
         }
@@ -126,7 +126,7 @@ mod tests {
         assert_eq!(fs.direction().unwrap(), StudyDirection::Minimize);
     }
 
-    /// 对齐 Python: FrozenStudy.direction() 多目标时报 ValueError
+    /// 对齐 Python: FrozenStudy.direction() 多目标时报 RuntimeError
     #[test]
     fn test_frozen_study_direction_multi_error() {
         let fs = FrozenStudy {
@@ -136,7 +136,8 @@ mod tests {
             user_attrs: HashMap::new(),
             system_attrs: HashMap::new(),
         };
-        assert!(fs.direction().is_err());
+        let err = fs.direction().unwrap_err();
+        assert!(matches!(err, crate::error::OptunaError::RuntimeError(_)));
     }
 
     /// 对齐 Python: FrozenStudy PartialEq

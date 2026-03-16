@@ -56,6 +56,7 @@ fn error_matches_catch(err: &OptunaError, catch: &[&str]) -> bool {
         OptunaError::UpdateFinishedTrialError(_) => "UpdateFinishedTrialError",
         OptunaError::InvalidDistribution(_) => "InvalidDistribution",
         OptunaError::NotImplemented(_) => "NotImplemented",
+        OptunaError::RuntimeError(_) => "RuntimeError",
     };
     catch.contains(&variant)
 }
@@ -109,10 +110,11 @@ impl Study {
     }
 
     /// Single-objective direction (errors if multi-objective).
+    /// 对齐 Python: 多目标时抛 RuntimeError。
     pub fn direction(&self) -> Result<StudyDirection> {
         if self.directions.len() != 1 {
-            return Err(OptunaError::ValueError(
-                "direction is not supported for multi-objective studies".into(),
+            return Err(OptunaError::RuntimeError(
+                "A single direction cannot be retrieved from a multi-objective study. Consider using the `directions` property instead.".into(),
             ));
         }
         Ok(self.directions[0])
@@ -2270,5 +2272,43 @@ mod tests {
         assert!(result.is_err());
         let err_msg = result.unwrap_err().to_string();
         assert!(err_msg.contains("finished"), "错误消息应包含 'finished', got: {}", err_msg);
+    }
+
+    /// 对齐 Python: direction() 多目标时应抛 RuntimeError
+    #[test]
+    fn test_study_direction_multi_objective_runtime_error() {
+        let study = create_study(
+            None, None, None, None,
+            None, Some(vec![StudyDirection::Minimize, StudyDirection::Maximize]),
+            false,
+        ).unwrap();
+        match study.direction() {
+            Err(OptunaError::RuntimeError(_)) => {} // 预期
+            other => panic!("expected RuntimeError, got {:?}", other.err()),
+        }
+    }
+
+    /// 对齐 Python: create_study 拒绝 NOT_SET 方向
+    #[test]
+    fn test_create_study_rejects_not_set_direction() {
+        let result = create_study(
+            None, None, None, None,
+            Some(StudyDirection::NotSet), None, false,
+        );
+        match result {
+            Err(e) => assert!(e.to_string().contains("MINIMIZE or MAXIMIZE")),
+            Ok(_) => panic!("expected error for NotSet direction"),
+        }
+    }
+
+    /// 对齐 Python: create_study 拒绝 directions 中包含 NOT_SET
+    #[test]
+    fn test_create_study_rejects_not_set_in_directions() {
+        let result = create_study(
+            None, None, None, None,
+            None, Some(vec![StudyDirection::Minimize, StudyDirection::NotSet]),
+            false,
+        );
+        assert!(result.is_err());
     }
 }

@@ -49,6 +49,24 @@ impl Distribution {
         }
     }
 
+    /// 对齐 Python `_get_single_value()`: 返回唯一值（调用前需确保 `single()` 为 true）。
+    pub fn get_single_value(&self) -> Result<ParamValue> {
+        match self {
+            Self::FloatDistribution(d) => Ok(ParamValue::Float(d.low)),
+            Self::IntDistribution(d) => Ok(ParamValue::Int(d.low)),
+            Self::CategoricalDistribution(d) => Ok(ParamValue::Categorical(d.choices[0].clone())),
+        }
+    }
+
+    /// 对齐 Python `_is_distribution_log()`: 返回分布是否为对数尺度。
+    pub fn is_log(&self) -> bool {
+        match self {
+            Self::FloatDistribution(d) => d.log,
+            Self::IntDistribution(d) => d.log,
+            Self::CategoricalDistribution(_) => false,
+        }
+    }
+
     /// Convert an external `ParamValue` to an internal `f64` representation.
     ///
     /// 对齐 Python: CategoricalDistribution 接受任意类型的值并在 choices 中查找索引。
@@ -122,38 +140,33 @@ pub fn check_distribution_compatibility(
         // 对齐 Python: Float 仅检查 log，不检查 step
         (Distribution::FloatDistribution(a), Distribution::FloatDistribution(b)) => {
             if a.log != b.log {
-                return Err(OptunaError::ValueError(format!(
-                    "Cannot set different `log` values for the same parameter: {} vs {}",
-                    a.log, b.log
-                )));
+                return Err(OptunaError::ValueError(
+                    "Cannot set different log configuration to the same parameter name.".to_string(),
+                ));
             }
             Ok(())
         }
         // 对齐 Python: Int 仅检查 log，不检查 step
         (Distribution::IntDistribution(a), Distribution::IntDistribution(b)) => {
             if a.log != b.log {
-                return Err(OptunaError::ValueError(format!(
-                    "Cannot set different `log` values for the same parameter: {} vs {}",
-                    a.log, b.log
-                )));
+                return Err(OptunaError::ValueError(
+                    "Cannot set different log configuration to the same parameter name.".to_string(),
+                ));
             }
             Ok(())
         }
         (Distribution::CategoricalDistribution(a), Distribution::CategoricalDistribution(b)) => {
             if a.choices != b.choices {
-                return Err(OptunaError::ValueError(format!(
-                    "Cannot set different `choices` for the same parameter: {:?} vs {:?}",
-                    a.choices, b.choices
-                )));
+                return Err(OptunaError::ValueError(
+                    "CategoricalDistribution does not support dynamic value space.".to_string(),
+                ));
             }
             Ok(())
         }
         _ => {
-            Err(OptunaError::ValueError(format!(
-                "Cannot use different distribution types for the same parameter: {:?} vs {:?}",
-                std::mem::discriminant(dist_a),
-                std::mem::discriminant(dist_b),
-            )))
+            Err(OptunaError::ValueError(
+                "Cannot set different distribution kind to the same parameter name.".to_string(),
+            ))
         }
     }
 }
@@ -326,5 +339,75 @@ mod tests {
         let a = Distribution::FloatDistribution(FloatDistribution::new(0.0, 1.0, false, None).unwrap());
         let b = Distribution::IntDistribution(IntDistribution::new(0, 1, false, 1).unwrap());
         assert!(check_distribution_compatibility(&a, &b).is_err());
+    }
+
+    // ── 新增测试：对齐 Python 审计修复 ──
+
+    /// 对齐 Python: get_single_value() 返回唯一值
+    #[test]
+    fn test_get_single_value_float() {
+        let d = Distribution::FloatDistribution(FloatDistribution::new(1.5, 1.5, false, None).unwrap());
+        assert!(d.single());
+        assert_eq!(d.get_single_value().unwrap(), ParamValue::Float(1.5));
+    }
+
+    #[test]
+    fn test_get_single_value_int() {
+        let d = Distribution::IntDistribution(IntDistribution::new(3, 3, false, 1).unwrap());
+        assert!(d.single());
+        assert_eq!(d.get_single_value().unwrap(), ParamValue::Int(3));
+    }
+
+    #[test]
+    fn test_get_single_value_categorical() {
+        let d = Distribution::CategoricalDistribution(
+            CategoricalDistribution::new(vec![CategoricalChoice::Str("only".into())]).unwrap(),
+        );
+        assert!(d.single());
+        assert_eq!(
+            d.get_single_value().unwrap(),
+            ParamValue::Categorical(CategoricalChoice::Str("only".into()))
+        );
+    }
+
+    /// 对齐 Python: is_log() 方法
+    #[test]
+    fn test_is_log() {
+        let d1 = Distribution::FloatDistribution(FloatDistribution::new(0.01, 1.0, true, None).unwrap());
+        assert!(d1.is_log());
+        let d2 = Distribution::FloatDistribution(FloatDistribution::new(0.0, 1.0, false, None).unwrap());
+        assert!(!d2.is_log());
+        let d3 = Distribution::IntDistribution(IntDistribution::new(1, 10, true, 1).unwrap());
+        assert!(d3.is_log());
+        let d4 = Distribution::CategoricalDistribution(
+            CategoricalDistribution::new(vec![CategoricalChoice::Int(1)]).unwrap(),
+        );
+        assert!(!d4.is_log());
+    }
+
+    /// 对齐 Python: check_distribution_compatibility 错误消息完全匹配
+    #[test]
+    fn test_compat_error_messages_match_python() {
+        // 不同类型
+        let a = Distribution::FloatDistribution(FloatDistribution::new(0.0, 1.0, false, None).unwrap());
+        let b = Distribution::IntDistribution(IntDistribution::new(0, 1, false, 1).unwrap());
+        let err = check_distribution_compatibility(&a, &b).unwrap_err();
+        assert!(err.to_string().contains("Cannot set different distribution kind to the same parameter name."));
+
+        // 不同 log
+        let a = Distribution::FloatDistribution(FloatDistribution::new(0.01, 1.0, true, None).unwrap());
+        let b = Distribution::FloatDistribution(FloatDistribution::new(0.01, 1.0, false, None).unwrap());
+        let err = check_distribution_compatibility(&a, &b).unwrap_err();
+        assert!(err.to_string().contains("Cannot set different log configuration to the same parameter name."));
+
+        // 不同 choices
+        let a = Distribution::CategoricalDistribution(
+            CategoricalDistribution::new(vec![CategoricalChoice::Str("a".into())]).unwrap(),
+        );
+        let b = Distribution::CategoricalDistribution(
+            CategoricalDistribution::new(vec![CategoricalChoice::Str("b".into())]).unwrap(),
+        );
+        let err = check_distribution_compatibility(&a, &b).unwrap_err();
+        assert!(err.to_string().contains("CategoricalDistribution does not support dynamic value space."));
     }
 }

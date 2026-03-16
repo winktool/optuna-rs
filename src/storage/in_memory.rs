@@ -2,6 +2,7 @@ use std::collections::HashMap;
 
 use chrono::Utc;
 use parking_lot::Mutex;
+use uuid::Uuid;
 
 use crate::distributions::Distribution;
 use crate::error::{OptunaError, Result};
@@ -125,13 +126,24 @@ impl InMemoryStorage {
         };
 
         let direction = study.directions[0];
+        // 对齐 Python _CachedStorage._update_cache: NaN 值的处理
         let is_better = if let Some(best_id) = study.best_trial_id {
             let best_trial = study.trials.iter().find(|t| t.trial_id == best_id);
             match best_trial.and_then(|t| t.value().ok().flatten()) {
-                Some(best_value) => match direction {
-                    StudyDirection::Minimize | StudyDirection::NotSet => new_value < best_value,
-                    StudyDirection::Maximize => new_value > best_value,
-                },
+                Some(best_value) => {
+                    if best_value.is_nan() {
+                        // 当前 best 是 NaN，任何非 NaN 值都更好
+                        true
+                    } else if new_value.is_nan() {
+                        // 新值是 NaN，不替换有效的 best
+                        false
+                    } else {
+                        match direction {
+                            StudyDirection::Minimize | StudyDirection::NotSet => new_value < best_value,
+                            StudyDirection::Maximize => new_value > best_value,
+                        }
+                    }
+                }
                 None => true,
             }
         } else {
@@ -161,7 +173,9 @@ impl Storage for InMemoryStorage {
                 }
                 n.to_string()
             }
-            None => format!("no-name-{study_id}"),
+            // 对齐 Python: 使用 UUID4 保证全局唯一性
+            // Python: study_name = "no-name-" + str(uuid.uuid4())
+            None => format!("no-name-{}", Uuid::new_v4()),
         };
 
         inner.study_name_to_id.insert(name.clone(), study_id);
@@ -188,15 +202,9 @@ impl Storage for InMemoryStorage {
             .ok_or_else(|| OptunaError::ValueError(format!("study {study_id} not found")))?;
         inner.study_name_to_id.remove(&study.name);
 
-        // Remove trial mappings
-        let trial_ids: Vec<i64> = inner
-            .trial_id_to_study_id_and_number
-            .iter()
-            .filter(|(_, (sid, _))| *sid == study_id)
-            .map(|(tid, _)| *tid)
-            .collect();
-        for tid in trial_ids {
-            inner.trial_id_to_study_id_and_number.remove(&tid);
+        // 对齐 Python: 直接从 study.trials 获取 trial_id 删除映射, O(n_trials)
+        for trial in &study.trials {
+            inner.trial_id_to_study_id_and_number.remove(&trial.trial_id);
         }
         Ok(())
     }
@@ -262,7 +270,8 @@ impl Storage for InMemoryStorage {
 
     fn get_all_studies(&self) -> Result<Vec<FrozenStudy>> {
         let inner = self.inner.lock();
-        Ok(inner
+        // 对齐 Python: 返回值按 study_id 排序 (Python dict 保持插入顺序等价)
+        let mut studies: Vec<FrozenStudy> = inner
             .studies
             .iter()
             .map(|(study_id, info)| FrozenStudy {
@@ -272,7 +281,9 @@ impl Storage for InMemoryStorage {
                 user_attrs: info.user_attrs.clone(),
                 system_attrs: info.system_attrs.clone(),
             })
-            .collect())
+            .collect();
+        studies.sort_by_key(|s| s.study_id);
+        Ok(studies)
     }
 
     fn create_new_trial(
@@ -563,49 +574,32 @@ impl Storage for InMemoryStorage {
     }
 
     /// 对齐 Python: 在单一锁作用域内完成 best_trial 查找，避免死锁。
-    /// 使用 `f64::total_cmp` 防止 NaN 导致 panic。
+    /// 使用 `best_trial_id` 缓存（由 `update_cache` 维护），O(1) 查找。
     fn get_best_trial(&self, study_id: i64) -> Result<FrozenTrial> {
         let inner = self.inner.lock();
         let study = Self::get_study(&inner, study_id)?;
 
+        // 对齐 Python: 多目标时抛 RuntimeError (Rust 用 OptunaError::RuntimeError)
         if study.directions.len() > 1 {
-            return Err(OptunaError::ValueError(
+            return Err(OptunaError::RuntimeError(
                 "best trial can be obtained only for single-objective optimization".into(),
             ));
         }
-        let direction = study.directions[0];
 
-        let mut best: Option<&FrozenTrial> = None;
-        for trial in study.trials.iter() {
-            if trial.state != TrialState::Complete {
-                continue;
+        // 对齐 Python: 使用缓存的 best_trial_id，O(1)
+        match study.best_trial_id {
+            Some(best_id) => {
+                let trial = study.trials.iter()
+                    .find(|t| t.trial_id == best_id)
+                    .ok_or_else(|| OptunaError::ValueError(
+                        "best trial not found in study trials".into(),
+                    ))?;
+                Ok(trial.clone())
             }
-            let v = match trial.values.as_ref().and_then(|vs| vs.first()) {
-                Some(v) => *v,
-                None => continue,
-            };
-            match best {
-                None => best = Some(trial),
-                Some(b) => {
-                    let bv = b.values.as_ref().unwrap()[0];
-                    let is_better = match direction {
-                        StudyDirection::Minimize | StudyDirection::NotSet => {
-                            v.total_cmp(&bv) == std::cmp::Ordering::Less
-                        }
-                        StudyDirection::Maximize => {
-                            v.total_cmp(&bv) == std::cmp::Ordering::Greater
-                        }
-                    };
-                    if is_better {
-                        best = Some(trial);
-                    }
-                }
-            }
+            None => Err(OptunaError::ValueError(
+                "no trials are completed yet".into(),
+            )),
         }
-
-        best.cloned().ok_or_else(|| {
-            OptunaError::ValueError("no trials are completed yet".into())
-        })
     }
 }
 
@@ -1242,5 +1236,84 @@ mod tests {
         // 不应 panic
         let best = storage.get_best_trial(sid).unwrap();
         assert_eq!(best.values, Some(vec![2.0]));
+    }
+
+    // ── 对齐 Python 审计修复的新测试 ──
+
+    /// 对齐 Python: auto-naming 使用 UUID 保证唯一性
+    #[test]
+    fn test_auto_name_uniqueness() {
+        let storage = InMemoryStorage::new();
+        let s1 = storage.create_new_study(&[StudyDirection::Minimize], None).unwrap();
+        let s2 = storage.create_new_study(&[StudyDirection::Minimize], None).unwrap();
+        let n1 = storage.get_study_name_from_id(s1).unwrap();
+        let n2 = storage.get_study_name_from_id(s2).unwrap();
+        assert!(n1.starts_with("no-name-"));
+        assert!(n2.starts_with("no-name-"));
+        assert_ne!(n1, n2, "UUID 自动名称应唯一");
+    }
+
+    /// 对齐 Python: get_all_studies 结果按 study_id 排序
+    #[test]
+    fn test_get_all_studies_sorted() {
+        let storage = InMemoryStorage::new();
+        for i in 0..5 {
+            storage.create_new_study(&[StudyDirection::Minimize], Some(&format!("s{}", i))).unwrap();
+        }
+        let studies = storage.get_all_studies().unwrap();
+        for i in 1..studies.len() {
+            assert!(studies[i].study_id > studies[i - 1].study_id,
+                "studies 应按 study_id 排序");
+        }
+    }
+
+    /// 对齐 Python: get_best_trial 多目标应抛 RuntimeError
+    #[test]
+    fn test_get_best_trial_multi_objective_runtime_error() {
+        let storage = InMemoryStorage::new();
+        let sid = storage.create_new_study(
+            &[StudyDirection::Minimize, StudyDirection::Maximize], None
+        ).unwrap();
+        let err = storage.get_best_trial(sid).unwrap_err();
+        assert!(matches!(err, OptunaError::RuntimeError(_)));
+    }
+
+    /// 对齐 Python: get_trial_params/user_attrs/system_attrs 便捷方法
+    #[test]
+    fn test_storage_convenience_methods() {
+        use crate::distributions::{Distribution, FloatDistribution};
+        let storage = InMemoryStorage::new();
+        let sid = storage.create_new_study(&[StudyDirection::Minimize], None).unwrap();
+        let tid = storage.create_new_trial(sid, None).unwrap();
+        // 设置参数 (内部表示 f64)
+        let dist = Distribution::FloatDistribution(FloatDistribution::new(0.0, 1.0, false, None).unwrap());
+        storage.set_trial_param(tid, "x", 0.5, &dist).unwrap();
+        // 设置 user attr
+        storage.set_trial_user_attr(tid, "ua_key", serde_json::json!("ua_val")).unwrap();
+        // 设置 system attr
+        storage.set_trial_system_attr(tid, "sa_key", serde_json::json!("sa_val")).unwrap();
+
+        // 测试便捷方法
+        let params = storage.get_trial_params(tid).unwrap();
+        assert!(params.contains_key("x"));
+
+        let ua = storage.get_trial_user_attrs(tid).unwrap();
+        assert_eq!(ua.get("ua_key"), Some(&serde_json::json!("ua_val")));
+
+        let sa = storage.get_trial_system_attrs(tid).unwrap();
+        assert_eq!(sa.get("sa_key"), Some(&serde_json::json!("sa_val")));
+    }
+
+    /// 对齐 Python: NaN best 被非 NaN 值替换（Maximize 方向）
+    #[test]
+    fn test_get_best_trial_nan_maximize() {
+        let storage = InMemoryStorage::new();
+        let sid = storage.create_new_study(&[StudyDirection::Maximize], None).unwrap();
+        let tid1 = storage.create_new_trial(sid, None).unwrap();
+        storage.set_trial_state_values(tid1, TrialState::Complete, Some(&[f64::NAN])).unwrap();
+        let tid2 = storage.create_new_trial(sid, None).unwrap();
+        storage.set_trial_state_values(tid2, TrialState::Complete, Some(&[5.0])).unwrap();
+        let best = storage.get_best_trial(sid).unwrap();
+        assert_eq!(best.values, Some(vec![5.0]));
     }
 }

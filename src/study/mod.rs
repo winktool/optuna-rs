@@ -58,6 +58,13 @@ pub fn create_study(
         vec![StudyDirection::Minimize]
     };
 
+    // 对齐 Python: 禁止使用 NOT_SET 方向
+    if dirs.iter().any(|d| matches!(d, StudyDirection::NotSet)) {
+        return Err(OptunaError::ValueError(
+            "StudyDirection must be either MINIMIZE or MAXIMIZE.".into(),
+        ));
+    }
+
     // 默认使用内存存储
     let storage = storage.unwrap_or_else(|| Arc::new(InMemoryStorage::new()));
 
@@ -120,9 +127,14 @@ pub fn load_study(
     let name = storage.get_study_name_from_id(study_id)?;
     let dirs = storage.get_study_directions(study_id)?;
 
-    // 使用默认或指定的采样器/剪枝器
-    let sampler =
-        sampler.unwrap_or_else(|| Arc::new(TpeSamplerBuilder::new(dirs[0]).build()));
+    // 对齐 Python: 多目标时默认切换到 NSGAIISampler
+    let sampler = sampler.unwrap_or_else(|| {
+        if dirs.len() > 1 {
+            Arc::new(NSGAIISamplerBuilder::new(dirs.to_vec()).build())
+        } else {
+            Arc::new(TpeSamplerBuilder::new(dirs[0]).build())
+        }
+    });
     let pruner = pruner.unwrap_or_else(|| {
         Arc::new(MedianPruner::new(5, 0, 1, 1, dirs[0]))
     });

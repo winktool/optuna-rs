@@ -205,6 +205,32 @@ impl TpeSampler {
 
     /// Split trials into below (good) and above (bad) groups.
     ///
+    /// 对齐 Python `_get_pruned_trial_score(trial, direction)`:
+    /// 有中间值时返回 (-step, value)，Maximize 时对 value 取负。
+    /// 无中间值时返回 (1, 0.0)。
+    fn pruned_trial_score(trial: &FrozenTrial, direction: StudyDirection) -> (i64, f64) {
+        if trial.intermediate_values.is_empty() {
+            return (1, 0.0);
+        }
+        let (step, intermediate_value) = trial
+            .intermediate_values
+            .iter()
+            .max_by_key(|(k, _)| *k)
+            .map(|(&k, &v)| (k, v))
+            .unwrap();
+        let v = if intermediate_value.is_nan() {
+            f64::INFINITY
+        } else {
+            match direction {
+                StudyDirection::Maximize => -intermediate_value,
+                _ => intermediate_value,
+            }
+        };
+        (-step, v)
+    }
+
+    /// Split trials into below/above groups for TPE.
+    ///
     /// When constraints are enabled, infeasible trials are separated and
     /// only fill below if feasible trials don't fill it.
     fn split_trials<'a>(
@@ -252,38 +278,14 @@ impl TpeSampler {
         }
 
         // Sort pruned by (-last_step, direction-aware intermediate_value).
-        // 对齐 Python _get_pruned_trial_score：Maximize 时对中间值取负
+        // 对齐 Python _get_pruned_trial_score：
+        //   有中间值时返回 (-step, value) 或 (-step, -value for Maximize)
+        //   无中间值时返回 (1, 0.0)
         // 对齐 Python: NaN 中间值映射为 inf，确保排在同步骤试验的最后
         pruned.sort_by(|a, b| {
-            let sa = a.last_step().unwrap_or(i64::MIN);
-            let sb = b.last_step().unwrap_or(i64::MIN);
-            match sb.cmp(&sa) {
-                std::cmp::Ordering::Equal => {
-                    // 对齐 Python: if math.isnan(intermediate_value): return (-step, float("inf"))
-                    let va = a
-                        .intermediate_values
-                        .get(&sa)
-                        .copied()
-                        .unwrap_or(f64::INFINITY);
-                    let va = if va.is_nan() { f64::INFINITY } else { va };
-                    let vb = b
-                        .intermediate_values
-                        .get(&sb)
-                        .copied()
-                        .unwrap_or(f64::INFINITY);
-                    let vb = if vb.is_nan() { f64::INFINITY } else { vb };
-                    // Minimize: 小值优先(升序)；Maximize: 大值优先(降序)
-                    match self.direction {
-                        StudyDirection::Maximize => {
-                            vb.partial_cmp(&va).unwrap_or(std::cmp::Ordering::Equal)
-                        }
-                        _ => {
-                            va.partial_cmp(&vb).unwrap_or(std::cmp::Ordering::Equal)
-                        }
-                    }
-                }
-                other => other,
-            }
+            let score_a = Self::pruned_trial_score(a, self.direction);
+            let score_b = Self::pruned_trial_score(b, self.direction);
+            score_a.partial_cmp(&score_b).unwrap_or(std::cmp::Ordering::Equal)
         });
 
         // Split: best n_below from complete, then pruned, then infeasible.

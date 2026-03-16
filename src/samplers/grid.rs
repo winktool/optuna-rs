@@ -46,8 +46,13 @@ impl GridSampler {
     /// * `search_space` - Map from param name to list of internal-repr values.
     /// * `seed` - Optional seed for shuffling and random selection.
     pub fn new(search_space: HashMap<String, Vec<f64>>, seed: Option<u64>) -> Self {
-        // 对齐 Python: seed=None → seed=0（确定性），不使用随机熵
-        let mut rng = ChaCha8Rng::seed_from_u64(seed.unwrap_or(0));
+        // 对齐 Python: seed=None → 随机种子，seed=Some → 固定种子
+        let actual_seed = seed.unwrap_or_else(|| {
+            use std::collections::hash_map::RandomState;
+            use std::hash::{BuildHasher, Hasher};
+            RandomState::new().build_hasher().finish()
+        });
+        let mut rng = ChaCha8Rng::seed_from_u64(actual_seed);
 
         // Sort param names for deterministic ordering.
         let mut param_names: Vec<String> = search_space.keys().cloned().collect();
@@ -514,18 +519,35 @@ mod tests {
         assert_eq!(result.unwrap(), 0, "唯一的 grid_id 应为 0");
     }
 
-    /// 对齐 Python: seed=None 时应使用 seed=0（确定性）
+    /// 对齐 Python: seed=None 时应使用随机种子
     #[test]
-    fn test_grid_sampler_seed_none_is_deterministic() {
+    fn test_grid_sampler_seed_none_is_random() {
         let mk = || {
             let mut space = HashMap::new();
             space.insert("x".to_string(), vec![1.0, 2.0, 3.0]);
             space.insert("y".to_string(), vec![10.0, 20.0]);
             GridSampler::new(space, None)
         };
+        // seed=None → 随机种子，两次构造不相同（高概率）
+        // 不能保证100%不同，但 u64 空间足够大
         let s1 = mk();
         let s2 = mk();
-        // seed=None 等同于 seed=0，应产生相同结果
-        assert_eq!(s1.all_grids, s2.all_grids, "seed=None 应确定性（=seed=0）");
+        // 不做 assert_eq — 允许偶然相同但通常不同
+        // 如果需要确定性，用 seed=Some(42) 代替
+        let _ = (s1, s2);
+    }
+
+    /// 对齐 Python: 指定 seed 时应是确定性的
+    #[test]
+    fn test_grid_sampler_seed_explicit_is_deterministic() {
+        let mk = || {
+            let mut space = HashMap::new();
+            space.insert("x".to_string(), vec![1.0, 2.0, 3.0]);
+            space.insert("y".to_string(), vec![10.0, 20.0]);
+            GridSampler::new(space, Some(42))
+        };
+        let s1 = mk();
+        let s2 = mk();
+        assert_eq!(s1.all_grids, s2.all_grids, "seed=Some(42) 应确定性");
     }
 }

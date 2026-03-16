@@ -77,15 +77,30 @@ impl FrozenTrial {
     }
 
     /// Single-objective accessor. Returns the value if there is exactly one.
+    /// 对齐 Python: 多目标时抛 RuntimeError（非 ValueError）。
     pub fn value(&self) -> Result<Option<f64>> {
         match &self.values {
             None => Ok(None),
             Some(vs) if vs.len() == 1 => Ok(Some(vs[0])),
-            Some(vs) => Err(OptunaError::ValueError(format!(
+            Some(vs) => Err(OptunaError::RuntimeError(format!(
                 "trial has {} values; use `values` for multi-objective",
                 vs.len()
             ))),
         }
+    }
+
+    /// 对齐 Python `FrozenTrial.value` setter：设置单目标值。
+    /// 多目标试验抛 RuntimeError。
+    pub fn set_value(&mut self, v: Option<f64>) -> Result<()> {
+        if let Some(ref vals) = self.values {
+            if vals.len() > 1 {
+                return Err(OptunaError::RuntimeError(
+                    "This attribute is not available during multi-objective optimization.".into(),
+                ));
+            }
+        }
+        self.values = v.map(|x| vec![x]);
+        Ok(())
     }
 
     /// The last intermediate value step, if any.
@@ -202,6 +217,12 @@ impl FrozenTrial {
     /// 对应 Python `FrozenTrial.set_user_attr(key, value)`。
     pub fn set_user_attr(&mut self, key: String, value: serde_json::Value) {
         self.user_attrs.insert(key, value);
+    }
+
+    /// Set a system attribute.
+    /// 对应 Python `FrozenTrial.set_system_attr(key, value)`。
+    pub fn set_system_attr(&mut self, key: String, value: serde_json::Value) {
+        self.system_attrs.insert(key, value);
     }
 
     /// 对齐 Python `FrozenTrial.suggest_float(name, low, high, step=None, log=False)`。
@@ -1119,5 +1140,73 @@ mod tests {
         let t = FrozenTrial::new(0, TrialState::Complete, Some(1.0), None,
             Some(start), Some(end), p, d, u, s, i, 0).unwrap();
         assert_eq!(t.duration().unwrap().num_seconds(), 10);
+    }
+
+    // ── 对齐 Python 审计修复的测试 ──
+
+    /// 对齐 Python: value() 多目标时应抛 RuntimeError (非 ValueError)
+    #[test]
+    fn test_value_multi_objective_returns_runtime_error() {
+        let now = Utc::now();
+        let (p, d, u, s, i) = empty_maps();
+        let t = FrozenTrial {
+            number: 0,
+            state: TrialState::Complete,
+            values: Some(vec![1.0, 2.0]),
+            datetime_start: Some(now),
+            datetime_complete: Some(now),
+            params: p,
+            distributions: d,
+            user_attrs: u,
+            system_attrs: s,
+            intermediate_values: i,
+            trial_id: 0,
+        };
+        let err = t.value().unwrap_err();
+        assert!(matches!(err, OptunaError::RuntimeError(_)));
+    }
+
+    /// 对齐 Python: set_system_attr()
+    #[test]
+    fn test_set_system_attr() {
+        let now = Utc::now();
+        let (p, d, u, s, i) = empty_maps();
+        let mut t = FrozenTrial::new(0, TrialState::Complete, Some(1.0), None,
+            Some(now), Some(now), p, d, u, s, i, 0).unwrap();
+        t.set_system_attr("key".into(), serde_json::json!("value"));
+        assert_eq!(t.system_attrs.get("key").unwrap(), &serde_json::json!("value"));
+    }
+
+    /// 对齐 Python: set_value() 单目标
+    #[test]
+    fn test_set_value_single_objective() {
+        let now = Utc::now();
+        let (p, d, u, s, i) = empty_maps();
+        let mut t = FrozenTrial::new(0, TrialState::Complete, Some(1.0), None,
+            Some(now), Some(now), p, d, u, s, i, 0).unwrap();
+        t.set_value(Some(2.0)).unwrap();
+        assert_eq!(t.values, Some(vec![2.0]));
+    }
+
+    /// 对齐 Python: set_value() 多目标时应 RuntimeError
+    #[test]
+    fn test_set_value_multi_objective_error() {
+        let now = Utc::now();
+        let (p, d, u, s, i) = empty_maps();
+        let mut t = FrozenTrial {
+            number: 0,
+            state: TrialState::Complete,
+            values: Some(vec![1.0, 2.0]),
+            datetime_start: Some(now),
+            datetime_complete: Some(now),
+            params: p,
+            distributions: d,
+            user_attrs: u,
+            system_attrs: s,
+            intermediate_values: i,
+            trial_id: 0,
+        };
+        let err = t.set_value(Some(3.0)).unwrap_err();
+        assert!(matches!(err, OptunaError::RuntimeError(_)));
     }
 }

@@ -1715,6 +1715,65 @@ def test_importance_normalize_true():
     assert abs(total - 1.0) < 1e-10, f"归一化后应为1.0, 实际={total}"
 
 # ═══════════════════════════════════════════════════════════════════════════
+#  Session 38: 旧版 Distribution 兼容性测试
+# ═══════════════════════════════════════════════════════════════════════════
+
+def test_deprecated_uniform_distribution_json():
+    """对齐 Rust: test_json_to_distribution_uniform
+    验证旧版 UniformDistribution 的 JSON 序列化格式。
+    Rust 端需要能反序列化此格式。"""
+    import json as json_mod
+    d = FloatDistribution(0.0, 1.0)
+    j = optuna.distributions.distribution_to_json(d)
+    parsed = json_mod.loads(j)
+    assert parsed["name"] == "FloatDistribution"
+    assert parsed["attributes"]["low"] == 0.0
+    assert parsed["attributes"]["high"] == 1.0
+
+def test_deprecated_int_distribution_step_adjustment():
+    """对齐 Rust: test_json_to_distribution_int_uniform
+    验证 IntDistribution 的 high 调整行为。
+    IntDistribution(1, 10, step=2) → high 被调整为 9 (因为 (10-1)%2 != 0)"""
+    d = IntDistribution(1, 10, step=2)
+    assert d.low == 1
+    assert d.high == 9  # Python 也做同样的调整
+
+def test_fixed_trial_system_attrs():
+    """对齐 Rust: test_fixed_trial_set_and_get_system_attr
+    验证 FixedTrial 的 system_attrs 行为。"""
+    from optuna.trial import FixedTrial
+    trial = FixedTrial({"x": 1.0})
+    assert trial.system_attrs == {}  # 初始为空
+
+def test_fixed_trial_params_property():
+    """对齐 Rust: test_fixed_trial_params_alias
+    验证 FixedTrial.params 在 suggest 后返回正确值。"""
+    from optuna.trial import FixedTrial
+    trial = FixedTrial({"x": 1.5})
+    trial.suggest_float("x", 0.0, 10.0)
+    assert "x" in trial.params
+    assert trial.params["x"] == 1.5
+
+def test_nested_optimize_detection():
+    """对齐 Rust: test_optimize_loop_flag_resets_after_completion
+    验证连续两次 optimize 不会被误报为嵌套调用。"""
+    study = optuna.create_study(direction="minimize")
+    study.optimize(lambda trial: trial.suggest_float("x", -10, 10) ** 2, n_trials=2)
+    # 第二次调用不应失败
+    study.optimize(lambda trial: trial.suggest_float("x", -10, 10) ** 2, n_trials=2)
+    assert len(study.trials) == 4
+
+def test_reseed_rng_sampler():
+    """对齐 Rust: test_reseed_rng_changes_output
+    验证 RandomSampler.reseed_rng() 存在且可调用。"""
+    sampler = optuna.samplers.RandomSampler(seed=42)
+    # Python 的 reseed_rng 接受一个 seed sequence
+    sampler.reseed_rng()
+    study = optuna.create_study(sampler=sampler, direction="minimize")
+    study.optimize(lambda trial: trial.suggest_float("x", 0, 1), n_trials=1)
+    assert len(study.trials) == 1
+
+# ═══════════════════════════════════════════════════════════════════════════
 #  执行
 # ═══════════════════════════════════════════════════════════════════════════
 

@@ -605,6 +605,11 @@ impl Sampler for TpeSampler {
         }
         Some(constraints)
     }
+
+    /// 对齐 Python `TPESampler.reseed_rng(seed)`: 重新设置随机种子。
+    fn reseed_rng(&self, seed: u64) {
+        *self.rng.lock() = ChaCha8Rng::seed_from_u64(seed);
+    }
 }
 
 /// Builder for constructing a [`TpeSampler`] with custom parameters.

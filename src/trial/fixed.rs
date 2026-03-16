@@ -15,22 +15,33 @@ use crate::error::{OptunaError, Result};
 /// `suggest_*` methods look up values from the fixed params dict rather than
 /// sampling from distributions.
 pub struct FixedTrial {
-    params: HashMap<String, ParamValue>,
+    /// 固定参数值（构造时传入）。
+    fixed_params: HashMap<String, ParamValue>,
+    /// 已 suggest 的参数值（对齐 Python `_suggested_params`）。
     suggested_params: HashMap<String, ParamValue>,
+    /// 已 suggest 的参数分布（对齐 Python `_distributions`）。
     distributions: HashMap<String, Distribution>,
+    /// 用户属性。
     user_attrs: HashMap<String, serde_json::Value>,
+    /// 系统属性（对齐 Python `_system_attrs`）。
+    system_attrs: HashMap<String, serde_json::Value>,
+    /// 试验开始时间。
     datetime_start: DateTime<Utc>,
+    /// 试验编号。
     number: i64,
 }
 
 impl FixedTrial {
     /// Create a new `FixedTrial` with pre-set parameter values.
+    ///
+    /// 对齐 Python `FixedTrial.__init__(params, number=0)`。
     pub fn new(params: HashMap<String, ParamValue>, number: i64) -> Self {
         Self {
-            params,
+            fixed_params: params,
             suggested_params: HashMap::new(),
             distributions: HashMap::new(),
             user_attrs: HashMap::new(),
+            system_attrs: HashMap::new(),
             datetime_start: Utc::now(),
             number,
         }
@@ -186,7 +197,7 @@ impl FixedTrial {
     /// - 重复 suggest 同名参数时检查分布兼容性
     fn suggest(&mut self, name: &str, dist: &Distribution) -> Result<ParamValue> {
         let value = self
-            .params
+            .fixed_params
             .get(name)
             .ok_or_else(|| {
                 OptunaError::ValueError(format!(
@@ -225,8 +236,16 @@ impl FixedTrial {
     }
 
     /// Set a user attribute.
+    /// 对齐 Python `FixedTrial.set_user_attr(key, value)`。
     pub fn set_user_attr(&mut self, key: String, value: serde_json::Value) {
         self.user_attrs.insert(key, value);
+    }
+
+    /// Set a system attribute.
+    /// 对齐 Python `FixedTrial.set_system_attr(key, value)`（deprecated in Python 3.1.0）。
+    #[deprecated(note = "Use user_attrs instead. Will be removed in a future version.")]
+    pub fn set_system_attr(&mut self, key: String, value: serde_json::Value) {
+        self.system_attrs.insert(key, value);
     }
 
     /// Get the trial number.
@@ -235,6 +254,12 @@ impl FixedTrial {
     }
 
     /// Get the suggested params.
+    /// 对齐 Python `FixedTrial.params` 属性（Python 返回 `_suggested_params`）。
+    pub fn params(&self) -> &HashMap<String, ParamValue> {
+        &self.suggested_params
+    }
+
+    /// 别名：与 `params()` 相同（向后兼容）。
     pub fn suggested_params(&self) -> &HashMap<String, ParamValue> {
         &self.suggested_params
     }
@@ -249,9 +274,16 @@ impl FixedTrial {
         &self.user_attrs
     }
 
+    /// Get the system attributes.
+    /// 对齐 Python `FixedTrial.system_attrs` 属性。
+    pub fn system_attrs(&self) -> &HashMap<String, serde_json::Value> {
+        &self.system_attrs
+    }
+
     /// Get the start time.
-    pub fn datetime_start(&self) -> DateTime<Utc> {
-        self.datetime_start
+    /// 对齐 Python `FixedTrial.datetime_start` 属性。
+    pub fn datetime_start(&self) -> Option<DateTime<Utc>> {
+        Some(self.datetime_start)
     }
 }
 
@@ -455,5 +487,72 @@ mod tests {
             }
             _ => panic!("d should use int distribution"),
         }
+    }
+
+    // ========== 对齐 Python: system_attrs 测试 ==========
+
+    /// 测试 FixedTrial 的 system_attrs 初始化为空。
+    /// 对应 Python: `assert trial.system_attrs == {}`
+    #[test]
+    fn test_fixed_trial_system_attrs_initially_empty() {
+        let params = HashMap::new();
+        let trial = FixedTrial::new(params, 0);
+        assert!(trial.system_attrs().is_empty());
+    }
+
+    /// 测试 set_system_attr (deprecated) 和 system_attrs getter。
+    /// 对应 Python:
+    /// ```python
+    /// trial.set_system_attr("key", "value")
+    /// assert trial.system_attrs["key"] == "value"
+    /// ```
+    #[test]
+    #[allow(deprecated)]
+    fn test_fixed_trial_set_and_get_system_attr() {
+        let params = HashMap::new();
+        let mut trial = FixedTrial::new(params, 0);
+        trial.set_system_attr("runner".to_string(), serde_json::json!("optuna-rs"));
+        assert_eq!(
+            trial.system_attrs().get("runner").unwrap(),
+            &serde_json::json!("optuna-rs")
+        );
+    }
+
+    /// 测试 params() 别名返回与 suggested_params() 相同的引用。
+    /// 对应 Python: `trial.params` 属性。
+    #[test]
+    fn test_fixed_trial_params_alias() {
+        let mut params = HashMap::new();
+        params.insert("x".into(), ParamValue::Float(1.5));
+        let mut trial = FixedTrial::new(params, 0);
+
+        // 先 suggest 一个参数，使其记录到 suggested_params
+        trial.suggest_float("x", 0.0, 10.0, false, None).unwrap();
+
+        // params() 和 suggested_params() 应该返回相同的内容
+        assert_eq!(trial.params(), trial.suggested_params());
+        match trial.params().get("x").unwrap() {
+            ParamValue::Float(v) => assert_eq!(*v, 1.5),
+            _ => panic!("expected Float param"),
+        }
+    }
+
+    /// 测试 datetime_start 返回 Some。
+    /// FixedTrial 在构造时设置 datetime_start 为 Utc::now()。
+    #[test]
+    fn test_fixed_trial_datetime_start_is_some() {
+        let params = HashMap::new();
+        let trial = FixedTrial::new(params, 0);
+        assert!(trial.datetime_start().is_some());
+    }
+
+    /// 测试 suggest 不存在的参数时报错。
+    /// 对应 Python: `FixedTrial({"x": 1.0}).suggest_float("y", 0, 1)` → ValueError
+    #[test]
+    fn test_fixed_trial_missing_param_error() {
+        let params = HashMap::new();
+        let mut trial = FixedTrial::new(params, 0);
+        let result = trial.suggest_float("missing", 0.0, 1.0, false, None);
+        assert!(result.is_err());
     }
 }

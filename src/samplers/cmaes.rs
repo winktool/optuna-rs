@@ -753,6 +753,11 @@ impl Sampler for CmaEsSampler {
             }
         }
     }
+
+    /// 对齐 Python `CmaEsSampler.reseed_rng(seed)`: 重新设置随机种子。
+    fn reseed_rng(&self, seed: u64) {
+        *self.rng.lock() = ChaCha8Rng::seed_from_u64(seed);
+    }
 }
 
 /// Builder for constructing a [`CmaEsSampler`] with custom parameters.

@@ -105,5 +105,94 @@
 
 - 分支: main
 - 远程: gitlab
-- 上次提交: 3ba5b7c (Session 36)
-- 当前状态: 待提交 Session 37 修改
+- 上次提交: 04cdf6e (Session 37)
+
+---
+
+## Session 38 — 深层对齐修复与测试扩充
+
+### 已应用的修复
+
+#### FixedTrial 模块 (trial/fixed.rs)
+1. **system_attrs 字段** — 添加 `system_attrs: HashMap<String, serde_json::Value>` 及 getter
+2. **set_system_attr 方法** — 添加 `#[deprecated]` 标注的 `set_system_attr()` 方法
+3. **params() 别名** — 添加 `params()` 方法作为 `suggested_params()` 的别名（匹配 Python `.params` 属性）
+4. **内部字段重命名** — `params` → `fixed_params` 避免与 Python API 命名冲突
+5. **datetime_start 返回类型** — 改为 `Option<DateTime<Utc>>`
+
+#### Sampler 模块 (samplers/)
+6. **reseed_rng 方法** — Sampler trait 添加 `fn reseed_rng(&self, seed: u64)` 默认空实现
+7. **RandomSampler reseed_rng** — 实现 RNG 重置
+8. **TpeSampler reseed_rng** — 实现 RNG 重置
+9. **NSGAIISampler reseed_rng** — 实现 RNG 重置
+10. **NSGAIIISampler reseed_rng** — 实现 RNG 重置
+11. **CmaEsSampler reseed_rng** — 实现 RNG 重置
+12. **GpSampler reseed_rng** — 实现 RNG 重置
+13. **NSGA-II single() 过滤** — `infer_relative_search_space` 过滤 `single()` 分布
+
+#### Distributions 模块 (distributions/mod.rs)
+14. **旧版 JSON 反序列化** — `json_to_distribution` 支持 5 种 deprecated 格式:
+    - UniformDistribution → FloatDistribution
+    - LogUniformDistribution → FloatDistribution(log=true)
+    - DiscreteUniformDistribution → FloatDistribution(step=q)
+    - IntUniformDistribution → IntDistribution
+    - IntLogUniformDistribution → IntDistribution(log=true)
+
+#### Study 模块 (study/core.rs)
+15. **嵌套 optimize 检测** — 添加 `in_optimize_loop: AtomicBool` 字段
+16. **optimize_with_options 重构** — 拆分为外层检查 + `optimize_inner` 内部实现
+17. **optimize_multi_with_options 重构** — 同样拆分，防止嵌套调用
+
+### 新增测试 (15 个 Rust / 7 个 Python)
+
+#### Rust 内联测试
+| 文件 | 测试名 | 描述 |
+|------|--------|------|
+| trial/fixed.rs | test_fixed_trial_system_attrs_initially_empty | system_attrs 初始为空 |
+| trial/fixed.rs | test_fixed_trial_set_and_get_system_attr | set/get system_attr |
+| trial/fixed.rs | test_fixed_trial_params_alias | params() == suggested_params() |
+| trial/fixed.rs | test_fixed_trial_datetime_start_is_some | datetime_start 返回 Some |
+| trial/fixed.rs | test_fixed_trial_missing_param_error | 缺失参数报错 |
+| distributions/mod.rs | test_json_to_distribution_uniform | UniformDistribution JSON |
+| distributions/mod.rs | test_json_to_distribution_log_uniform | LogUniform JSON |
+| distributions/mod.rs | test_json_to_distribution_discrete_uniform | DiscreteUniform JSON |
+| distributions/mod.rs | test_json_to_distribution_int_uniform | IntUniform JSON |
+| distributions/mod.rs | test_json_to_distribution_int_log_uniform | IntLogUniform JSON |
+| distributions/mod.rs | test_json_to_distribution_standard_float | 标准 Float JSON |
+| distributions/mod.rs | test_json_to_distribution_unknown_name | 未知名称报错 |
+| samplers/random.rs | test_reseed_rng_changes_output | reseed_rng 改变输出 |
+| study/core.rs | test_optimize_loop_flag_resets_after_completion | 标志重置 |
+| study/core.rs | test_optimize_loop_flag_resets_after_error | 错误后标志重置 |
+
+#### Python 交叉验证测试
+| 测试名 | 描述 |
+|--------|------|
+| test_deprecated_uniform_distribution_json | FloatDistribution JSON 格式 |
+| test_deprecated_int_distribution_step_adjustment | IntDistribution high 调整 |
+| test_fixed_trial_system_attrs | FixedTrial system_attrs 初始为空 |
+| test_fixed_trial_params_property | FixedTrial params 属性 |
+| test_nested_optimize_detection | 连续 optimize 不报嵌套 |
+| test_reseed_rng_sampler | RandomSampler reseed_rng 可调用 |
+
+### 测试统计
+
+| 指标 | 数值 |
+|------|------|
+| Rust 测试总数 | 804 |
+| Python 交叉验证 | 131 |
+| 本次新增 Rust | +15 |
+| 本次新增 Python | +6 |
+| 修改文件数 | 11 |
+
+### 待修复 (后续 Session)
+
+| 优先级 | 项目 | 说明 |
+|--------|------|------|
+| 🔴 高 | MOTPE 多目标 TPE | 无非支配排序/HSSP/超体积加权 |
+| 🔴 高 | NSGA-II 代际系统 | 使用末尾 N 个 trial 而非真正的代际 |
+| 🔴 高 | CMA-ES 状态持久化 | 重启后丢失优化状态 |
+| 🟠 中 | StudySummary 类 | Python 的 StudySummary 未实现 |
+| 🟠 中 | Heartbeat 功能 | 分布式试验心跳检测 |
+| 🟡 低 | fANOVA 方差分解 | 使用 bin variance 而非随机森林边际方差 |
+| 🟡 低 | Wilcoxon 精确分布表 | 小样本精确分布缺失 |
+| 🟡 低 | BaseTrial trait | Trial/FrozenTrial/FixedTrial 统一接口 |

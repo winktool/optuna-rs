@@ -101,6 +101,11 @@ pub trait Sampler: Send + Sync {
     ) -> Option<Vec<f64>> {
         None
     }
+
+    /// 对齐 Python `BaseSampler.reseed_rng(seed)`:
+    /// 重新设置随机数生成器种子。用于多线程模式下确保线程间随机性独立。
+    /// 默认空操作。
+    fn reseed_rng(&self, _seed: u64) {}
 }
 
 #[cfg(test)]

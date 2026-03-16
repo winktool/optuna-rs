@@ -116,10 +116,56 @@ pub fn distribution_to_json(dist: &Distribution) -> Result<String> {
 
 /// Deserialize a distribution from JSON.
 ///
-/// Accepts the current format: `{"name": "<Type>", "attributes": { ... }}`
+/// 对齐 Python `json_to_distribution()`:
+/// 支持当前格式和 Python 旧版 deprecated 分布格式：
+/// - `UniformDistribution` → `FloatDistribution(low, high)`
+/// - `LogUniformDistribution` → `FloatDistribution(low, high, log=true)`
+/// - `DiscreteUniformDistribution` → `FloatDistribution(low, high, step=q)`
+/// - `IntUniformDistribution` → `IntDistribution(low, high, step=step)`
+/// - `IntLogUniformDistribution` → `IntDistribution(low, high, log=true)`
 pub fn json_to_distribution(json: &str) -> Result<Distribution> {
-    serde_json::from_str(json)
-        .map_err(|e| OptunaError::StorageInternalError(format!("JSON deserialization failed: {e}")))
+    // 先尝试标准格式
+    if let Ok(d) = serde_json::from_str::<Distribution>(json) {
+        return Ok(d);
+    }
+    // 尝试解析旧版 deprecated 格式
+    let v: serde_json::Value = serde_json::from_str(json)
+        .map_err(|e| OptunaError::StorageInternalError(format!("JSON parse failed: {e}")))?;
+    let name = v.get("name").and_then(|n| n.as_str()).unwrap_or("");
+    let attrs = v.get("attributes").unwrap_or(&serde_json::Value::Null);
+    match name {
+        "UniformDistribution" => {
+            let low = attrs.get("low").and_then(|v| v.as_f64()).unwrap_or(0.0);
+            let high = attrs.get("high").and_then(|v| v.as_f64()).unwrap_or(1.0);
+            Ok(Distribution::FloatDistribution(FloatDistribution::new(low, high, false, None)?))
+        }
+        "LogUniformDistribution" => {
+            let low = attrs.get("low").and_then(|v| v.as_f64()).unwrap_or(1e-7);
+            let high = attrs.get("high").and_then(|v| v.as_f64()).unwrap_or(1.0);
+            Ok(Distribution::FloatDistribution(FloatDistribution::new(low, high, true, None)?))
+        }
+        "DiscreteUniformDistribution" => {
+            let low = attrs.get("low").and_then(|v| v.as_f64()).unwrap_or(0.0);
+            let high = attrs.get("high").and_then(|v| v.as_f64()).unwrap_or(1.0);
+            let q = attrs.get("q").and_then(|v| v.as_f64()).unwrap_or(1.0);
+            Ok(Distribution::FloatDistribution(FloatDistribution::new(low, high, false, Some(q))?))
+        }
+        "IntUniformDistribution" => {
+            let low = attrs.get("low").and_then(|v| v.as_i64()).unwrap_or(0);
+            let high = attrs.get("high").and_then(|v| v.as_i64()).unwrap_or(10);
+            let step = attrs.get("step").and_then(|v| v.as_i64()).unwrap_or(1);
+            Ok(Distribution::IntDistribution(IntDistribution::new(low, high, false, step)?))
+        }
+        "IntLogUniformDistribution" => {
+            let low = attrs.get("low").and_then(|v| v.as_i64()).unwrap_or(1);
+            let high = attrs.get("high").and_then(|v| v.as_i64()).unwrap_or(10);
+            let step = attrs.get("step").and_then(|v| v.as_i64()).unwrap_or(1);
+            Ok(Distribution::IntDistribution(IntDistribution::new(low, high, true, step)?))
+        }
+        _ => Err(OptunaError::StorageInternalError(format!(
+            "Unknown distribution type: '{name}'"
+        ))),
+    }
 }
 
 /// 检查两个分布是否兼容。
@@ -409,5 +455,116 @@ mod tests {
         );
         let err = check_distribution_compatibility(&a, &b).unwrap_err();
         assert!(err.to_string().contains("CategoricalDistribution does not support dynamic value space."));
+    }
+
+    // ========== 对齐 Python: 旧版 distribution JSON 反序列化测试 ==========
+
+    /// 测试 UniformDistribution JSON 反序列化。
+    /// 对应 Python: `UniformDistribution(low=0.0, high=1.0)` → `FloatDistribution(0.0, 1.0)`
+    #[test]
+    fn test_json_to_distribution_uniform() {
+        let json = r#"{"name":"UniformDistribution","attributes":{"low":0.0,"high":1.0}}"#;
+        let dist = json_to_distribution(json).unwrap();
+        match dist {
+            Distribution::FloatDistribution(d) => {
+                assert_eq!(d.low, 0.0);
+                assert_eq!(d.high, 1.0);
+                assert!(!d.log);
+                assert!(d.step.is_none());
+            }
+            _ => panic!("expected FloatDistribution"),
+        }
+    }
+
+    /// 测试 LogUniformDistribution JSON 反序列化。
+    /// 对应 Python: `LogUniformDistribution(low=1e-5, high=1.0)` → `FloatDistribution(1e-5, 1.0, log=True)`
+    #[test]
+    fn test_json_to_distribution_log_uniform() {
+        let json = r#"{"name":"LogUniformDistribution","attributes":{"low":1e-5,"high":1.0}}"#;
+        let dist = json_to_distribution(json).unwrap();
+        match dist {
+            Distribution::FloatDistribution(d) => {
+                assert!((d.low - 1e-5).abs() < 1e-10);
+                assert_eq!(d.high, 1.0);
+                assert!(d.log);
+            }
+            _ => panic!("expected FloatDistribution with log=true"),
+        }
+    }
+
+    /// 测试 DiscreteUniformDistribution JSON 反序列化。
+    /// 对应 Python: `DiscreteUniformDistribution(low=0.0, high=10.0, q=2.5)`
+    ///   → `FloatDistribution(0.0, 10.0, step=2.5)`
+    #[test]
+    fn test_json_to_distribution_discrete_uniform() {
+        let json = r#"{"name":"DiscreteUniformDistribution","attributes":{"low":0.0,"high":10.0,"q":2.5}}"#;
+        let dist = json_to_distribution(json).unwrap();
+        match dist {
+            Distribution::FloatDistribution(d) => {
+                assert_eq!(d.low, 0.0);
+                assert_eq!(d.high, 10.0);
+                assert!(!d.log);
+                assert_eq!(d.step, Some(2.5));
+            }
+            _ => panic!("expected FloatDistribution with step"),
+        }
+    }
+
+    /// 测试 IntUniformDistribution JSON 反序列化。
+    /// 对应 Python: `IntUniformDistribution(low=1, high=10, step=2)`
+    ///   → `IntDistribution(1, 10, step=2)`
+    #[test]
+    fn test_json_to_distribution_int_uniform() {
+        let json = r#"{"name":"IntUniformDistribution","attributes":{"low":1,"high":10,"step":2}}"#;
+        let dist = json_to_distribution(json).unwrap();
+        match dist {
+            Distribution::IntDistribution(d) => {
+                assert_eq!(d.low, 1);
+                // high 被 adjust_int_uniform_high 调整: (10-1)%2=1 != 0，所以 high = 10 - 1 = 9
+                assert_eq!(d.high, 9);
+                assert!(!d.log);
+                assert_eq!(d.step, 2);
+            }
+            _ => panic!("expected IntDistribution"),
+        }
+    }
+
+    /// 测试 IntLogUniformDistribution JSON 反序列化。
+    /// 对应 Python: `IntLogUniformDistribution(low=1, high=100)`
+    ///   → `IntDistribution(1, 100, log=True)`
+    #[test]
+    fn test_json_to_distribution_int_log_uniform() {
+        let json = r#"{"name":"IntLogUniformDistribution","attributes":{"low":1,"high":100}}"#;
+        let dist = json_to_distribution(json).unwrap();
+        match dist {
+            Distribution::IntDistribution(d) => {
+                assert_eq!(d.low, 1);
+                assert_eq!(d.high, 100);
+                assert!(d.log);
+            }
+            _ => panic!("expected IntDistribution with log=true"),
+        }
+    }
+
+    /// 测试标准格式 FloatDistribution JSON 仍然正常工作。
+    #[test]
+    fn test_json_to_distribution_standard_float() {
+        let json = r#"{"name":"FloatDistribution","attributes":{"low":0.0,"high":1.0,"log":false,"step":null}}"#;
+        let dist = json_to_distribution(json).unwrap();
+        match dist {
+            Distribution::FloatDistribution(d) => {
+                assert_eq!(d.low, 0.0);
+                assert_eq!(d.high, 1.0);
+                assert!(!d.log);
+            }
+            _ => panic!("expected FloatDistribution"),
+        }
+    }
+
+    /// 测试未知 distribution 名称返回错误。
+    #[test]
+    fn test_json_to_distribution_unknown_name() {
+        let json = r#"{"name":"BogusDistribution","attributes":{"low":0.0,"high":1.0}}"#;
+        assert!(json_to_distribution(json).is_err());
     }
 }

@@ -75,6 +75,11 @@ impl Sampler for RandomSampler {
     ) -> Result<f64> {
         self.sample_with_transform(distribution)
     }
+
+    /// 对齐 Python `RandomSampler.reseed_rng(seed)`: 重新设置随机种子。
+    fn reseed_rng(&self, seed: u64) {
+        *self.rng.lock() = ChaCha8Rng::seed_from_u64(seed);
+    }
 }
 
 #[cfg(test)]
@@ -252,5 +257,36 @@ mod tests {
         let trial = dummy_trial();
         let v = sampler.sample_independent(&[], &trial, "x", &dist).unwrap();
         assert!((v - 3.0).abs() < 1e-15, "lo==hi should return lo");
+    }
+
+    // ========== 对齐 Python: reseed_rng 测试 ==========
+
+    /// 测试 reseed_rng 改变 RandomSampler 的 RNG 状态。
+    /// 对应 Python: `sampler.reseed_rng()` 在并行模式下为每个 worker 重置 RNG。
+    #[test]
+    fn test_reseed_rng_changes_output() {
+        use crate::samplers::Sampler;
+
+        let sampler = RandomSampler::new(Some(42));
+        let dist =
+            Distribution::FloatDistribution(FloatDistribution::new(0.0, 1.0, false, None).unwrap());
+        let trial = dummy_trial();
+
+        // 第一次采样
+        let v1 = sampler.sample_independent(&[], &trial, "x", &dist).unwrap();
+
+        // reseed 到不同的种子
+        sampler.reseed_rng(99999);
+
+        // reseed 后采样序列应重新开始（使用新种子的第一个值）
+        let v2 = sampler.sample_independent(&[], &trial, "x", &dist).unwrap();
+
+        // 使用相同种子 99999 的新采样器应产生相同的值
+        let sampler2 = RandomSampler::new(Some(99999));
+        let v3 = sampler2.sample_independent(&[], &trial, "x", &dist).unwrap();
+
+        assert!((v2 - v3).abs() < 1e-15, "reseed 后应与相同种子的新采样器等价");
+        // v1 与 v2 大概率不同（极小概率相同，忽略）
+        let _ = v1; // 仅确认不 panic
     }
 }

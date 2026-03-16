@@ -163,7 +163,12 @@ impl Sampler for NSGAIISampler {
         &self,
         trials: &[FrozenTrial],
     ) -> IndexMap<String, Distribution> {
-        self.search_space.lock().calculate(trials)
+        // 对齐 Python: 过滤 single() 分布（单值分布不参与搜索空间）
+        let space = self.search_space.lock().calculate(trials);
+        space
+            .into_iter()
+            .filter(|(_, d)| !d.single())
+            .collect()
     }
 
     fn sample_relative(
@@ -385,6 +390,11 @@ impl Sampler for NSGAIISampler {
                 let _constraints = cf(trial);
             }
         }
+    }
+
+    /// 对齐 Python `NSGAIISampler.reseed_rng(seed)`: 重新设置随机种子。
+    fn reseed_rng(&self, seed: u64) {
+        *self.rng.lock() = ChaCha8Rng::seed_from_u64(seed);
     }
 }
 

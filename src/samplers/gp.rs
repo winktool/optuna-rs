@@ -937,6 +937,11 @@ impl Sampler for GpSampler {
             }
         }
     }
+
+    /// 对齐 Python `GPSampler.reseed_rng(seed)`: 重新设置随机种子。
+    fn reseed_rng(&self, seed: u64) {
+        *self.rng.lock() = ChaCha8Rng::seed_from_u64(seed);
+    }
 }
 
 #[cfg(test)]

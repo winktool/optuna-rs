@@ -539,6 +539,11 @@ impl Sampler for NSGAIIISampler {
             }
         }
     }
+
+    /// 对齐 Python `NSGAIIISampler.reseed_rng(seed)`: 重新设置随机种子。
+    fn reseed_rng(&self, seed: u64) {
+        *self.rng.lock() = ChaCha8Rng::seed_from_u64(seed);
+    }
 }
 
 /// Builder for constructing an [`NSGAIIISampler`] with custom parameters.

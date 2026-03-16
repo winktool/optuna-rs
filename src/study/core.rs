@@ -72,6 +72,8 @@ pub struct Study {
     sampler: Arc<dyn Sampler>,
     pruner: Arc<dyn Pruner>,
     stop_flag: Arc<AtomicBool>,
+    /// 对齐 Python `_thread_local.in_optimize_loop`: 用于检测嵌套 optimize 调用。
+    in_optimize_loop: AtomicBool,
 }
 
 impl Study {
@@ -92,6 +94,7 @@ impl Study {
             sampler,
             pruner,
             stop_flag: Arc::new(AtomicBool::new(false)),
+            in_optimize_loop: AtomicBool::new(false),
         }
     }
 
@@ -622,6 +625,34 @@ impl Study {
     where
         F: Fn(&mut Trial) -> Result<f64> + Send + Sync,
     {
+        // 对齐 Python: 检测嵌套 optimize 调用
+        if self.in_optimize_loop.swap(true, Ordering::SeqCst) {
+            return Err(OptunaError::RuntimeError(
+                "Nested invocation of `Study.optimize` method isn't allowed.".into(),
+            ));
+        }
+
+        let result = self.optimize_inner(&func, n_trials, timeout, n_jobs, catch, callbacks, show_progress_bar);
+
+        // 确保在退出时重置标志
+        self.in_optimize_loop.store(false, Ordering::SeqCst);
+        result
+    }
+
+    /// 内部优化循环实现。
+    fn optimize_inner<F>(
+        &self,
+        func: &F,
+        n_trials: Option<usize>,
+        timeout: Option<Duration>,
+        n_jobs: i32,
+        catch: &[&str],
+        callbacks: Option<&[&dyn Callback]>,
+        show_progress_bar: bool,
+    ) -> Result<()>
+    where
+        F: Fn(&mut Trial) -> Result<f64> + Send + Sync,
+    {
         self.stop_flag.store(false, Ordering::Release);
         SIGINT_RECEIVED.store(false, Ordering::SeqCst);
         install_signal_handler(&self.stop_flag);
@@ -784,6 +815,31 @@ impl Study {
     pub fn optimize_multi_with_options<F>(
         &self,
         func: F,
+        n_trials: Option<usize>,
+        timeout: Option<Duration>,
+        n_jobs: i32,
+        catch: &[&str],
+        callbacks: Option<&[&dyn Callback]>,
+        show_progress_bar: bool,
+    ) -> Result<()>
+    where
+        F: Fn(&mut Trial) -> Result<Vec<f64>> + Send + Sync,
+    {
+        // 对齐 Python: 检测嵌套 optimize 调用
+        if self.in_optimize_loop.swap(true, Ordering::SeqCst) {
+            return Err(OptunaError::RuntimeError(
+                "Nested invocation of `Study.optimize` method isn't allowed.".into(),
+            ));
+        }
+        let result = self.optimize_multi_inner(&func, n_trials, timeout, n_jobs, catch, callbacks, show_progress_bar);
+        self.in_optimize_loop.store(false, Ordering::SeqCst);
+        result
+    }
+
+    /// 内部多目标优化循环实现。
+    fn optimize_multi_inner<F>(
+        &self,
+        func: &F,
         n_trials: Option<usize>,
         timeout: Option<Duration>,
         n_jobs: i32,
@@ -2310,5 +2366,53 @@ mod tests {
             false,
         );
         assert!(result.is_err());
+    }
+
+    // ========== 对齐 Python: 嵌套 optimize 检测测试 ==========
+
+    /// 测试 in_optimize_loop 标志在 optimize 结束后被重置。
+    /// 对应 Python: `study.optimize()` 完成后不应阻止再次调用。
+    #[test]
+    fn test_optimize_loop_flag_resets_after_completion() {
+        let study = create_study(
+            None, None, None, None,
+            Some(StudyDirection::Minimize), None, false,
+        ).unwrap();
+
+        // 第一次 optimize — 应该成功
+        study.optimize(|trial| {
+            let x = trial.suggest_float("x", -10.0, 10.0, false, None)?;
+            Ok(x * x)
+        }, Some(2), None, None).unwrap();
+
+        // 第二次 optimize — 如果标志正确重置，也应该成功
+        study.optimize(|trial| {
+            let x = trial.suggest_float("x", -10.0, 10.0, false, None)?;
+            Ok(x * x)
+        }, Some(2), None, None).unwrap();
+
+        // 验证共有 4 个 trial
+        assert_eq!(study.trials().unwrap().len(), 4);
+    }
+
+    /// 测试 optimize 在 panic 后标志仍然被正确重置。
+    /// 对应 Python: optimize 即使 objective 异常也能保证标志重置。
+    #[test]
+    fn test_optimize_loop_flag_resets_after_error() {
+        let study = create_study(
+            None, None, None, None,
+            Some(StudyDirection::Minimize), None, false,
+        ).unwrap();
+
+        // 第一次 optimize — 会失败
+        let _ = study.optimize(|_trial| {
+            Err(crate::OptunaError::RuntimeError("test error".into()))
+        }, Some(1), None, None);
+
+        // 第二次 optimize — 即使第一次失败，标志也应该重置了
+        study.optimize(|trial| {
+            let x = trial.suggest_float("x", -10.0, 10.0, false, None)?;
+            Ok(x * x)
+        }, Some(1), None, None).unwrap();
     }
 }

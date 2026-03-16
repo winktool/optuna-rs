@@ -387,6 +387,7 @@ impl Study {
             relative_params,
             search_space,
             fixed_params,
+            trial, // 对齐 Python `_cached_frozen_trial`
         ))
     }
 
@@ -1792,11 +1793,11 @@ mod tests {
         let x = trial.suggest_float("x", 0.0, 1.0, false, None).unwrap();
 
         // params 访问器
-        let params = trial.params().unwrap();
+        let params = trial.params();
         assert!(params.contains_key("x"));
 
         // distributions 访问器
-        let dists = trial.distributions().unwrap();
+        let dists = trial.distributions();
         assert!(dists.contains_key("x"));
 
         // user_attrs 访问器
@@ -2267,7 +2268,7 @@ mod tests {
             None, None, None, None,
             Some(StudyDirection::Minimize), None, false,
         ).unwrap();
-        let trial = study.ask(None).unwrap();
+        let mut trial = study.ask(None).unwrap();
         trial.report(0.5, 0).unwrap();
         trial.report(0.3, 1).unwrap();
         let frozen = study.tell(trial.trial_id(), TrialState::Pruned, None).unwrap();
@@ -2414,5 +2415,173 @@ mod tests {
             let x = trial.suggest_float("x", -10.0, 10.0, false, None)?;
             Ok(x * x)
         }, Some(1), None, None).unwrap();
+    }
+
+    // ========== 对齐 Python: tell_auto 自动推断状态测试 ==========
+
+    /// 测试 tell_auto 合法值 → Complete。
+    /// 对应 Python: `study.tell(trial, values=1.0, state=None)` → Complete
+    #[test]
+    fn test_tell_auto_valid_values_complete() {
+        let study = create_study(
+            None, None, None, None,
+            Some(StudyDirection::Minimize), None, false,
+        ).unwrap();
+        let mut trial = study.ask(None).unwrap();
+        trial.suggest_float_default("x", 0.0, 1.0).unwrap();
+        let frozen = study.tell_auto(trial.trial_id(), Some(&[0.5])).unwrap();
+        assert_eq!(frozen.state, TrialState::Complete);
+        assert!((frozen.values.as_ref().unwrap()[0] - 0.5).abs() < 1e-12);
+    }
+
+    /// 测试 tell_auto values=None → Fail。
+    /// 对应 Python: `study.tell(trial, values=None, state=None)` → Fail
+    #[test]
+    fn test_tell_auto_none_values_fail() {
+        let study = create_study(
+            None, None, None, None,
+            Some(StudyDirection::Minimize), None, false,
+        ).unwrap();
+        let trial = study.ask(None).unwrap();
+        let frozen = study.tell_auto(trial.trial_id(), None).unwrap();
+        assert_eq!(frozen.state, TrialState::Fail);
+    }
+
+    /// 测试 tell_auto NaN → Fail。
+    /// 对应 Python: NaN 值不可行 → state=Fail
+    #[test]
+    fn test_tell_auto_nan_values_fail() {
+        let study = create_study(
+            None, None, None, None,
+            Some(StudyDirection::Minimize), None, false,
+        ).unwrap();
+        let trial = study.ask(None).unwrap();
+        let frozen = study.tell_auto(trial.trial_id(), Some(&[f64::NAN])).unwrap();
+        assert_eq!(frozen.state, TrialState::Fail);
+    }
+
+    /// 测试 tell_auto 值数量不匹配 → Fail。
+    /// 对应 Python: 值数量不等于方向数 → state=Fail
+    #[test]
+    fn test_tell_auto_wrong_count_fail() {
+        let study = create_study(
+            None, None, None, None,
+            Some(StudyDirection::Minimize), None, false,
+        ).unwrap();
+        let trial = study.ask(None).unwrap();
+        // 1 个方向但传 2 个值
+        let frozen = study.tell_auto(trial.trial_id(), Some(&[1.0, 2.0])).unwrap();
+        assert_eq!(frozen.state, TrialState::Fail);
+    }
+
+    // ========== 对齐 Python: tell skip_if_finished 测试 ==========
+
+    /// 测试 tell 对已完成试验 skip_if_finished=false → ValueError。
+    #[test]
+    fn test_tell_finished_trial_error() {
+        let study = create_study(
+            None, None, None, None,
+            Some(StudyDirection::Minimize), None, false,
+        ).unwrap();
+        let trial = study.ask(None).unwrap();
+        study.tell(trial.trial_id(), TrialState::Complete, Some(&[1.0])).unwrap();
+        // 再次 tell 应报错
+        let err = study.tell(trial.trial_id(), TrialState::Complete, Some(&[2.0]));
+        assert!(err.is_err());
+    }
+
+    /// 测试 tell 对已完成试验 skip_if_finished=true → 静默跳过。
+    #[test]
+    fn test_tell_finished_trial_skip() {
+        let study = create_study(
+            None, None, None, None,
+            Some(StudyDirection::Minimize), None, false,
+        ).unwrap();
+        let trial = study.ask(None).unwrap();
+        study.tell(trial.trial_id(), TrialState::Complete, Some(&[1.0])).unwrap();
+        // skip_if_finished=true 应静默跳过
+        let frozen = study.tell_with_options(
+            trial.trial_id(), TrialState::Complete, Some(&[2.0]), true
+        ).unwrap();
+        // 值应保持原始的 1.0
+        assert!((frozen.values.as_ref().unwrap()[0] - 1.0).abs() < 1e-12);
+    }
+
+    // ========== 对齐 Python: enqueue_trial 测试 ==========
+
+    /// 测试 enqueue_trial 后 ask 使用排队的参数。
+    #[test]
+    fn test_enqueue_trial_params_used() {
+        let study = create_study(
+            None, None, None, None,
+            Some(StudyDirection::Minimize), None, false,
+        ).unwrap();
+
+        let mut params = std::collections::HashMap::new();
+        params.insert("x".to_string(), crate::distributions::ParamValue::Float(0.42));
+        study.enqueue_trial(params, None, false).unwrap();
+
+        let mut trial = study.ask(None).unwrap();
+        let x = trial.suggest_float_default("x", 0.0, 1.0).unwrap();
+        assert!((x - 0.42).abs() < 1e-12, "enqueue 的参数应被使用");
+    }
+
+    /// 测试 add_trial 和 add_trials。
+    #[test]
+    fn test_add_trial_and_add_trials() {
+        let study = create_study(
+            None, None, None, None,
+            Some(StudyDirection::Minimize), None, false,
+        ).unwrap();
+
+        let ft = crate::trial::create_trial(
+            Some(TrialState::Complete),
+            None,
+            Some(vec![1.0]),
+            None, None, None, None, None,
+        ).unwrap();
+        study.add_trial(&ft).unwrap();
+        assert_eq!(study.trials().unwrap().len(), 1);
+
+        let ft2 = crate::trial::create_trial(
+            Some(TrialState::Complete),
+            None,
+            Some(vec![2.0]),
+            None, None, None, None, None,
+        ).unwrap();
+        let ft3 = crate::trial::create_trial(
+            Some(TrialState::Complete),
+            None,
+            Some(vec![3.0]),
+            None, None, None, None, None,
+        ).unwrap();
+        study.add_trials(&[ft2, ft3]).unwrap();
+        assert_eq!(study.trials().unwrap().len(), 3);
+    }
+
+    /// 测试 study.stop() 停止优化循环。
+    #[test]
+    fn test_study_stop_from_callback() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let counter = Arc::new(AtomicUsize::new(0));
+        let c = counter.clone();
+
+        let study = create_study(
+            None, None, None, None,
+            Some(StudyDirection::Minimize), None, false,
+        ).unwrap();
+
+        study.optimize(|trial| {
+            let n = c.fetch_add(1, Ordering::SeqCst);
+            if n >= 3 {
+                study.stop();
+            }
+            let x = trial.suggest_float_default("x", 0.0, 1.0)?;
+            Ok(x)
+        }, Some(1000), None, None).unwrap();
+
+        let total = counter.load(Ordering::SeqCst);
+        // stop 在第3次调用后触发，最多执行4次（第4次因 stop_flag 退出）
+        assert!(total <= 5, "stop 后应很快终止，实际执行 {total} 次");
     }
 }

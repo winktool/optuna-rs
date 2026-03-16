@@ -565,7 +565,7 @@ pub mod commands {
 
                 let fixed = if distributions.is_empty() { None } else { Some(distributions) };
                 let trial = study.ask(fixed.as_ref()).map_err(|e| e.to_string())?;
-                let params = trial.params().unwrap_or_default();
+                let params = trial.params();
 
                 if format == "json" {
                     let json = serde_json::json!({

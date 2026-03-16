@@ -196,3 +196,117 @@
 | 🟡 低 | fANOVA 方差分解 | 使用 bin variance 而非随机森林边际方差 |
 | 🟡 低 | Wilcoxon 精确分布表 | 小样本精确分布缺失 |
 | 🟡 低 | BaseTrial trait | Trial/FrozenTrial/FixedTrial 统一接口 |
+
+---
+
+## Session 39 — Trial 缓存性能优化 & FrozenTrial Hash & 深度审计
+
+### 审计覆盖
+
+#### Pruners 模块深度审计
+- **NopPruner** ✅ 完全对齐
+- **MedianPruner** ✅ 完全对齐
+- **PercentilePruner** ✅ 完全对齐
+- **SuccessiveHalvingPruner** ✅ 对齐（细微差异：storage=None 跳过写入）
+- **HyperbandPruner** ✅ 完全对齐
+- **ThresholdPruner** ✅ 完全对齐
+- **PatientPruner** ✅ 对齐（低优先级：NotSet 方向处理）
+- **WilcoxonPruner** ✅ 对齐（已知差异：小样本使用正态近似 vs Python 精确表）
+
+#### Trial 模块深度审计
+- 发现 P1: Trial 每次 suggest 都读 storage（已修复）
+- 发现 P2: FrozenTrial 无 Hash（已修复）
+
+### 已应用的修复
+
+#### FrozenTrial Hash (trial/frozen.rs)
+1. **Hash impl** — `impl std::hash::Hash for FrozenTrial`，使用 `trial_id + number + state` 作为哈希键
+   - 注：Python FrozenTrial 不可哈希（含 list 字段），此为 Rust 扩展功能
+
+#### Trial 缓存 (trial/handle.rs) — P1 性能修复
+2. **cached_trial 字段** — 添加 `cached_trial: FrozenTrial` 字段，匹配 Python 的 `_cached_frozen_trial`
+3. **suggest() 重构** — 使用 `cached_trial.distributions/params` 替代每次 `storage.get_trial()` 读取
+4. **suggest() 缓存更新** — 成功 suggest 后更新 `cached_trial.params` 和 `cached_trial.distributions`
+5. **report() 签名变更** — `&self` → `&mut self`，使用 `cached_trial.intermediate_values` 检查重复 step
+6. **report() 缓存更新** — 写入 storage 后更新 `cached_trial.intermediate_values`
+7. **params() 简化** — 返回类型从 `Result<HashMap<..>>` → `HashMap<..>`（直读缓存）
+8. **distributions() 简化** — 返回类型从 `Result<HashMap<..>>` → `HashMap<..>`（直读缓存）
+
+#### 级联修改
+9. **Study.ask()** — 传递 `trial` (FrozenTrial) 作为 `cached_trial` 参数给 `Trial::new()`
+10. **cli.rs** — `trial.params().unwrap_or_default()` → `trial.params()`
+11. **integration.rs** — `PruningMixin.check()` 参数从 `&Trial` → `&mut Trial`
+
+### 已解决的待修复项
+
+| 原编号 | 原状态 | 项目 | 处理结果 |
+|--------|--------|------|---------|
+| #4 | 🔴 | tell() state=None 缺失 | ✅ 已存在（Session 39 测试确认） |
+| #6 | 🟠 | reseed_rng 缺失 | ✅ Session 38 已修复 |
+| #8 | 🟠 | 嵌套 optimize 检查 | ✅ Session 38 已修复 |
+| #11 | 🟠 | deprecated distribution JSON | ✅ Session 38 已修复 |
+| #13 | 🟡 | NSGA-II single() 过滤 | ✅ Session 38 已修复 |
+
+### 新增测试
+
+#### Rust 内联测试 (20 个)
+| 文件 | 测试名 | 描述 |
+|------|--------|------|
+| trial/frozen.rs | test_frozen_trial_hash_in_hashset | HashSet 去重 |
+| trial/frozen.rs | test_frozen_trial_hash_consistency | 哈希一致性 |
+| trial/frozen.rs | test_validate_mismatched_keys | 参数/分布键不匹配 |
+| trial/frozen.rs | test_validate_complete_without_values | 完成无值拒绝 |
+| trial/frozen.rs | test_validate_pruned_without_values_ok | 剪枝无值允许 |
+| trial/handle.rs | test_cached_trial_params_updated_after_suggest | suggest 后 params 更新 |
+| trial/handle.rs | test_cached_trial_distributions_updated_after_suggest | suggest 后 distributions 更新 |
+| trial/handle.rs | test_report_updates_cache_for_pruning | report 更新缓存 |
+| trial/handle.rs | test_multiple_suggests_independent | 多参数独立 suggest |
+| trial/handle.rs | test_report_multi_objective_error | 多目标 report 拒绝 |
+| trial/handle.rs | test_report_negative_step_error | 负 step 报错 |
+| study/core.rs | test_tell_auto_valid_values_complete | tell auto 有效值 |
+| study/core.rs | test_tell_auto_none_values_fail | tell auto 无值失败 |
+| study/core.rs | test_tell_auto_nan_values_fail | tell auto NaN 失败 |
+| study/core.rs | test_tell_auto_wrong_count_fail | tell auto 数量错误 |
+| study/core.rs | test_tell_finished_trial_error | tell 完成试验报错 |
+| study/core.rs | test_tell_finished_trial_skip | tell 跳过完成试验 |
+| study/core.rs | test_enqueue_trial_params_used | enqueue 参数生效 |
+| study/core.rs | test_add_trial_and_add_trials | add_trial/add_trials |
+| study/core.rs | test_study_stop_from_callback | study.stop 回调 |
+
+#### Python 交叉验证测试 (10 个)
+| 测试名 | 描述 |
+|--------|------|
+| test_tell_state_none_valid_values_complete | tell(state=None) 有效值 |
+| test_tell_state_none_none_values_fail | tell(state=None) 无值 |
+| test_tell_state_none_nan_values_fail | tell(state=None) NaN 值 |
+| test_tell_skip_if_finished | tell 跳过已完成 |
+| test_tell_pruned_uses_last_intermediate | tell 剪枝用末值 |
+| test_enqueue_trial_params_used | enqueue 参数 |
+| test_add_trial_and_add_trials | add_trial/add_trials |
+| test_study_stop | study.stop |
+| test_suggest_updates_params_immediately | suggest 后 params 立即可用 |
+| ~~test_frozen_trial_hashable~~ | ~~已移除：Python FrozenTrial不可哈希~~ |
+
+### 测试统计
+
+| 指标 | 数值 |
+|------|------|
+| Rust 测试总数 | 753 (748 unit + 5 doc) |
+| Python 交叉验证 | 140 |
+| 本次新增 Rust | +20 (部分抵消了之前多计) |
+| 本次新增 Python | +10 |
+| 修改文件数 | 6 |
+
+### 待修复 (后续 Session)
+
+| 优先级 | 项目 | 说明 |
+|--------|------|------|
+| 🔴 高 | MOTPE 多目标 TPE | 无非支配排序/HSSP/超体积加权 |
+| 🔴 高 | NSGA-II 代际系统 | 使用末尾 N 个 trial 而非真正的代际 |
+| 🔴 高 | CMA-ES 状态持久化 | 重启后丢失优化状态 |
+| 🟠 中 | StudySummary 类 | Python 的 StudySummary 未实现 |
+| 🟠 中 | Heartbeat 功能 | 分布式试验心跳检测 |
+| 🟡 低 | fANOVA 方差分解 | 使用 bin variance 而非随机森林边际方差 |
+| 🟡 低 | Wilcoxon 精确分布表 | 小样本精确分布缺失 |
+| 🟡 低 | BaseTrial trait | Trial/FrozenTrial/FixedTrial 统一接口 |
+| 🟡 低 | Hyperband _filter_study | after_trial 不经过 _filter_study 过滤 |

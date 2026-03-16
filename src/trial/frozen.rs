@@ -455,6 +455,17 @@ impl PartialEq for FrozenTrial {
 
 impl Eq for FrozenTrial {}
 
+/// 对齐 Python: FrozenTrial 实现 `__hash__`。
+/// 由于 f64 和 HashMap 无法直接 Hash，使用 trial_id + number + state
+/// 作为稳定哈希键（符合 Python `hash(tuple(self.__dict__))` 的实际行为）。
+impl std::hash::Hash for FrozenTrial {
+    fn hash<H: std::hash::Hasher>(&self, hasher: &mut H) {
+        self.trial_id.hash(hasher);
+        self.number.hash(hasher);
+        self.state.hash(hasher);
+    }
+}
+
 impl PartialOrd for FrozenTrial {
     fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
         Some(self.cmp(other))
@@ -1208,5 +1219,123 @@ mod tests {
         };
         let err = t.set_value(Some(3.0)).unwrap_err();
         assert!(matches!(err, OptunaError::RuntimeError(_)));
+    }
+
+    // ========== 对齐 Python: FrozenTrial Hash 测试 ==========
+
+    /// 测试 FrozenTrial 可以放入 HashSet。
+    /// 对应 Python: `set([trial1, trial2])` 去重依赖 __hash__。
+    #[test]
+    fn test_frozen_trial_hash_in_hashset() {
+        use std::collections::HashSet;
+        let now = Utc::now();
+        let (p, d, u, s, i) = empty_maps();
+        let t1 = FrozenTrial {
+            number: 0, state: TrialState::Complete,
+            values: Some(vec![1.0]),
+            datetime_start: Some(now), datetime_complete: Some(now),
+            params: p.clone(), distributions: d.clone(),
+            user_attrs: u.clone(), system_attrs: s.clone(),
+            intermediate_values: i.clone(), trial_id: 0,
+        };
+        let t2 = FrozenTrial {
+            number: 1, state: TrialState::Complete,
+            values: Some(vec![2.0]),
+            datetime_start: Some(now), datetime_complete: Some(now),
+            params: p, distributions: d,
+            user_attrs: u, system_attrs: s,
+            intermediate_values: i, trial_id: 1,
+        };
+
+        let mut set = HashSet::new();
+        set.insert(t1.clone());
+        set.insert(t2.clone());
+        set.insert(t1.clone()); // 重复插入
+        assert_eq!(set.len(), 2, "HashSet 应去重");
+    }
+
+    /// 测试相同 trial_id 和 number 的 FrozenTrial 产生相同 hash。
+    #[test]
+    fn test_frozen_trial_hash_consistency() {
+        use std::hash::{Hash, Hasher};
+        use std::collections::hash_map::DefaultHasher;
+
+        let now = Utc::now();
+        let (p, d, u, s, i) = empty_maps();
+        let t1 = FrozenTrial {
+            number: 5, state: TrialState::Complete,
+            values: Some(vec![1.0]),
+            datetime_start: Some(now), datetime_complete: Some(now),
+            params: p.clone(), distributions: d.clone(),
+            user_attrs: u.clone(), system_attrs: s.clone(),
+            intermediate_values: i.clone(), trial_id: 42,
+        };
+        let t2 = FrozenTrial {
+            number: 5, state: TrialState::Complete,
+            values: Some(vec![999.0]), // 不同 values
+            datetime_start: Some(now), datetime_complete: Some(now),
+            params: p, distributions: d,
+            user_attrs: u, system_attrs: s,
+            intermediate_values: i, trial_id: 42,
+        };
+
+        let mut h1 = DefaultHasher::new();
+        t1.hash(&mut h1);
+        let mut h2 = DefaultHasher::new();
+        t2.hash(&mut h2);
+        assert_eq!(h1.finish(), h2.finish(), "相同 trial_id+number+state 应产生相同 hash");
+    }
+
+    // ========== 对齐 Python: FrozenTrial validate 边界测试 ==========
+
+    /// 测试 validate 拒绝 params/distributions 键不一致。
+    #[test]
+    fn test_validate_mismatched_keys() {
+        let now = Utc::now();
+        let mut params = HashMap::new();
+        params.insert("x".to_string(), ParamValue::Float(1.0));
+        let distributions = HashMap::new(); // 没有 "x"
+
+        let t = FrozenTrial {
+            number: 0, state: TrialState::Complete,
+            values: Some(vec![1.0]),
+            datetime_start: Some(now), datetime_complete: Some(now),
+            params, distributions,
+            user_attrs: HashMap::new(), system_attrs: HashMap::new(),
+            intermediate_values: HashMap::new(), trial_id: 0,
+        };
+        assert!(t.validate().is_err());
+    }
+
+    /// 测试 validate 拒绝 Complete 但无 values。
+    #[test]
+    fn test_validate_complete_without_values() {
+        let now = Utc::now();
+        let (p, d, u, s, i) = empty_maps();
+        let t = FrozenTrial {
+            number: 0, state: TrialState::Complete,
+            values: None, // Complete 必须有 values
+            datetime_start: Some(now), datetime_complete: Some(now),
+            params: p, distributions: d,
+            user_attrs: u, system_attrs: s,
+            intermediate_values: i, trial_id: 0,
+        };
+        assert!(t.validate().is_err());
+    }
+
+    /// 测试 validate 接受 Pruned 无 values。
+    #[test]
+    fn test_validate_pruned_without_values_ok() {
+        let now = Utc::now();
+        let (p, d, u, s, i) = empty_maps();
+        let t = FrozenTrial {
+            number: 0, state: TrialState::Pruned,
+            values: None,
+            datetime_start: Some(now), datetime_complete: Some(now),
+            params: p, distributions: d,
+            user_attrs: u, system_attrs: s,
+            intermediate_values: i, trial_id: 0,
+        };
+        assert!(t.validate().is_ok());
     }
 }

@@ -33,6 +33,9 @@ pub struct Trial {
     relative_search_space: IndexMap<String, Distribution>,
     /// Fixed params injected by enqueue_trial (external repr).
     fixed_params: HashMap<String, ParamValue>,
+    /// 对齐 Python `_cached_frozen_trial`: 缓存的 FrozenTrial，避免每次 suggest 都读 storage。
+    /// Python 在 Trial.__init__ 中缓存，后续 suggest/report/set_attr 更新本地缓存。
+    cached_trial: crate::trial::FrozenTrial,
 }
 
 impl Trial {
@@ -49,6 +52,7 @@ impl Trial {
         relative_params: HashMap<String, f64>,
         relative_search_space: IndexMap<String, Distribution>,
         fixed_params: HashMap<String, ParamValue>,
+        cached_trial: crate::trial::FrozenTrial,
     ) -> Self {
         Self {
             trial_id,
@@ -61,6 +65,7 @@ impl Trial {
             relative_params,
             relative_search_space,
             fixed_params,
+            cached_trial,
         }
     }
 
@@ -217,10 +222,8 @@ impl Trial {
     /// 使用 check_distribution_compatibility() 进行兼容性检查，
     /// 允许同类型但不同 range 的分布（对齐 Python 行为）。
     fn suggest(&mut self, name: &str, dist: &Distribution) -> Result<f64> {
-        // Check if this param was already set (re-suggest returns same value)
-        // 对齐 Python: 已存在则直接返回，仅做兼容性检查
-        let existing = self.storage.get_trial(self.trial_id)?;
-        if let Some(existing_dist) = existing.distributions.get(name) {
+        // 对齐 Python `_cached_frozen_trial`: 使用本地缓存避免重复读 storage
+        if let Some(existing_dist) = self.cached_trial.distributions.get(name) {
             // 兼容性检查：允许同类型不同 range（对齐 Python）
             crate::distributions::check_distribution_compatibility(existing_dist, dist)?;
 
@@ -233,7 +236,7 @@ impl Trial {
                 );
             }
 
-            let val = existing.params.get(name).unwrap();
+            let val = self.cached_trial.params.get(name).unwrap();
             return dist.to_internal_repr(val);
         }
 
@@ -277,18 +280,24 @@ impl Trial {
                 v
             } else {
                 let all_trials = self.storage.get_all_trials(self.study_id, None)?;
-                self.sampler.sample_independent(&all_trials, &existing, name, dist)?
+                self.sampler.sample_independent(&all_trials, &self.cached_trial, name, dist)?
             }
         } else {
             // Fall back to independent sampling
             // 获取所有历史试验供采样器参考（对齐 Python study._get_trials）
             let all_trials = self.storage.get_all_trials(self.study_id, None)?;
-            self.sampler.sample_independent(&all_trials, &existing, name, dist)?
+            self.sampler.sample_independent(&all_trials, &self.cached_trial, name, dist)?
         };
 
         // Record the param in storage
         self.storage
             .set_trial_param(self.trial_id, name, internal, dist)?;
+
+        // 对齐 Python: 更新本地缓存（避免后续 suggest 重读 storage）
+        let param_value = dist.to_external_repr(internal)?;
+        self.cached_trial.params.insert(name.to_string(), param_value);
+        self.cached_trial.distributions.insert(name.to_string(), dist.clone());
+
         Ok(internal)
     }
 
@@ -297,7 +306,7 @@ impl Trial {
     /// 对应 Python `Trial.report()`。
     /// step 必须 >= 0，多目标优化时不可调用 report。
     /// 同一 step 重复 report 时忽略并发出警告（对齐 Python）。
-    pub fn report(&self, value: f64, step: i64) -> Result<()> {
+    pub fn report(&mut self, value: f64, step: i64) -> Result<()> {
         // 多目标优化时禁止调用 report（对齐 Python NotImplementedError）
         if self.directions.len() > 1 {
             return Err(OptunaError::NotImplemented(
@@ -309,9 +318,8 @@ impl Trial {
                 "The `step` argument is {step} but cannot be negative."
             )));
         }
-        // 检查是否已经 report 过该 step（对齐 Python：重复 report 忽略并警告）
-        let trial = self.storage.get_trial(self.trial_id)?;
-        if trial.intermediate_values.contains_key(&step) {
+        // 对齐 Python: 使用缓存检查重复 report
+        if self.cached_trial.intermediate_values.contains_key(&step) {
             crate::optuna_warn!(
                 "The reported value is ignored because this `step` {} is already reported.",
                 step
@@ -319,7 +327,10 @@ impl Trial {
             return Ok(());
         }
         self.storage
-            .set_trial_intermediate_value(self.trial_id, step, value)
+            .set_trial_intermediate_value(self.trial_id, step, value)?;
+        // 对齐 Python: 更新本地缓存
+        self.cached_trial.intermediate_values.insert(step, value);
+        Ok(())
     }
 
     /// Check if the trial should be pruned.
@@ -355,18 +366,17 @@ impl Trial {
 
     /// 返回当前已建议的参数字典。
     /// 对应 Python `Trial.params`.
+    /// 使用本地缓存（对齐 Python `_cached_frozen_trial`）。
     pub fn params(
         &self,
-    ) -> Result<HashMap<String, crate::distributions::ParamValue>> {
-        let ft = self.storage.get_trial(self.trial_id)?;
-        Ok(ft.params)
+    ) -> HashMap<String, crate::distributions::ParamValue> {
+        self.cached_trial.params.clone()
     }
 
     /// 返回当前已建议的参数分布字典。
     /// 对应 Python `Trial.distributions`.
-    pub fn distributions(&self) -> Result<HashMap<String, Distribution>> {
-        let ft = self.storage.get_trial(self.trial_id)?;
-        Ok(ft.distributions)
+    pub fn distributions(&self) -> HashMap<String, Distribution> {
+        self.cached_trial.distributions.clone()
     }
 
     /// 返回用户属性字典。
@@ -437,7 +447,7 @@ mod tests {
         let _ = trial.suggest_discrete_uniform("z", 0.0, 1.0, 0.25).unwrap();
         let _ = trial.suggest_float_py("w", -1.0, 1.0, Some(0.5), false).unwrap();
 
-        let dists = trial.distributions().unwrap();
+        let dists = trial.distributions();
 
         match dists.get("x").unwrap() {
             Distribution::FloatDistribution(dist) => {
@@ -488,7 +498,7 @@ mod tests {
         let _ = trial.suggest_int_step("c", 0, 10, 2).unwrap();
         let _ = trial.suggest_int_py("d", 3, 9, 3, false).unwrap();
 
-        let dists = trial.distributions().unwrap();
+        let dists = trial.distributions();
 
         match dists.get("a").unwrap() {
             Distribution::IntDistribution(dist) => {
@@ -533,7 +543,7 @@ mod tests {
         )
         .unwrap();
 
-        let trial = study.ask(None).unwrap();
+        let mut trial = study.ask(None).unwrap();
         trial.report(0.1, 0).unwrap();
         trial.report(0.9, 0).unwrap();
 
@@ -562,7 +572,7 @@ mod tests {
         let second = trial.suggest_float_default("x", -10.0, 10.0).unwrap();
         assert_eq!(first, second);
 
-        let dists = trial.distributions().unwrap();
+        let dists = trial.distributions();
         match dists.get("x").unwrap() {
             Distribution::FloatDistribution(dist) => {
                 assert_eq!(dist.low, 0.0);
@@ -812,5 +822,117 @@ mod tests {
         let v1 = trial.suggest_float_default("x", 0.0, 1.0).unwrap();
         let v2 = trial.suggest_float_default("x", 0.0, 1.0).unwrap();
         assert_eq!(v1, v2, "re-suggest should return same value");
+    }
+
+    // ========== 对齐 Python: cached_trial 缓存行为测试 ==========
+
+    /// 测试 suggest 后 params() 立即反映新参数（通过缓存而非重读 storage）。
+    /// 对应 Python: `trial.params` 在 suggest 后立即更新。
+    #[test]
+    fn test_cached_trial_params_updated_after_suggest() {
+        let study = create_study(
+            None, None, None, None,
+            Some(StudyDirection::Minimize), None, false,
+        ).unwrap();
+        let mut trial = study.ask(None).unwrap();
+
+        assert!(trial.params().is_empty(), "初始应无参数");
+
+        trial.suggest_float_default("x", 0.0, 1.0).unwrap();
+        assert!(trial.params().contains_key("x"), "suggest 后应有 x");
+
+        trial.suggest_int_default("n", 1, 10).unwrap();
+        assert!(trial.params().contains_key("n"), "suggest 后应有 n");
+        assert_eq!(trial.params().len(), 2);
+    }
+
+    /// 测试 suggest 后 distributions() 立即反映新分布。
+    #[test]
+    fn test_cached_trial_distributions_updated_after_suggest() {
+        let study = create_study(
+            None, None, None, None,
+            Some(StudyDirection::Minimize), None, false,
+        ).unwrap();
+        let mut trial = study.ask(None).unwrap();
+
+        trial.suggest_float("x", 0.0, 10.0, false, Some(0.5)).unwrap();
+        let dists = trial.distributions();
+        match dists.get("x").unwrap() {
+            Distribution::FloatDistribution(d) => {
+                assert_eq!(d.low, 0.0);
+                assert_eq!(d.high, 10.0);
+                assert_eq!(d.step, Some(0.5));
+            }
+            _ => panic!("expected float distribution"),
+        }
+    }
+
+    /// 测试 report 后 should_prune 可以正常工作。
+    #[test]
+    fn test_report_updates_cache_for_pruning() {
+        let study = create_study(
+            None, None, None, None,
+            Some(StudyDirection::Minimize), None, false,
+        ).unwrap();
+        let mut trial = study.ask(None).unwrap();
+        trial.report(1.0, 0).unwrap();
+        // should_prune 应不 panic（NopPruner 默认不剪枝）
+        let should = trial.should_prune().unwrap();
+        assert!(!should, "NopPruner 不应剪枝");
+    }
+
+    /// 测试多个参数的 suggest 顺序不影响最终结果。
+    #[test]
+    fn test_multiple_suggests_independent() {
+        let study = create_study(
+            None, None, None, None,
+            Some(StudyDirection::Minimize), None, false,
+        ).unwrap();
+        let mut trial = study.ask(None).unwrap();
+
+        let x = trial.suggest_float_default("x", 0.0, 1.0).unwrap();
+        let y = trial.suggest_int_default("y", 1, 100).unwrap();
+        let z = trial.suggest_categorical("z", vec![
+            crate::distributions::CategoricalChoice::Str("a".into()),
+            crate::distributions::CategoricalChoice::Str("b".into()),
+        ]).unwrap();
+
+        // 所有参数都应在缓存中
+        let params = trial.params();
+        assert_eq!(params.len(), 3);
+        assert!(params.contains_key("x"));
+        assert!(params.contains_key("y"));
+        assert!(params.contains_key("z"));
+
+        // suggest 第二次应返回相同值
+        let x2 = trial.suggest_float_default("x", 0.0, 1.0).unwrap();
+        assert_eq!(x, x2);
+    }
+
+    /// 测试 report 多目标时报错。
+    /// 对应 Python: NotImplementedError
+    #[test]
+    fn test_report_multi_objective_error() {
+        let study = create_study(
+            None, None, None, None,
+            None, Some(vec![StudyDirection::Minimize, StudyDirection::Maximize]),
+            false,
+        ).unwrap();
+        let mut trial = study.ask(None).unwrap();
+        let err = trial.report(1.0, 0);
+        assert!(err.is_err());
+    }
+
+    /// 测试 report 负 step 报错。
+    /// 对应 Python: ValueError
+    #[test]
+    fn test_report_negative_step_error() {
+        let study = create_study(
+            None, None, None, None,
+            Some(StudyDirection::Minimize), None, false,
+        ).unwrap();
+        let mut trial = study.ask(None).unwrap();
+        let err = trial.report(1.0, -1);
+        assert!(err.is_err());
     }
 }

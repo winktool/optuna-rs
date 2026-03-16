@@ -901,7 +901,7 @@ impl PruningMixin {
     /// * `value` - 当前指标值
     pub fn check(
         &self,
-        trial: &crate::trial::Trial,
+        trial: &mut crate::trial::Trial,
         step: i64,
         value: f64,
     ) -> PruneDecision {

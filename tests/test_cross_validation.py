@@ -1774,6 +1774,107 @@ def test_reseed_rng_sampler():
     assert len(study.trials) == 1
 
 # ═══════════════════════════════════════════════════════════════════════════
+#  Session 39: tell_auto / ask-tell / add_trial / stop 交叉验证
+# ═══════════════════════════════════════════════════════════════════════════
+
+def test_tell_state_none_valid_values_complete():
+    """对齐 Rust: test_tell_auto_valid_values_complete
+    state=None + 合法值 → Complete"""
+    study = optuna.create_study(direction="minimize")
+    trial = study.ask()
+    trial.suggest_float("x", 0.0, 1.0)
+    frozen = study.tell(trial, 0.5, state=None)
+    assert frozen.state == optuna.trial.TrialState.COMPLETE
+    assert abs(frozen.values[0] - 0.5) < 1e-12
+
+def test_tell_state_none_none_values_fail():
+    """对齐 Rust: test_tell_auto_none_values_fail
+    state=None + values=None → Fail"""
+    study = optuna.create_study(direction="minimize")
+    trial = study.ask()
+    frozen = study.tell(trial, values=None, state=None)
+    assert frozen.state == optuna.trial.TrialState.FAIL
+
+def test_tell_state_none_nan_values_fail():
+    """对齐 Rust: test_tell_auto_nan_values_fail
+    state=None + NaN → Fail"""
+    study = optuna.create_study(direction="minimize")
+    trial = study.ask()
+    frozen = study.tell(trial, values=float("nan"), state=None)
+    assert frozen.state == optuna.trial.TrialState.FAIL
+
+def test_tell_skip_if_finished():
+    """对齐 Rust: test_tell_finished_trial_skip
+    skip_if_finished=True 应静默跳过已完成试验"""
+    study = optuna.create_study(direction="minimize")
+    trial = study.ask()
+    study.tell(trial, 1.0)
+    # 再次 tell 应不报错
+    frozen = study.tell(trial, 2.0, skip_if_finished=True)
+    assert abs(frozen.values[0] - 1.0) < 1e-12  # 保持原始值
+
+def test_tell_pruned_uses_last_intermediate():
+    """对齐 Rust: test_tell_pruned_uses_last_intermediate_value
+    PRUNED 状态应使用最后中间值"""
+    study = optuna.create_study(direction="minimize")
+    trial = study.ask()
+    trial.report(0.5, 0)
+    trial.report(0.3, 1)
+    frozen = study.tell(trial, state=optuna.trial.TrialState.PRUNED)
+    assert frozen.state == optuna.trial.TrialState.PRUNED
+    # Python: pruned 时如果有中间值且可行，自动作为 value
+    assert frozen.values is not None
+    assert abs(frozen.values[0] - 0.3) < 1e-12
+
+def test_enqueue_trial_params_used():
+    """对齐 Rust: test_enqueue_trial_params_used
+    enqueue 的参数应被 ask 使用"""
+    study = optuna.create_study(direction="minimize")
+    study.enqueue_trial({"x": 0.42})
+    trial = study.ask()
+    x = trial.suggest_float("x", 0.0, 1.0)
+    assert abs(x - 0.42) < 1e-12
+
+def test_add_trial_and_add_trials():
+    """对齐 Rust: test_add_trial_and_add_trials"""
+    study = optuna.create_study(direction="minimize")
+    ft = optuna.trial.create_trial(state=optuna.trial.TrialState.COMPLETE, values=[1.0])
+    study.add_trial(ft)
+    assert len(study.trials) == 1
+    ft2 = optuna.trial.create_trial(state=optuna.trial.TrialState.COMPLETE, values=[2.0])
+    ft3 = optuna.trial.create_trial(state=optuna.trial.TrialState.COMPLETE, values=[3.0])
+    study.add_trials([ft2, ft3])
+    assert len(study.trials) == 3
+
+def test_study_stop():
+    """对齐 Rust: test_study_stop_from_callback
+    study.stop() 应终止优化"""
+    counter = {"n": 0}
+    study = optuna.create_study(direction="minimize")
+    def objective(trial):
+        counter["n"] += 1
+        if counter["n"] >= 3:
+            study.stop()
+        return trial.suggest_float("x", 0, 1)
+    study.optimize(objective, n_trials=1000)
+    assert counter["n"] <= 5, f"stop 后应很快终止，实际 {counter['n']} 次"
+
+## NOTE: test_frozen_trial_hashable 已移除
+## Python FrozenTrial 不可哈希（含 list 字段），Rust 的 Hash impl 是扩展功能
+
+def test_suggest_updates_params_immediately():
+    """对齐 Rust: test_cached_trial_params_updated_after_suggest
+    suggest 后 params 应立即可用"""
+    study = optuna.create_study(direction="minimize")
+    trial = study.ask()
+    assert len(trial.params) == 0
+    trial.suggest_float("x", 0.0, 1.0)
+    assert "x" in trial.params
+    trial.suggest_int("n", 1, 10)
+    assert "n" in trial.params
+    assert len(trial.params) == 2
+
+# ═══════════════════════════════════════════════════════════════════════════
 #  执行
 # ═══════════════════════════════════════════════════════════════════════════
 

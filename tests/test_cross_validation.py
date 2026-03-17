@@ -2031,6 +2031,156 @@ def test_wilcoxon_exact_small_n():
     stat, pvalue = wilcoxon(d, alternative="greater", method="exact", correction=False)
     assert abs(pvalue - 0.125) < 1e-10, f"pvalue={pvalue}, expected 0.125"
 
+
+# ═══════════════════════════════════════════════════════════════════════════
+#  Session 42: FrozenTrial 语义对齐、SearchSpaceTransform 列映射
+# ═══════════════════════════════════════════════════════════════════════════
+
+def test_frozen_trial_repr():
+    """Rust: test_display_contains_all_fields
+    对齐 Python FrozenTrial.__repr__: 输出包含 'FrozenTrial(' 和所有关键字段。
+    """
+    t = optuna.trial.FrozenTrial(
+        number=42, state=optuna.trial.TrialState.COMPLETE,
+        value=1.5, values=None,
+        datetime_start=None, datetime_complete=None,
+        params={}, distributions={},
+        user_attrs={}, system_attrs={},
+        intermediate_values={}, trial_id=7,
+    )
+    r = repr(t)
+    assert r.startswith("FrozenTrial("), f"repr should start with FrozenTrial(, got: {r[:30]}"
+    assert "number=42" in r, "'number=42' should be in repr"
+    # Python 的 __repr__ 也有 value=None 结尾
+    assert "value=" in r, "'value=' should appear in repr"
+
+
+def test_frozen_trial_ordering():
+    """Rust: test_ordering_by_number
+    对齐 Python FrozenTrial.__lt__ / __le__: 按 number 排序。
+    """
+    kwargs = dict(state=optuna.trial.TrialState.COMPLETE, value=1.0, values=None,
+                  datetime_start=None, datetime_complete=None,
+                  params={}, distributions={},
+                  user_attrs={}, system_attrs={},
+                  intermediate_values={}, trial_id=0)
+    t1 = optuna.trial.FrozenTrial(number=3, **kwargs)
+    t2 = optuna.trial.FrozenTrial(number=1, **kwargs)
+    assert t2 < t1, "trial with smaller number should be <"
+    assert t2 <= t1
+    assert not t1 < t2
+    trials = sorted([t1, t2])
+    assert trials[0].number == 1
+    assert trials[1].number == 3
+
+
+def test_frozen_trial_eq():
+    """Rust: test_eq_different_state
+    对齐 Python FrozenTrial.__eq__: 比较所有字段。
+    """
+    kwargs = dict(value=None, values=None,
+                  datetime_start=None, datetime_complete=None,
+                  params={}, distributions={},
+                  user_attrs={}, system_attrs={},
+                  intermediate_values={}, trial_id=0)
+    t1 = optuna.trial.FrozenTrial(number=0, state=optuna.trial.TrialState.COMPLETE, **kwargs)
+    t2 = optuna.trial.FrozenTrial(number=0, state=optuna.trial.TrialState.COMPLETE, **kwargs)
+    # 相同字段 → 相等
+    assert t1 == t2
+
+
+def test_frozen_trial_last_step():
+    """Rust: test_last_step_returns_max
+    对齐 Python FrozenTrial.last_step: 返回最大 step。
+    """
+    t = optuna.trial.FrozenTrial(
+        number=0, state=optuna.trial.TrialState.RUNNING,
+        value=None, values=None,
+        datetime_start=None, datetime_complete=None,
+        params={}, distributions={},
+        user_attrs={}, system_attrs={},
+        intermediate_values={0: 1.0, 5: 2.0, 3: 3.0}, trial_id=0,
+    )
+    assert t.last_step == 5, f"expected 5, got {t.last_step}"
+
+
+def test_frozen_trial_duration():
+    """Rust: test_duration_complete
+    对齐 Python FrozenTrial.duration: 有 start 和 complete 时返回 timedelta。
+    """
+    import datetime
+    start = datetime.datetime(2024, 1, 1, 0, 0, 0)
+    end = start + datetime.timedelta(seconds=10)
+    t = optuna.trial.FrozenTrial(
+        number=0, state=optuna.trial.TrialState.COMPLETE,
+        value=1.0, values=None,
+        datetime_start=start, datetime_complete=end,
+        params={}, distributions={},
+        user_attrs={}, system_attrs={},
+        intermediate_values={}, trial_id=0,
+    )
+    assert t.duration == datetime.timedelta(seconds=10)
+
+
+def test_frozen_trial_value_single():
+    """Rust: test_value_single_objective
+    对齐 Python: 单目标 value 返回值。
+    """
+    t = optuna.trial.FrozenTrial(
+        number=0, state=optuna.trial.TrialState.COMPLETE,
+        value=3.14, values=None,
+        datetime_start=None, datetime_complete=None,
+        params={}, distributions={},
+        user_attrs={}, system_attrs={},
+        intermediate_values={}, trial_id=0,
+    )
+    assert abs(t.value - 3.14) < 1e-10
+
+
+def test_frozen_trial_value_multi_raises():
+    """Rust: test_value_multi_objective_error
+    对齐 Python: 多目标调用 .value 报 RuntimeError。
+    """
+    t = optuna.trial.FrozenTrial(
+        number=0, state=optuna.trial.TrialState.COMPLETE,
+        value=None, values=[1.0, 2.0],
+        datetime_start=None, datetime_complete=None,
+        params={}, distributions={},
+        user_attrs={}, system_attrs={},
+        intermediate_values={}, trial_id=0,
+    )
+    try:
+        _ = t.value
+        assert False, "should raise RuntimeError"
+    except RuntimeError:
+        pass
+
+
+def test_transform_column_mapping():
+    """Rust: test_column_to_encoded_columns_mixed
+    对齐 Python SearchSpaceTransform.column_to_encoded_columns:
+    Float→1列, 3-choice Categorical→3列 (one-hot)。
+    """
+    from optuna._transform import _SearchSpaceTransform
+    from optuna.distributions import FloatDistribution, CategoricalDistribution
+
+    search_space = {
+        "x": FloatDistribution(0.0, 1.0),
+        "c": CategoricalDistribution(["a", "b", "c"]),
+    }
+    t = _SearchSpaceTransform(search_space)
+
+    # column_to_encoded_columns: 每个原始参数对应哪些编码列
+    col_map = t.column_to_encoded_columns
+    assert len(col_map) == 2, f"should have 2 params, got {len(col_map)}"
+    assert len(col_map[0]) == 1, f"Float x should map to 1 column, got {len(col_map[0])}"
+    assert len(col_map[1]) == 3, f"Categorical c should map to 3 columns, got {len(col_map[1])}"
+
+    # encoded_column_to_column: 反向映射
+    enc_to_col = t.encoded_column_to_column
+    # [0, 1, 1, 1] => 编码列 0→参数0, 列 1/2/3→参数1
+    assert list(enc_to_col) == [0, 1, 1, 1], f"got {list(enc_to_col)}"
+
 # ═══════════════════════════════════════════════════════════════════════════
 #  执行
 # ═══════════════════════════════════════════════════════════════════════════

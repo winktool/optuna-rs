@@ -35,6 +35,10 @@ pub enum OptunaError {
     /// 对应 Python `RuntimeError` — 通用运行时错误。
     #[error("runtime error: {0}")]
     RuntimeError(String),
+
+    /// 对应 Python `CLIUsageError` — CLI 参数使用错误。
+    #[error("CLI usage error: {0}")]
+    CLIUsageError(String),
 }
 
 /// Convenience alias used throughout the crate.
@@ -86,5 +90,20 @@ mod tests {
         assert_eq!(ok.unwrap(), 42);
         let err: Result<i32> = Err(OptunaError::TrialPruned);
         assert!(err.is_err());
+    }
+
+    /// 对齐 Python: CLIUsageError 包含错误消息。
+    #[test]
+    fn test_cli_usage_error() {
+        let e = OptunaError::CLIUsageError("unknown option --foo".into());
+        assert!(e.to_string().contains("unknown option --foo"));
+        assert!(e.to_string().contains("CLI"));
+    }
+
+    /// 对齐 Python: RuntimeError 包含错误消息。
+    #[test]
+    fn test_runtime_error() {
+        let e = OptunaError::RuntimeError("multi-objective direction".into());
+        assert!(e.to_string().contains("multi-objective direction"));
     }
 }

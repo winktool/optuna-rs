@@ -20,7 +20,6 @@ pub struct SearchSpaceTransform {
     /// Maps original param index → range of encoded column indices.
     column_to_encoded_columns: Vec<std::ops::Range<usize>>,
     /// Maps encoded column index → original param index.
-    #[allow(dead_code)]
     encoded_column_to_column: Vec<usize>,
     transform_log: bool,
     transform_0_1: bool,
@@ -87,6 +86,22 @@ impl SearchSpaceTransform {
     /// Create with default settings (transform_log=true, transform_step=true, transform_0_1=false).
     pub fn with_defaults(search_space: IndexMap<String, Distribution>) -> Self {
         Self::new(search_space, true, true, false)
+    }
+
+    /// 对齐 Python `column_to_encoded_columns` 属性:
+    /// 返回每个原始参数对应的编码列索引范围。
+    ///
+    /// 例如: Float → Range(0..1), 3-choice Categorical → Range(1..4)
+    pub fn column_to_encoded_columns(&self) -> &[std::ops::Range<usize>] {
+        &self.column_to_encoded_columns
+    }
+
+    /// 对齐 Python `encoded_column_to_column` 属性:
+    /// 返回每个编码列对应的原始参数索引。
+    ///
+    /// 例如: [0, 1, 1, 1] 表示编码列 0→参数0, 列 1/2/3→参数1 (3-choice categorical)
+    pub fn encoded_column_to_column(&self) -> &[usize] {
+        &self.encoded_column_to_column
     }
 
     /// The bounds for each encoded column.
@@ -791,5 +806,93 @@ mod tests {
     fn test_search_space_transform_empty_panic() {
         let empty: IndexMap<String, Distribution> = IndexMap::new();
         SearchSpaceTransform::new(empty, true, true, false);
+    }
+
+    // ================================================================
+    // column_to_encoded_columns / encoded_column_to_column 对齐测试
+    // ================================================================
+
+    /// 对齐 Python `column_to_encoded_columns`:
+    /// Float 参数占 1 列，3-choice Categorical 占 3 列。
+    #[test]
+    fn test_column_to_encoded_columns_mixed() {
+        use crate::distributions::{CategoricalDistribution, CategoricalChoice};
+        let mut space = IndexMap::new();
+        // 参数0: Float → 1 列
+        space.insert(
+            "x".into(),
+            Distribution::FloatDistribution(FloatDistribution::new(0.0, 1.0, false, None).unwrap()),
+        );
+        // 参数1: 3-choice Categorical → 3 列 (one-hot)
+        space.insert(
+            "c".into(),
+            Distribution::CategoricalDistribution(CategoricalDistribution::new(vec![
+                CategoricalChoice::Str("a".into()),
+                CategoricalChoice::Str("b".into()),
+                CategoricalChoice::Str("c".into()),
+            ]).unwrap()),
+        );
+        // 参数2: Int → 1 列
+        space.insert(
+            "i".into(),
+            Distribution::IntDistribution(IntDistribution::new(0, 10, false, 1).unwrap()),
+        );
+
+        let t = SearchSpaceTransform::new(space, true, true, false);
+
+        // 编码列: x=[0], c=[1,2,3], i=[4]
+        let col_ranges = t.column_to_encoded_columns();
+        assert_eq!(col_ranges.len(), 3, "3 原始参数");
+        assert_eq!(col_ranges[0], 0..1, "Float x 占 1 列");
+        assert_eq!(col_ranges[1], 1..4, "Categorical c 占 3 列");
+        assert_eq!(col_ranges[2], 4..5, "Int i 占 1 列");
+        assert_eq!(t.n_encoded(), 5, "总编码列 = 5");
+    }
+
+    /// 对齐 Python `encoded_column_to_column`:
+    /// 反向映射每个编码列到原始参数索引。
+    #[test]
+    fn test_encoded_column_to_column_mixed() {
+        use crate::distributions::{CategoricalDistribution, CategoricalChoice};
+        let mut space = IndexMap::new();
+        space.insert(
+            "x".into(),
+            Distribution::FloatDistribution(FloatDistribution::new(0.0, 1.0, false, None).unwrap()),
+        );
+        space.insert(
+            "c".into(),
+            Distribution::CategoricalDistribution(CategoricalDistribution::new(vec![
+                CategoricalChoice::Str("a".into()),
+                CategoricalChoice::Str("b".into()),
+                CategoricalChoice::Str("c".into()),
+            ]).unwrap()),
+        );
+
+        let t = SearchSpaceTransform::new(space, true, true, false);
+
+        let enc_to_col = t.encoded_column_to_column();
+        // 编码列 0 → 参数0 (x), 编码列 1/2/3 → 参数1 (c)
+        assert_eq!(enc_to_col, &[0, 1, 1, 1]);
+    }
+
+    /// 对齐 Python: 纯数值参数不展开列。
+    #[test]
+    fn test_column_mapping_numeric_only() {
+        let mut space = IndexMap::new();
+        space.insert(
+            "a".into(),
+            Distribution::FloatDistribution(FloatDistribution::new(0.0, 1.0, false, None).unwrap()),
+        );
+        space.insert(
+            "b".into(),
+            Distribution::IntDistribution(IntDistribution::new(0, 10, false, 1).unwrap()),
+        );
+
+        let t = SearchSpaceTransform::new(space, true, true, false);
+        let col_ranges = t.column_to_encoded_columns();
+        assert_eq!(col_ranges[0], 0..1);
+        assert_eq!(col_ranges[1], 1..2);
+        assert_eq!(t.n_encoded(), 2);
+        assert_eq!(t.encoded_column_to_column(), &[0, 1]);
     }
 }

@@ -526,6 +526,38 @@ impl Ord for FrozenTrial {
     }
 }
 
+/// 对齐 Python `FrozenTrial.__repr__`:
+/// `FrozenTrial(number=0, state=TrialState.COMPLETE, value=1.5, ...)`
+impl std::fmt::Display for FrozenTrial {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // 对齐 Python: 输出所有字段 + 末尾 value=...
+        let value_str = match &self.values {
+            Some(v) if v.len() == 1 => format!("{}", v[0]),
+            _ => "None".to_string(),
+        };
+        write!(
+            f,
+            "FrozenTrial(number={}, state={:?}, values={:?}, \
+             datetime_start={:?}, datetime_complete={:?}, \
+             params={:?}, distributions={:?}, \
+             user_attrs={:?}, system_attrs={:?}, \
+             intermediate_values={:?}, trial_id={}, value={})",
+            self.number,
+            self.state,
+            self.values,
+            self.datetime_start,
+            self.datetime_complete,
+            self.params,
+            self.distributions,
+            self.user_attrs,
+            self.system_attrs,
+            self.intermediate_values,
+            self.trial_id,
+            value_str,
+        )
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1385,5 +1417,326 @@ mod tests {
             intermediate_values: i, trial_id: 0,
         };
         assert!(t.validate().is_ok());
+    }
+
+    // ================================================================
+    // Display / __repr__ 对齐测试
+    // ================================================================
+
+    /// 对齐 Python `FrozenTrial.__repr__`: Display 输出包含所有关键字段。
+    #[test]
+    fn test_display_contains_all_fields() {
+        let now = Utc::now();
+        let (p, d, u, s, i) = empty_maps();
+        let t = FrozenTrial {
+            number: 42, state: TrialState::Complete,
+            values: Some(vec![1.5]),
+            datetime_start: Some(now), datetime_complete: Some(now),
+            params: p, distributions: d,
+            user_attrs: u, system_attrs: s,
+            intermediate_values: i, trial_id: 7,
+        };
+        let repr = format!("{}", t);
+        assert!(repr.starts_with("FrozenTrial("), "should start with class name");
+        assert!(repr.contains("number=42"), "should contain number");
+        assert!(repr.contains("trial_id=7"), "should contain trial_id");
+        assert!(repr.contains("value=1.5"), "should contain value for single-obj");
+    }
+
+    /// 对齐 Python: 多目标时 value=None。
+    #[test]
+    fn test_display_multi_objective_value_none() {
+        let now = Utc::now();
+        let (p, d, u, s, i) = empty_maps();
+        let t = FrozenTrial {
+            number: 0, state: TrialState::Complete,
+            values: Some(vec![1.0, 2.0]), // 多目标
+            datetime_start: Some(now), datetime_complete: Some(now),
+            params: p, distributions: d,
+            user_attrs: u, system_attrs: s,
+            intermediate_values: i, trial_id: 0,
+        };
+        let repr = format!("{}", t);
+        assert!(repr.contains("value=None"), "multi-obj should show value=None");
+    }
+
+    // ================================================================
+    // PartialOrd / Ord 排序对齐测试
+    // ================================================================
+
+    /// 对齐 Python `FrozenTrial.__lt__`: 按 number 排序。
+    #[test]
+    fn test_ordering_by_number() {
+        let now = Utc::now();
+        let (p1, d1, u1, s1, i1) = empty_maps();
+        let (p2, d2, u2, s2, i2) = empty_maps();
+        let t1 = FrozenTrial {
+            number: 3, state: TrialState::Complete,
+            values: Some(vec![1.0]),
+            datetime_start: Some(now), datetime_complete: Some(now),
+            params: p1, distributions: d1,
+            user_attrs: u1, system_attrs: s1,
+            intermediate_values: i1, trial_id: 0,
+        };
+        let t2 = FrozenTrial {
+            number: 1, state: TrialState::Complete,
+            values: Some(vec![2.0]),
+            datetime_start: Some(now), datetime_complete: Some(now),
+            params: p2, distributions: d2,
+            user_attrs: u2, system_attrs: s2,
+            intermediate_values: i2, trial_id: 1,
+        };
+        assert!(t2 < t1, "trial with smaller number should be less");
+        assert!(t1 > t2);
+
+        // Vec 排序应按 number
+        let mut trials = vec![t1.clone(), t2.clone()];
+        trials.sort();
+        assert_eq!(trials[0].number, 1);
+        assert_eq!(trials[1].number, 3);
+    }
+
+    // ================================================================
+    // PartialEq 语义测试
+    // ================================================================
+
+    /// 对齐 Python: PartialEq 比较所有字段，NaN == NaN。
+    #[test]
+    fn test_eq_nan_values() {
+        let now = Utc::now();
+        let (p1, d1, u1, s1, i1) = empty_maps();
+        let (p2, d2, u2, s2, i2) = empty_maps();
+        // 注意: Complete 不允许 NaN values (validate 会报错)
+        // 所以用 Running 状态
+        let t1 = FrozenTrial {
+            number: 0, state: TrialState::Running,
+            values: Some(vec![f64::NAN]),
+            datetime_start: Some(now), datetime_complete: None,
+            params: p1, distributions: d1,
+            user_attrs: u1, system_attrs: s1,
+            intermediate_values: i1, trial_id: 0,
+        };
+        let t2 = FrozenTrial {
+            number: 0, state: TrialState::Running,
+            values: Some(vec![f64::NAN]),
+            datetime_start: Some(now), datetime_complete: None,
+            params: p2, distributions: d2,
+            user_attrs: u2, system_attrs: s2,
+            intermediate_values: i2, trial_id: 0,
+        };
+        assert_eq!(t1, t2, "NaN == NaN should be true for values comparison");
+    }
+
+    /// 对齐 Python: 不同 state 的试验不相等。
+    #[test]
+    fn test_eq_different_state() {
+        let now = Utc::now();
+        let (p1, d1, u1, s1, i1) = empty_maps();
+        let (p2, d2, u2, s2, i2) = empty_maps();
+        let t1 = FrozenTrial {
+            number: 0, state: TrialState::Running,
+            values: None,
+            datetime_start: Some(now), datetime_complete: None,
+            params: p1, distributions: d1,
+            user_attrs: u1, system_attrs: s1,
+            intermediate_values: i1, trial_id: 0,
+        };
+        let t2 = FrozenTrial {
+            number: 0, state: TrialState::Waiting,
+            values: None,
+            datetime_start: None, datetime_complete: None,
+            params: p2, distributions: d2,
+            user_attrs: u2, system_attrs: s2,
+            intermediate_values: i2, trial_id: 0,
+        };
+        assert_ne!(t1, t2);
+    }
+
+    // ================================================================
+    // Hash 一致性测试
+    // ================================================================
+
+    /// 对齐 Python: 相同 trial 多次 hash 结果一致。
+    #[test]
+    fn test_hash_deterministic() {
+        use std::collections::hash_map::DefaultHasher;
+        use std::hash::{Hash, Hasher};
+
+        let now = Utc::now();
+        let (p, d, u, s, i) = empty_maps();
+        let t = FrozenTrial {
+            number: 5, state: TrialState::Complete,
+            values: Some(vec![1.0]),
+            datetime_start: Some(now), datetime_complete: Some(now),
+            params: p, distributions: d,
+            user_attrs: u, system_attrs: s,
+            intermediate_values: i, trial_id: 10,
+        };
+
+        let mut h1 = DefaultHasher::new();
+        t.hash(&mut h1);
+        let hash1 = h1.finish();
+
+        let mut h2 = DefaultHasher::new();
+        t.hash(&mut h2);
+        let hash2 = h2.finish();
+
+        assert_eq!(hash1, hash2, "same trial should hash identically");
+    }
+
+    /// 对齐 Python: 不同 number 的试验 hash 不同。
+    #[test]
+    fn test_hash_different_numbers() {
+        use std::collections::hash_map::DefaultHasher;
+        use std::hash::{Hash, Hasher};
+
+        let now = Utc::now();
+        let (p1, d1, u1, s1, i1) = empty_maps();
+        let (p2, d2, u2, s2, i2) = empty_maps();
+        let t1 = FrozenTrial {
+            number: 1, state: TrialState::Complete,
+            values: Some(vec![1.0]),
+            datetime_start: Some(now), datetime_complete: Some(now),
+            params: p1, distributions: d1,
+            user_attrs: u1, system_attrs: s1,
+            intermediate_values: i1, trial_id: 1,
+        };
+        let t2 = FrozenTrial {
+            number: 2, state: TrialState::Complete,
+            values: Some(vec![1.0]),
+            datetime_start: Some(now), datetime_complete: Some(now),
+            params: p2, distributions: d2,
+            user_attrs: u2, system_attrs: s2,
+            intermediate_values: i2, trial_id: 2,
+        };
+
+        let mut h1 = DefaultHasher::new();
+        t1.hash(&mut h1);
+        let mut h2 = DefaultHasher::new();
+        t2.hash(&mut h2);
+
+        assert_ne!(h1.finish(), h2.finish(), "different trials should hash differently");
+    }
+
+    // ================================================================
+    // last_step / duration 方法测试
+    // ================================================================
+
+    /// 对齐 Python `FrozenTrial.last_step`: 返回最大 step。
+    #[test]
+    fn test_last_step_returns_max() {
+        let (p, d, u, s, _) = empty_maps();
+        let mut iv = HashMap::new();
+        iv.insert(0, 1.0);
+        iv.insert(5, 2.0);
+        iv.insert(3, 3.0);
+        let t = FrozenTrial {
+            number: 0, state: TrialState::Running,
+            values: None,
+            datetime_start: Some(Utc::now()), datetime_complete: None,
+            params: p, distributions: d,
+            user_attrs: u, system_attrs: s,
+            intermediate_values: iv, trial_id: 0,
+        };
+        assert_eq!(t.last_step(), Some(5));
+    }
+
+    /// 对齐 Python: 无中间值时 last_step 返回 None。
+    #[test]
+    fn test_last_step_empty() {
+        let (p, d, u, s, i) = empty_maps();
+        let t = FrozenTrial {
+            number: 0, state: TrialState::Running,
+            values: None,
+            datetime_start: Some(Utc::now()), datetime_complete: None,
+            params: p, distributions: d,
+            user_attrs: u, system_attrs: s,
+            intermediate_values: i, trial_id: 0,
+        };
+        assert_eq!(t.last_step(), None);
+    }
+
+    /// 对齐 Python `FrozenTrial.duration`: 有 start 和 complete 时返回 Some。
+    #[test]
+    fn test_duration_complete() {
+        let start = Utc::now();
+        let end = start + chrono::Duration::seconds(10);
+        let (p, d, u, s, i) = empty_maps();
+        let t = FrozenTrial {
+            number: 0, state: TrialState::Complete,
+            values: Some(vec![1.0]),
+            datetime_start: Some(start), datetime_complete: Some(end),
+            params: p, distributions: d,
+            user_attrs: u, system_attrs: s,
+            intermediate_values: i, trial_id: 0,
+        };
+        let dur = t.duration().expect("should have duration");
+        assert_eq!(dur, chrono::Duration::seconds(10));
+    }
+
+    /// 对齐 Python: 无 datetime_complete 时 duration 返回 None。
+    #[test]
+    fn test_duration_incomplete() {
+        let (p, d, u, s, i) = empty_maps();
+        let t = FrozenTrial {
+            number: 0, state: TrialState::Running,
+            values: None,
+            datetime_start: Some(Utc::now()), datetime_complete: None,
+            params: p, distributions: d,
+            user_attrs: u, system_attrs: s,
+            intermediate_values: i, trial_id: 0,
+        };
+        assert!(t.duration().is_none());
+    }
+
+    // ================================================================
+    // value() getter 测试
+    // ================================================================
+
+    /// 对齐 Python: 单目标 value() 返回值。
+    #[test]
+    fn test_value_single_objective() {
+        let now = Utc::now();
+        let (p, d, u, s, i) = empty_maps();
+        let t = FrozenTrial {
+            number: 0, state: TrialState::Complete,
+            values: Some(vec![3.14]),
+            datetime_start: Some(now), datetime_complete: Some(now),
+            params: p, distributions: d,
+            user_attrs: u, system_attrs: s,
+            intermediate_values: i, trial_id: 0,
+        };
+        assert_eq!(t.value().unwrap(), Some(3.14));
+    }
+
+    /// 对齐 Python: 多目标调用 value() 报 RuntimeError。
+    #[test]
+    fn test_value_multi_objective_error() {
+        let now = Utc::now();
+        let (p, d, u, s, i) = empty_maps();
+        let t = FrozenTrial {
+            number: 0, state: TrialState::Complete,
+            values: Some(vec![1.0, 2.0]),
+            datetime_start: Some(now), datetime_complete: Some(now),
+            params: p, distributions: d,
+            user_attrs: u, system_attrs: s,
+            intermediate_values: i, trial_id: 0,
+        };
+        assert!(t.value().is_err());
+    }
+
+    /// 对齐 Python: 无值时 value() 返回 None。
+    #[test]
+    fn test_value_none() {
+        let (p, d, u, s, i) = empty_maps();
+        let t = FrozenTrial {
+            number: 0, state: TrialState::Running,
+            values: None,
+            datetime_start: Some(Utc::now()), datetime_complete: None,
+            params: p, distributions: d,
+            user_attrs: u, system_attrs: s,
+            intermediate_values: i, trial_id: 0,
+        };
+        assert_eq!(t.value().unwrap(), None);
     }
 }

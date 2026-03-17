@@ -57,6 +57,7 @@ fn error_matches_catch(err: &OptunaError, catch: &[&str]) -> bool {
         OptunaError::InvalidDistribution(_) => "InvalidDistribution",
         OptunaError::NotImplemented(_) => "NotImplemented",
         OptunaError::RuntimeError(_) => "RuntimeError",
+        OptunaError::CLIUsageError(_) => "CLIUsageError",
     };
     catch.contains(&variant)
 }

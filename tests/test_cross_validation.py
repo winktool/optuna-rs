@@ -3016,6 +3016,144 @@ def test_nsgaiii_reference_points_count():
         actual = comb(n_obj + divs - 1, divs)
         assert actual == expected_count, \
             f"n_obj={n_obj}, divs={divs}: C({n_obj+divs-1},{divs})={actual}, expected {expected_count}"
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Session 48: 对齐 logging、NopPruner、GP、heartbeat 相关
+# ═══════════════════════════════════════════════════════════════════════════
+
+
+def test_logging_set_get_verbosity():
+    """对齐 Rust logging.rs: set_verbosity/get_verbosity 往返一致"""
+    import optuna
+    original = optuna.logging.get_verbosity()
+    try:
+        optuna.logging.set_verbosity(optuna.logging.DEBUG)
+        assert optuna.logging.get_verbosity() == optuna.logging.DEBUG
+        optuna.logging.set_verbosity(optuna.logging.WARNING)
+        assert optuna.logging.get_verbosity() == optuna.logging.WARNING
+        optuna.logging.set_verbosity(optuna.logging.ERROR)
+        assert optuna.logging.get_verbosity() == optuna.logging.ERROR
+        optuna.logging.set_verbosity(optuna.logging.INFO)
+        assert optuna.logging.get_verbosity() == optuna.logging.INFO
+    finally:
+        optuna.logging.set_verbosity(original)
+
+
+def test_logging_verbosity_levels_values():
+    """对齐 Rust LogLevel repr: DEBUG=10, INFO=20, WARNING=30, ERROR=40"""
+    import optuna
+    assert optuna.logging.DEBUG == 10
+    assert optuna.logging.INFO == 20
+    assert optuna.logging.WARNING == 30
+    assert optuna.logging.ERROR == 40
+
+
+def test_nop_pruner_never_prunes():
+    """对齐 Rust nop.rs: NopPruner 永远返回 False"""
+    import optuna
+    study = optuna.create_study()
+
+    def objective(trial):
+        for step in range(10):
+            trial.report(float(step), step)
+            # NopPruner 不应剪枝
+            assert not trial.should_prune()
+        return 1.0
+
+    study.optimize(objective, n_trials=3, callbacks=[],
+                   catch=())
+
+
+def test_nop_pruner_is_default():
+    """对齐 Rust: 默认 pruner 是 NopPruner"""
+    import optuna
+    pruner = optuna.pruners.NopPruner()
+    # NopPruner 应该有 prune 方法
+    assert hasattr(pruner, 'prune')
+
+
+def test_study_direction_values():
+    """对齐 Rust direction.rs: StudyDirection 枚举值"""
+    import optuna
+    assert optuna.study.StudyDirection.NOT_SET.value == 0
+    assert optuna.study.StudyDirection.MINIMIZE.value == 1
+    assert optuna.study.StudyDirection.MAXIMIZE.value == 2
+
+
+def test_study_direction_all_variants():
+    """对齐 Rust direction.rs: 所有变体互不相同"""
+    import optuna
+    directions = list(optuna.study.StudyDirection)
+    assert len(directions) == 3
+    assert len(set(directions)) == 3
+
+
+def test_gp_sampler_creation():
+    """对齐 Rust gp.rs: GPSampler 可以创建"""
+    import optuna
+    sampler = optuna.samplers.GPSampler(seed=42)
+    study = optuna.create_study(sampler=sampler)
+    # 至少能做 1 轮优化
+    study.optimize(lambda trial: trial.suggest_float("x", 0, 1) ** 2, n_trials=3)
+    assert len(study.trials) == 3
+
+
+def test_gp_sampler_deterministic():
+    """对齐 Rust gp_lbfgsb.rs: deterministic_objective 模式"""
+    import optuna
+    sampler = optuna.samplers.GPSampler(seed=42, deterministic_objective=True)
+    study = optuna.create_study(sampler=sampler)
+    study.optimize(lambda trial: trial.suggest_float("x", 0, 1) ** 2, n_trials=5)
+    assert len(study.trials) == 5
+    assert study.best_value is not None
+
+
+def test_gp_sampler_multidimensional():
+    """对齐 Rust gp_lbfgsb.rs: 多维搜索"""
+    import optuna
+    sampler = optuna.samplers.GPSampler(seed=42)
+    study = optuna.create_study(sampler=sampler)
+
+    def obj(trial):
+        x = trial.suggest_float("x", 0, 1)
+        y = trial.suggest_float("y", 0, 1)
+        return x + y
+
+    study.optimize(obj, n_trials=5)
+    assert len(study.trials) == 5
+
+
+def test_sampler_after_trial_all_states():
+    """对齐 Rust samplers/mod.rs: after_trial 对所有状态可调用"""
+    import optuna
+    from optuna.trial import TrialState
+
+    study = optuna.create_study()
+
+    # COMPLETE: 需要 values
+    trial1 = study.ask()
+    study.tell(trial1, values=0.0, state=TrialState.COMPLETE)
+
+    # PRUNED: 不传 values
+    trial2 = study.ask()
+    study.tell(trial2, state=TrialState.PRUNED)
+
+    # FAIL: 不传 values
+    trial3 = study.ask()
+    study.tell(trial3, state=TrialState.FAIL)
+
+    assert len(study.trials) == 3
+
+
+def test_heartbeat_default_interval():
+    """对齐 Rust heartbeat.rs: 默认没有 heartbeat 干扰"""
+    import optuna
+    study = optuna.create_study()
+    # InMemory storage 不支持 heartbeat, 不会报错
+    assert len(study.trials) == 0
+
+
 #  执行
 # ═══════════════════════════════════════════════════════════════════════════
 

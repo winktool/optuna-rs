@@ -78,4 +78,61 @@ mod tests {
         let trial = make_trial();
         assert!(!pruner.prune(&[], &trial, None).unwrap());
     }
+
+    /// 对齐 Python: 带中间值的试验也不剪枝
+    #[test]
+    fn test_nop_pruner_with_intermediate_values() {
+        let pruner = NopPruner::new();
+        let mut trial = make_trial();
+        trial.intermediate_values.insert(0, 0.5);
+        trial.intermediate_values.insert(1, 0.3);
+        trial.intermediate_values.insert(2, 0.1);
+        assert!(!pruner.prune(&[], &trial, None).unwrap());
+    }
+
+    /// 对齐 Python: 多次连续调用都返回 false
+    #[test]
+    fn test_nop_pruner_multiple_calls() {
+        let pruner = NopPruner::new();
+        let trial = make_trial();
+        for _ in 0..100 {
+            assert!(!pruner.prune(&[], &trial, None).unwrap());
+        }
+    }
+
+    /// 对齐 Python: 即使有失败试验也不剪枝
+    #[test]
+    fn test_nop_pruner_with_failed_trials() {
+        let pruner = NopPruner::new();
+        let failed = FrozenTrial {
+            state: TrialState::Fail,
+            ..make_trial()
+        };
+        let trial = make_trial();
+        assert!(!pruner.prune(&[failed], &trial, None).unwrap());
+    }
+
+    /// 对齐 Python: Debug 格式
+    #[test]
+    fn test_nop_pruner_debug_format() {
+        let pruner = NopPruner::new();
+        let debug_str = format!("{:?}", pruner);
+        assert!(debug_str.contains("NopPruner"));
+    }
+
+    /// 对齐 Python: 即使有很多试验历史也不剪枝
+    #[test]
+    fn test_nop_pruner_with_many_trials() {
+        let pruner = NopPruner::new();
+        let trials: Vec<FrozenTrial> = (0..100).map(|i| FrozenTrial {
+            number: i,
+            trial_id: i,
+            state: TrialState::Complete,
+            values: Some(vec![i as f64]),
+            datetime_complete: Some(chrono::Utc::now()),
+            ..make_trial()
+        }).collect();
+        let trial = make_trial();
+        assert!(!pruner.prune(&trials, &trial, None).unwrap());
+    }
 }

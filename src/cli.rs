@@ -642,5 +642,197 @@ pub mod commands {
             assert!(parse_direction("unknown").is_err());
             assert!(parse_direction("").is_err());
         }
+
+        /// 对齐 Python: 大小写不敏感
+        #[test]
+        fn test_parse_direction_case_insensitive() {
+            assert_eq!(parse_direction("Minimize").unwrap(), StudyDirection::Minimize);
+            assert_eq!(parse_direction("MAXIMIZE").unwrap(), StudyDirection::Maximize);
+            assert_eq!(parse_direction("Min").unwrap(), StudyDirection::Minimize);
+            assert_eq!(parse_direction("Max").unwrap(), StudyDirection::Maximize);
+        }
+
+        /// 对齐 Python: CLI 参数解析 create-study
+        #[test]
+        fn test_cli_parse_create_study() {
+            use clap::Parser;
+            let cli = Cli::parse_from(&[
+                "optuna", "create-study",
+                "--storage", "sqlite:///test.db",
+                "--study-name", "test_study",
+                "--direction", "minimize",
+            ]);
+            match cli.command {
+                Commands::CreateStudy { study_name, direction, .. } => {
+                    assert_eq!(study_name.as_deref(), Some("test_study"));
+                    assert_eq!(direction.as_deref(), Some("minimize"));
+                }
+                _ => panic!("wrong command"),
+            }
+        }
+
+        /// 对齐 Python: CLI 参数解析 delete-study
+        #[test]
+        fn test_cli_parse_delete_study() {
+            use clap::Parser;
+            let cli = Cli::parse_from(&[
+                "optuna", "delete-study",
+                "--storage", "sqlite:///test.db",
+                "--study-name", "my_study",
+            ]);
+            match cli.command {
+                Commands::DeleteStudy { study_name, .. } => {
+                    assert_eq!(study_name, "my_study");
+                }
+                _ => panic!("wrong command"),
+            }
+        }
+
+        /// 对齐 Python: CLI 参数解析 tell
+        #[test]
+        fn test_cli_parse_tell() {
+            use clap::Parser;
+            let cli = Cli::parse_from(&[
+                "optuna", "tell",
+                "--storage", "sqlite:///test.db",
+                "--study-name", "test",
+                "--trial-number", "0",
+                "--values", "1.0,2.0",
+                "--state", "complete",
+            ]);
+            match cli.command {
+                Commands::Tell { values, state, trial_number, .. } => {
+                    assert_eq!(values.as_deref(), Some("1.0,2.0"));
+                    assert_eq!(state, "complete");
+                    assert_eq!(trial_number, 0);
+                }
+                _ => panic!("wrong command"),
+            }
+        }
+
+        /// 对齐 Python: CLI 参数解析 ask
+        #[test]
+        fn test_cli_parse_ask() {
+            use clap::Parser;
+            let cli = Cli::parse_from(&[
+                "optuna", "ask",
+                "--storage", "sqlite:///test.db",
+                "--study-name", "test",
+                "--sampler", "TPESampler",
+                "--sampler-kwargs", r#"{"seed": 42}"#,
+            ]);
+            match cli.command {
+                Commands::Ask { sampler, sampler_kwargs, .. } => {
+                    assert_eq!(sampler.as_deref(), Some("TPESampler"));
+                    assert!(sampler_kwargs.is_some());
+                }
+                _ => panic!("wrong command"),
+            }
+        }
+
+        /// 对齐 Python: CLI 参数解析 studies json 格式
+        #[test]
+        fn test_cli_parse_studies_json() {
+            use clap::Parser;
+            let cli = Cli::parse_from(&[
+                "optuna", "studies",
+                "--storage", "sqlite:///test.db",
+                "-f", "json",
+            ]);
+            match cli.command {
+                Commands::Studies { format, .. } => {
+                    assert_eq!(format, "json");
+                }
+                _ => panic!("wrong command"),
+            }
+        }
+
+        /// 对齐 Python: CLI 默认方向
+        #[test]
+        fn test_cli_default_direction() {
+            use clap::Parser;
+            let cli = Cli::parse_from(&[
+                "optuna", "create-study",
+                "--storage", "sqlite:///test.db",
+            ]);
+            match cli.command {
+                Commands::CreateStudy { direction, directions, .. } => {
+                    assert!(direction.is_none());
+                    assert!(directions.is_none());
+                }
+                _ => panic!("wrong command"),
+            }
+        }
+
+        /// 对齐 Python: best-trial 命令解析
+        #[test]
+        fn test_cli_parse_best_trial() {
+            use clap::Parser;
+            let cli = Cli::parse_from(&[
+                "optuna", "best-trial",
+                "--storage", "sqlite:///test.db",
+                "--study-name", "my_study",
+                "-f", "json",
+            ]);
+            match cli.command {
+                Commands::BestTrial { study_name, format, .. } => {
+                    assert_eq!(study_name, "my_study");
+                    assert_eq!(format, "json");
+                }
+                _ => panic!("wrong command"),
+            }
+        }
+
+        /// 对齐 Python: best-trials 命令解析
+        #[test]
+        fn test_cli_parse_best_trials() {
+            use clap::Parser;
+            let cli = Cli::parse_from(&[
+                "optuna", "best-trials",
+                "--storage", "sqlite:///test.db",
+                "--study-name", "my_study",
+            ]);
+            match cli.command {
+                Commands::BestTrials { study_name, .. } => {
+                    assert_eq!(study_name, "my_study");
+                }
+                _ => panic!("wrong command"),
+            }
+        }
+
+        /// 对齐 Python: trials 命令解析
+        #[test]
+        fn test_cli_parse_trials() {
+            use clap::Parser;
+            let cli = Cli::parse_from(&[
+                "optuna", "trials",
+                "--storage", "sqlite:///test.db",
+                "--study-name", "my_study",
+                "-f", "table",
+            ]);
+            match cli.command {
+                Commands::Trials { study_name, format, .. } => {
+                    assert_eq!(study_name, "my_study");
+                    assert_eq!(format, "table");
+                }
+                _ => panic!("wrong command"),
+            }
+        }
+
+        /// 对齐 Python: storage-upgrade 命令解析
+        #[test]
+        fn test_cli_parse_storage_upgrade() {
+            use clap::Parser;
+            let cli = Cli::parse_from(&[
+                "optuna", "storage-upgrade",
+                "--storage", "sqlite:///test.db",
+            ]);
+            match cli.command {
+                Commands::StorageUpgrade { storage, .. } => {
+                    assert_eq!(storage, "sqlite:///test.db");
+                }
+                _ => panic!("wrong command"),
+            }
+        }
     }
 }

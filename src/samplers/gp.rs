@@ -253,6 +253,16 @@ impl GPRegressor {
 
         -0.5 * log_det - 0.5 * quad - 0.5 * n * (2.0 * PI).ln()
     }
+
+    /// 返回当前核参数缓存，用于下一轮拟合的初始值。
+    /// 对齐 Python `_gprs_cache_list` 的缓存机制。
+    pub(crate) fn params_cache(&self) -> Option<KernelParamsCache> {
+        Some(KernelParamsCache {
+            inverse_squared_lengthscales: self.inverse_squared_lengthscales.clone(),
+            kernel_scale: self.kernel_scale,
+            noise_var: self.noise_var,
+        })
+    }
 }
 
 /// 缓存的核参数: 用于跨调用复用上一轮拟合结果作为初始值。

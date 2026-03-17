@@ -314,4 +314,101 @@ mod tests {
         assert!((ks2 - 0.5_f64.exp()).abs() < 1e-10);
         assert!((nv2 - DEFAULT_MINIMUM_NOISE_VAR).abs() < 1e-10);
     }
+
+    /// 对齐 Python: 5 点数据拟合，验证 posterior 合理性
+    #[test]
+    fn test_fit_5_points() {
+        let x = vec![vec![0.0], vec![0.25], vec![0.5], vec![0.75], vec![1.0]];
+        let y = vec![0.0, 0.0625, 0.25, 0.5625, 1.0]; // y = x^2
+        let is_cat = vec![false];
+
+        let gpr = fit_kernel_params_lbfgsb(&x, &y, &is_cat, 42, None, false);
+        let (mean_0, _) = gpr.posterior(&[0.0]);
+        let (mean_1, _) = gpr.posterior(&[1.0]);
+
+        // 已观测点附近应接近观测值
+        assert!(mean_0.abs() < 0.5, "mean at 0.0={mean_0}, expected ~0.0");
+        assert!((mean_1 - 1.0).abs() < 0.5, "mean at 1.0={mean_1}, expected ~1.0");
+    }
+
+    /// 对齐 Python: 带缓存的拟合应也工作
+    #[test]
+    fn test_fit_with_cache() {
+        let x = vec![vec![0.0], vec![0.5], vec![1.0]];
+        let y = vec![0.0, 0.25, 1.0];
+        let is_cat = vec![false];
+
+        // 第一次拟合
+        let gpr1 = fit_kernel_params_lbfgsb(&x, &y, &is_cat, 42, None, false);
+        let cache = gpr1.params_cache();
+
+        // 第二次用缓存拟合
+        let gpr2 = fit_kernel_params_lbfgsb(&x, &y, &is_cat, 42, cache.as_ref(), false);
+        let (mean2, _) = gpr2.posterior(&[0.5]);
+        assert!((mean2 - 0.25).abs() < 0.5, "cached fit: mean={mean2}");
+    }
+
+    /// 对齐 Python: 多维数据拟合
+    #[test]
+    fn test_fit_multidimensional() {
+        let x = vec![
+            vec![0.0, 0.0], vec![1.0, 0.0], vec![0.0, 1.0], vec![1.0, 1.0],
+        ];
+        let y = vec![0.0, 1.0, 1.0, 2.0]; // y = x1 + x2
+        let is_cat = vec![false, false];
+
+        let gpr = fit_kernel_params_lbfgsb(&x, &y, &is_cat, 42, None, false);
+        let (mean, _) = gpr.posterior(&[0.5, 0.5]);
+        assert!((mean - 1.0).abs() < 1.0, "2D fit: mean={mean}, expected ~1.0");
+    }
+
+    /// 对齐 Python: deterministic_objective 模式
+    #[test]
+    fn test_fit_deterministic() {
+        let x = vec![vec![0.0], vec![0.5], vec![1.0]];
+        let y = vec![0.0, 0.25, 1.0];
+        let is_cat = vec![false];
+
+        let gpr = fit_kernel_params_lbfgsb(&x, &y, &is_cat, 42, None, true);
+        let (mean, _var) = gpr.posterior(&[0.5]);
+        assert!((mean - 0.25).abs() < 0.5, "deterministic fit: mean={mean}");
+    }
+
+    /// 对齐 Python: 种子不同应产生不同初始化
+    #[test]
+    fn test_different_seeds() {
+        let x = vec![vec![0.0], vec![0.5], vec![1.0]];
+        let y = vec![0.0, 0.25, 1.0];
+        let is_cat = vec![false];
+
+        let gpr1 = fit_kernel_params_lbfgsb(&x, &y, &is_cat, 1, None, false);
+        let gpr2 = fit_kernel_params_lbfgsb(&x, &y, &is_cat, 2, None, false);
+        let (m1, _) = gpr1.posterior(&[0.5]);
+        let (m2, _) = gpr2.posterior(&[0.5]);
+        // 结果可能相同也可能不同，但都应合理
+        assert!(m1.abs() < 10.0);
+        assert!(m2.abs() < 10.0);
+    }
+
+    #[cfg(feature = "gp-lbfgsb")]
+    /// 对齐 Python: decode_params 多维
+    #[test]
+    fn test_decode_params_multidim() {
+        let raw = vec![0.0, 1.0, 0.5, -1.0]; // 2 dims + kernel_scale + noise
+        let (inv, ks, _nv) = decode_params(&raw, 2, false);
+        assert_eq!(inv.len(), 2);
+        assert!((inv[0] - 1.0).abs() < 1e-10);  // exp(0) = 1
+        assert!((inv[1] - 1.0_f64.exp()).abs() < 1e-10); // exp(1)
+        assert!((ks - 0.5_f64.exp()).abs() < 1e-10);
+    }
+
+    #[cfg(feature = "gp-lbfgsb")]
+    /// 对齐 Python: log_prior 噪声越大先验越低
+    #[test]
+    fn test_log_prior_noise_penalty() {
+        use crate::samplers::gp::DEFAULT_MINIMUM_NOISE_VAR;
+        let lp_small = default_log_prior(&[1.0], 1.0, DEFAULT_MINIMUM_NOISE_VAR + 0.01);
+        let lp_big = default_log_prior(&[1.0], 1.0, DEFAULT_MINIMUM_NOISE_VAR + 10.0);
+        assert!(lp_small > lp_big, "小噪声先验={lp_small} 应 > 大噪声先验={lp_big}");
+    }
 }

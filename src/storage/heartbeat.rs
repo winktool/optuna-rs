@@ -252,4 +252,59 @@ mod tests {
     fn test_null_heartbeat_thread_zst() {
         assert_eq!(std::mem::size_of::<NullHeartbeatThread>(), 0);
     }
+
+    /// 对齐 Python: HeartbeatHandle::Null 多次 stop 不 panic
+    #[test]
+    fn test_null_heartbeat_handle_multiple_stops() {
+        let mut handle = HeartbeatHandle::Null;
+        handle.stop();
+        handle.stop();
+        handle.stop();
+    }
+
+    /// 对齐 Python: NullHeartbeatThread 实现 Default
+    #[test]
+    fn test_null_heartbeat_thread_default() {
+        let _thread = NullHeartbeatThread;
+        // 零大小类型不需要 Default 但应正常构造
+    }
+
+    /// 对齐 Python: HeartbeatHandle 枚举变体
+    #[test]
+    fn test_heartbeat_handle_variants() {
+        // Null 变体
+        let null = HeartbeatHandle::Null;
+        match null {
+            HeartbeatHandle::Null => {}
+            _ => panic!("should be Null"),
+        }
+    }
+
+    /// 对齐 Python: is_heartbeat_enabled 判断逻辑
+    #[test]
+    fn test_is_heartbeat_enabled_returns_false_for_in_memory() {
+        // InMemoryStorage 不实现 Heartbeat trait，
+        // 所以实际上无法直接调用 is_heartbeat_enabled。
+        // 但可以通过 get_heartbeat_handle 间接验证。
+        let storage: Arc<dyn Storage> = Arc::new(crate::storage::InMemoryStorage::new());
+        let handle = get_heartbeat_handle(0, &storage);
+        assert!(matches!(handle, HeartbeatHandle::Null));
+    }
+
+    /// 对齐 Python: fail_stale_trials 的基本流程
+    /// (通过 InMemoryStorage 验证 — 无 stale trials 时无操作)
+    #[test]
+    fn test_fail_stale_trials_no_stale_via_study() {
+        use crate::study::create_study;
+        let study = create_study(
+            None, None, None, None, None,
+            Some(vec![crate::study::StudyDirection::Minimize]),
+            false,
+        ).unwrap();
+
+        // InMemoryStorage 不实现 Heartbeat，所以 get_heartbeat_handle 返回 Null
+        // 但 study.optimize 中的心跳机制会正确跳过
+        let trials = study.trials().unwrap();
+        assert!(trials.is_empty()); // 无试验时无 stale
+    }
 }

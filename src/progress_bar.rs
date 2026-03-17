@@ -163,4 +163,55 @@ mod tests {
         bar.set_position(50);
         bar.finish();
     }
+
+    /// 对齐 Python: 试验模式更新
+    #[test]
+    fn test_progress_bar_trials_mode_update() {
+        let bar = OptimizationProgressBar::new_with_trials(10);
+        bar.update(Some(1.234567));
+        bar.update(None);
+        bar.finish();
+    }
+
+    /// 对齐 Python: 超时模式
+    #[test]
+    fn test_progress_bar_timeout_mode() {
+        let bar = OptimizationProgressBar::new_with_timeout(5.0);
+        bar.set_position(2);
+        bar.set_message("best: 0.5");
+        bar.finish_and_clear();
+    }
+
+    /// 对齐 Python: 0 次试验边界
+    #[test]
+    fn test_progress_bar_zero_trials() {
+        let bar = OptimizationProgressBar::new_with_trials(0);
+        bar.finish();
+    }
+
+    /// 对齐 Python: drop 不 panic (测试 Drop impl)
+    #[test]
+    fn test_progress_bar_drop_without_finish() {
+        let bar = OptimizationProgressBar::new_with_trials(10);
+        bar.update(Some(0.1));
+        // drop 不 panic
+    }
+
+    /// 对齐 Python: enable_steady_tick 不 panic
+    #[test]
+    fn test_progress_bar_enable_steady_tick() {
+        let bar = OptimizationProgressBar::new_with_trials(10);
+        bar.enable_steady_tick(100);
+        bar.finish();
+    }
+
+    /// 对齐 Python: 多次 update
+    #[test]
+    fn test_progress_bar_multiple_updates() {
+        let bar = OptimizationProgressBar::new_with_trials(100);
+        for i in 0..100 {
+            bar.update(Some(i as f64 * 0.01));
+        }
+        bar.finish();
+    }
 }

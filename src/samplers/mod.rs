@@ -189,4 +189,73 @@ mod tests {
         let val = s.sample_independent(&[], &trial, "x", &dist).unwrap();
         assert_eq!(val, 0.5);
     }
+
+    /// 对齐 Python: reseed_rng 默认空操作不 panic
+    #[test]
+    fn test_default_reseed_rng() {
+        let s = DummySampler;
+        s.reseed_rng(42);
+        s.reseed_rng(0);
+        s.reseed_rng(u64::MAX);
+    }
+
+    /// 对齐 Python: should_stop_study 默认返回 false
+    #[test]
+    fn test_default_should_stop_study() {
+        let s = DummySampler;
+        assert!(!s.should_stop_study());
+    }
+
+    /// 对齐 Python: compute_constraints 默认返回 None
+    #[test]
+    fn test_default_compute_constraints() {
+        let s = DummySampler;
+        let trial = make_trial();
+        assert!(s.compute_constraints(&trial, TrialState::Complete).is_none());
+    }
+
+    /// 对齐 Python: inject_storage 默认空操作不 panic
+    #[test]
+    fn test_default_inject_storage() {
+        let s = DummySampler;
+        let storage: std::sync::Arc<dyn crate::storage::Storage> =
+            std::sync::Arc::new(crate::storage::InMemoryStorage::new());
+        s.inject_storage(storage, 0);
+    }
+
+    /// 对齐 Python: after_trial 各种状态都不 panic
+    #[test]
+    fn test_after_trial_all_states() {
+        let s = DummySampler;
+        let trial = make_trial();
+        s.after_trial(&[], &trial, TrialState::Complete, Some(&[1.0]));
+        s.after_trial(&[], &trial, TrialState::Pruned, None);
+        s.after_trial(&[], &trial, TrialState::Fail, None);
+    }
+
+    /// 对齐 Python: infer_relative_search_space 有历史也返回空
+    #[test]
+    fn test_infer_relative_with_history() {
+        let s = DummySampler;
+        let completed = FrozenTrial::new(
+            0, TrialState::Complete, Some(1.0), None,
+            Some(chrono::Utc::now()), Some(chrono::Utc::now()),
+            HashMap::new(), HashMap::new(), HashMap::new(),
+            HashMap::new(), HashMap::new(), 0,
+        ).unwrap();
+        let space = s.infer_relative_search_space(&[completed]);
+        assert!(space.is_empty());
+    }
+
+    /// 对齐 Python: sample_independent 带 int 分布
+    #[test]
+    fn test_sample_independent_int_dist() {
+        let s = DummySampler;
+        let trial = make_trial();
+        let dist = Distribution::IntDistribution(
+            crate::distributions::IntDistribution::new(0, 10, false, 1).unwrap(),
+        );
+        let val = s.sample_independent(&[], &trial, "n", &dist).unwrap();
+        assert_eq!(val, 0.5);
+    }
 }

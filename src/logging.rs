@@ -18,6 +18,12 @@
 //! - `WARN` — 搜索空间问题、废弃 API
 //! - `ERROR` — 存储错误、致命异常
 
+use std::sync::atomic::{AtomicU8, Ordering};
+
+/// 全局日志级别存储。
+/// 对齐 Python: 允许通过 set_verbosity/get_verbosity 动态查询当前级别。
+static VERBOSITY: AtomicU8 = AtomicU8::new(20); // 默认 Info=20
+
 /// 日志级别枚举。
 ///
 /// 对应 Python `optuna.logging` 的日志级别常量。
@@ -78,7 +84,9 @@ pub fn init(_level: LogLevel) {}
 ///
 /// 注意：由于 `tracing-subscriber` 的全局过滤器在初始化后无法修改，
 /// 建议使用 `RUST_LOG` 环境变量动态调整级别。
+/// 但 get_verbosity() 将正确返回最后一次设置的级别。
 pub fn set_verbosity(level: LogLevel) {
+    VERBOSITY.store(level as u8, Ordering::Relaxed);
     // 重新初始化（tracing-subscriber 的 try_init 会静默忽略重复调用）
     init(level);
 }
@@ -86,10 +94,15 @@ pub fn set_verbosity(level: LogLevel) {
 /// 获取当前日志级别。
 ///
 /// 对应 Python `optuna.logging.get_verbosity()`。
-/// 默认返回 Info 级别（实际级别由 RUST_LOG 环境变量控制）。
+/// 返回最后一次通过 `set_verbosity()` 设置的级别。
 pub fn get_verbosity() -> LogLevel {
-    // tracing 没有直接暴露当前级别的 API，返回默认值
-    LogLevel::Info
+    match VERBOSITY.load(Ordering::Relaxed) {
+        10 => LogLevel::Debug,
+        30 => LogLevel::Warning,
+        40 => LogLevel::Error,
+        50 => LogLevel::Critical,
+        _ => LogLevel::Info, // 默认 20 = Info
+    }
 }
 
 /// 禁用默认日志处理器。
@@ -192,7 +205,9 @@ mod tests {
         // 无 feature 时不应 panic
         init(LogLevel::Info);
         set_verbosity(LogLevel::Debug);
-        assert_eq!(get_verbosity(), LogLevel::Info);
+        assert_eq!(get_verbosity(), LogLevel::Debug);
+        // 恢复默认
+        set_verbosity(LogLevel::Info);
     }
 
     #[test]
@@ -201,5 +216,69 @@ mod tests {
         optuna_info!("test info");
         optuna_warn!("test warn");
         optuna_error!("test error");
+    }
+
+    /// 对齐 Python: 日志级别数值应与 Python logging 标准一致
+    #[test]
+    fn test_log_level_values() {
+        assert_eq!(LogLevel::Debug as i32, 10);
+        assert_eq!(LogLevel::Info as i32, 20);
+        assert_eq!(LogLevel::Warning as i32, 30);
+        assert_eq!(LogLevel::Error as i32, 40);
+        assert_eq!(LogLevel::Critical as i32, 50);
+    }
+
+    /// 对齐 Python: 所有日志级别的顺序关系
+    #[test]
+    fn test_log_level_all_relations() {
+        assert!(LogLevel::Debug < LogLevel::Info);
+        assert!(LogLevel::Info < LogLevel::Warning);
+        assert!(LogLevel::Warning < LogLevel::Error);
+        assert!(LogLevel::Error < LogLevel::Critical);
+        // 反向
+        assert!(LogLevel::Critical > LogLevel::Debug);
+        assert!(LogLevel::Warning > LogLevel::Info);
+    }
+
+    /// 对齐 Python: set_verbosity 多次调用不应 panic
+    #[test]
+    fn test_set_verbosity_idempotent() {
+        set_verbosity(LogLevel::Debug);
+        set_verbosity(LogLevel::Warning);
+        set_verbosity(LogLevel::Info);
+        set_verbosity(LogLevel::Critical);
+        // 不应 panic，即使多次调用
+    }
+
+    /// 对齐 Python: disable/enable handler 空操作不 panic
+    #[test]
+    fn test_disable_enable_handlers() {
+        disable_default_handler();
+        enable_propagation();
+        disable_propagation();
+    }
+
+    /// 对齐 Python: LogLevel 相等性
+    #[test]
+    fn test_log_level_equality() {
+        assert_eq!(LogLevel::Debug, LogLevel::Debug);
+        assert_ne!(LogLevel::Debug, LogLevel::Info);
+        assert_ne!(LogLevel::Warning, LogLevel::Error);
+    }
+
+    /// 对齐 Python: get_verbosity 返回最后设置的级别
+    #[test]
+    fn test_get_verbosity_tracks_set() {
+        set_verbosity(LogLevel::Debug);
+        assert_eq!(get_verbosity(), LogLevel::Debug);
+        set_verbosity(LogLevel::Warning);
+        assert_eq!(get_verbosity(), LogLevel::Warning);
+        set_verbosity(LogLevel::Error);
+        assert_eq!(get_verbosity(), LogLevel::Error);
+        set_verbosity(LogLevel::Critical);
+        assert_eq!(get_verbosity(), LogLevel::Critical);
+        // 恢复默认
+        set_verbosity(LogLevel::Info);
+        assert_eq!(get_verbosity(), LogLevel::Info);
     }
 }

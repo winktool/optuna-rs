@@ -3,7 +3,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 use indexmap::IndexMap;
 use parking_lot::Mutex;
-use rand::seq::SliceRandom;
+use rand::seq::{IndexedRandom, SliceRandom};
 use rand::SeedableRng;
 use rand_chacha::ChaCha8Rng;
 

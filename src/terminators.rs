@@ -27,7 +27,7 @@ use crate::samplers::gp::{
 use crate::search_space::IntersectionSearchSpace;
 
 use indexmap::IndexMap;
-use rand::Rng;
+use rand::RngExt;
 use rand::SeedableRng;
 use rand_chacha::ChaCha8Rng;
 
@@ -580,12 +580,12 @@ fn compute_standardized_regret_bound(
             if is_categorical[d_idx] {
                 match &search_space[&param_names[d_idx]] {
                     Distribution::CategoricalDistribution(c) => {
-                        (rng.gen_range(0.0_f64..1.0) * c.choices.len() as f64).floor()
+                        (rng.random_range(0.0_f64..1.0) * c.choices.len() as f64).floor()
                     }
-                    _ => rng.gen_range(0.0_f64..1.0),
+                    _ => rng.random_range(0.0_f64..1.0),
                 }
             } else {
-                rng.gen_range(0.0_f64..1.0)
+                rng.random_range(0.0_f64..1.0)
             }
         }).collect();
 

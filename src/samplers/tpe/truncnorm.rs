@@ -168,14 +168,14 @@ pub fn rvs(
     b: &[f64],
     loc: &[f64],
     scale: &[f64],
-    rng: &mut impl rand::Rng,
+    rng: &mut impl rand::RngExt,
 ) -> Vec<f64> {
     let n = a.len();
     let mut result = Vec::with_capacity(n);
     for i in 0..n {
         let a_std = (a[i] - loc[i]) / scale[i];
         let b_std = (b[i] - loc[i]) / scale[i];
-        let q: f64 = rng.r#gen();
+        let q: f64 = rng.random();
         let x = ppf(q, a_std, b_std) * scale[i] + loc[i];
         result.push(x.clamp(a[i], b[i]));
     }
@@ -262,7 +262,7 @@ mod tests {
 
     #[test]
     fn test_rvs_within_bounds() {
-        let mut rng = rand::thread_rng();
+        let mut rng = rand::rng();
         let n = 100;
         let a = vec![-1.0; n];
         let b = vec![1.0; n];

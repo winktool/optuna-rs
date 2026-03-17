@@ -2,7 +2,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use indexmap::IndexMap;
 use parking_lot::Mutex;
-use rand::Rng;
+use rand::RngExt;
 use rand::SeedableRng;
 use rand_chacha::ChaCha8Rng;
 
@@ -98,7 +98,7 @@ impl NSGAIISampler {
         );
         let rng = match seed {
             Some(s) => ChaCha8Rng::seed_from_u64(s),
-            None => ChaCha8Rng::from_entropy(),
+            None => ChaCha8Rng::from_rng(&mut rand::rng()),
         };
         let crossover_box = crossover.unwrap_or_else(|| {
             // 对应 Python: if crossover is None: crossover = UniformCrossover(swapping_prob)
@@ -161,8 +161,8 @@ impl NSGAIISampler {
         rng: &mut ChaCha8Rng,
     ) -> usize {
         let n = ranks.len();
-        let a = rng.gen_range(0..n);
-        let b = rng.gen_range(0..n);
+        let a = rng.random_range(0..n);
+        let b = rng.random_range(0..n);
 
         if ranks[a] < ranks[b] {
             a
@@ -405,7 +405,7 @@ impl Sampler for NSGAIISampler {
             .collect();
 
         // Crossover
-        let mut child = if rng.r#gen::<f64>() < self.crossover_prob {
+        let mut child = if rng.random::<f64>() < self.crossover_prob {
             self.crossover.crossover(&parents, &mut *rng)
         } else {
             parents[0].clone()
@@ -418,7 +418,7 @@ impl Sampler for NSGAIISampler {
             .unwrap_or_else(|| 1.0 / n_dims.max(1) as f64);
         let mut mutated = vec![false; n_dims];
         for (i, m) in mutated.iter_mut().enumerate() {
-            if rng.r#gen::<f64>() < mutation_prob {
+            if rng.random::<f64>() < mutation_prob {
                 *m = true;
             }
             let _ = i; // suppress unused warning

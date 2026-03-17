@@ -14,9 +14,9 @@ use std::sync::Arc;
 
 use indexmap::IndexMap;
 use parking_lot::Mutex;
-use rand::Rng;
-use rand_chacha::ChaCha8Rng;
+use rand::RngExt;
 use rand::SeedableRng;
+use rand_chacha::ChaCha8Rng;
 
 use crate::distributions::Distribution;
 use crate::error::Result;
@@ -877,12 +877,12 @@ impl GpSampler {
                 if is_categorical[d] {
                     match &search_space[&param_names[d]] {
                         Distribution::CategoricalDistribution(c) => {
-                            (rng.gen_range(0.0..1.0) * c.choices.len() as f64).floor()
+                            (rng.random_range(0.0..1.0) * c.choices.len() as f64).floor()
                         }
-                        _ => rng.gen_range(0.0..1.0),
+                        _ => rng.random_range(0.0..1.0),
                     }
                 } else {
-                    rng.gen_range(0.0..1.0)
+                    rng.random_range(0.0..1.0)
                 }
             }).collect();
 
@@ -899,7 +899,7 @@ impl GpSampler {
                 if is_categorical[d] {
                     best_params[d]
                 } else {
-                    let noise = (rng.gen_range(0.0..1.0) - 0.5) * 0.1;
+                    let noise = (rng.random_range(0.0..1.0) - 0.5) * 0.1;
                     (best_params[d] + noise).clamp(0.0, 1.0)
                 }
             }).collect();

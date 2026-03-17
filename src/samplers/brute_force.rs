@@ -5,7 +5,8 @@ use std::sync::Mutex;
 use indexmap::IndexMap;
 
 use rand::rngs::StdRng;
-use rand::seq::SliceRandom;
+use rand::seq::IndexedRandom;
+use rand::RngExt;
 use rand::SeedableRng;
 
 use crate::distributions::{Distribution, ParamValue};
@@ -143,14 +144,12 @@ impl TreeNode {
         let total: f64 = weights.iter().sum();
         if total == 0.0 {
             // Fallback: uniform (shouldn't happen if count_unexpanded > 0)
-            use rand::Rng;
-            let idx = rng.r#gen_range(0..children.len());
+            let idx = rng.random_range(0..children.len());
             return children[idx].0 .0;
         }
 
         // Weighted random choice (mirrors `rng.choice(keys, p=weights)`)
-        use rand::Rng;
-        let mut r: f64 = rng.r#gen::<f64>() * total;
+        let mut r: f64 = rng.random::<f64>() * total;
         for (i, w) in weights.iter().enumerate() {
             r -= w;
             if r <= 0.0 {
@@ -214,7 +213,7 @@ impl BruteForceSampler {
         if guard.is_none() {
             *guard = Some(match self.seed {
                 Some(s) => StdRng::seed_from_u64(s),
-                None => StdRng::from_entropy(),
+                None => StdRng::from_rng(&mut rand::rng()),
             });
         }
         guard

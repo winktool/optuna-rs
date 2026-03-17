@@ -11,71 +11,70 @@ authors = ["Brian Martin"]
 readme = "README.md"
 
 [dependencies]
-chrono = { version = "0.4", features = ["serde"] }
-indexmap = { version = "2", features = ["serde"] }
-parking_lot = "0.12"
-rand = "0.8"
-rand_chacha = "0.3"
-serde = { version = "1", features = ["derive"] }
-serde_json = "1"
-libm = "0.2"
-rand_distr = "0.4"
-thiserror = "2"
-uuid = { version = "1", features = ["v4"] }
-clap = { version = "4", features = ["derive", "env"], optional = true }
+chrono = { version = "0.4.41", features = ["serde"] }
+indexmap = { version = "2.13.0", features = ["serde"] }
+parking_lot = "0.12.5"
+rand = "0.10.0"
+rand_core = "0.10.0"
+rand_chacha = "0.10.0"
+serde = { version = "1.0.228", features = ["derive"] }
+serde_json = "1.0.149"
+libm = "0.2.16"
+rand_distr = "0.6.0"
+thiserror = "2.0.18"
+uuid = { version = "1.22.0", features = ["v4"] }
+clap = { version = "4.6.0", features = ["derive", "env"], optional = true }
 
 # SeaORM 持久化存储（可选）
-sea-orm = { version = "1", features = [
+sea-orm = { version = "1.1.19", features = [
     "sqlx-sqlite", "sqlx-postgres", "sqlx-mysql",
     "runtime-tokio-rustls",
 ], optional = true }
-tokio = { version = "1", features = ["rt", "rt-multi-thread"], optional = true }
+tokio = { version = "1.50.0", features = ["rt", "rt-multi-thread"], optional = true }
 
 # Redis Journal 后端（可选）
-redis = { version = "0.27", features = ["tokio-comp"], optional = true }
+redis = { version = "1.0.5", features = ["tokio-comp"], optional = true }
 
 # 进度条（可选）
-indicatif = { version = "0.17", optional = true }
+indicatif = { version = "0.18.4", optional = true }
 
 # 结构化日志（可选）
-tracing = { version = "0.1", optional = true }
-tracing-subscriber = { version = "0.3", features = ["env-filter"], optional = true }
+tracing = { version = "0.1.44", optional = true }
+tracing-subscriber = { version = "0.3.23", features = ["env-filter"], optional = true }
 
-# GP 优化器 L-BFGS-B（可选）— 基于 scirs2 (SciPy for Rust)
-scirs2-optimize = { version = "0.3", optional = true }
-scirs2-core = { version = "0.3", optional = true }
+# GP 优化器 BFGS — 内置实现，无外部依赖
 
 # S3 工件存储（可选）
-aws-sdk-s3 = { version = "1", optional = true }
-aws-config = { version = "1", optional = true }
+aws-sdk-s3 = { version = "1.127.0", optional = true }
+aws-config = { version = "1.8.15", optional = true }
 
 # GCS 工件存储（可选）
-cloud-storage = { version = "0.11", optional = true }
+cloud-storage = { version = "0.11.1", optional = true }
 
 # DataFrame 支持（可选）
-polars = { version = "0.46", optional = true }
+polars = { version = "0.53.0", optional = true, default-features = false, features = ["lazy", "dtype-struct", "dtype-datetime"] }
 
 # gRPC 存储代理（可选）
-tonic = { version = "0.12", features = ["transport"], optional = true }
-prost = { version = "0.13", optional = true }
+tonic = { version = "0.14.5", features = ["transport"], optional = true }
+prost = { version = "0.14.3", optional = true }
 
 # 可视化（可选）
-plotly = { version = "0.11", optional = true }
+plotly = { version = "0.14.1", optional = true }
 
 # Matplotlib 风格可视化后端（可选）
-plotters = { version = "0.3", optional = true }
+plotters = { version = "0.3.7", optional = true }
 
 # MLflow 集成（可选）
-reqwest = { version = "0.12", features = ["blocking", "json"], optional = true }
+reqwest = { version = "0.13.2", features = ["blocking", "json"], optional = true }
 
 # 信号处理（Ctrl+C 优雅终止）
-ctrlc = "3.4"
+ctrlc = "3.5.2"
 
 # 临时文件（测试工具）
-tempfile = "3"
+tempfile = "3.27.0"
 
 [build-dependencies]
-tonic-build = { version = "0.12", optional = true }
+tonic-build = { version = "0.14.5", optional = true }
 
 [features]
 default = []
@@ -84,7 +83,7 @@ cli = ["clap", "rdb"]
 redis-storage = ["redis", "tokio"]
 progress = ["indicatif"]
 logging = ["tracing", "tracing-subscriber"]
-gp-lbfgsb = ["scirs2-optimize", "scirs2-core"]
+# gp-lbfgsb 已内置，不再需要外部依赖
 s3 = ["aws-sdk-s3", "aws-config", "tokio"]
 gcs = ["cloud-storage", "tokio"]
 dataframe = ["polars"]

@@ -249,7 +249,7 @@ pub fn trials_to_dataframe(
         return Ok(DataFrame::empty());
     }
 
-    DataFrame::new(columns)
+    DataFrame::new(trials.len(), columns)
         .map_err(|e| OptunaError::ValueError(format!("创建 DataFrame 失败: {e}")))
 }
 

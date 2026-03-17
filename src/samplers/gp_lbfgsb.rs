@@ -3,8 +3,8 @@
 //! 对应 Python `optuna.samplers._gp.gp._fit_kernel_params` +
 //! `optuna.samplers._gp.batched_lbfgsb`。
 //!
-//! 基于 [`scirs2-optimize`](https://docs.rs/scirs2-optimize) crate 实现 L-BFGS-B 优化，
-//! 忠实移植 Python 使用 `scipy.optimize.minimize(method='L-BFGS-B')` 的行为。
+//! 内置 BFGS 优化器，忠实移植 Python 使用 `scipy.optimize.minimize(method='L-BFGS-B')` 的行为。
+//! 不依赖外部优化库，减少编译依赖冲突。
 //!
 //! ## Python 原始实现要点
 //!
@@ -15,23 +15,9 @@
 //!    - `inv_sq_ls`: `-(0.1/x + 0.1*x)` 惩罚，鼓励 ≈ 1
 //!    - `kernel_scale`: Gamma(α=2, β=1) → `(α-1)*log(x) - β*x`
 //!    - `noise_var`: Gamma(α=1.1, β=30) → 鼓励小噪声
-//! 4. **梯度计算**: Python 用 PyTorch autograd；Rust 用有限差分
+//! 4. **梯度计算**: Python 用 PyTorch autograd；Rust 用中心差分
 //! 5. **scipy 调用**: `minimize(loss, x0, jac=True, method='l-bfgs-b', options={'gtol': 1e-2})`
-//!
-//! # 使用方式
-//! 需要启用 `gp-lbfgsb` feature:
-//! ```toml
-//! optuna-rs = { version = "0.1", features = ["gp-lbfgsb"] }
-//! ```
-//!
-//! 启用后，`fit_kernel_params` 会自动使用 L-BFGS-B 优化替代随机搜索。
 
-#[cfg(feature = "gp-lbfgsb")]
-use scirs2_optimize::unconstrained::{minimize, Method, Options};
-#[cfg(feature = "gp-lbfgsb")]
-use scirs2_core::ndarray::ArrayView1;
-
-#[cfg(feature = "gp-lbfgsb")]
 use crate::samplers::gp::{
     GPRegressor, KernelParamsCache, DEFAULT_MINIMUM_NOISE_VAR, default_log_prior,
 };
@@ -40,7 +26,6 @@ use crate::samplers::gp::{
 ///
 /// 布局: `[log(inv_sq_ls[0]), ..., log(inv_sq_ls[n-1]), log(kernel_scale), log(noise_var - min_noise)]`
 /// 对于 deterministic_objective 模式，只有 d+1 个参数（无 noise_var）。
-#[cfg(feature = "gp-lbfgsb")]
 fn decode_params(params: &[f64], n_dims: usize, deterministic: bool) -> (Vec<f64>, f64, f64) {
     let inv_sq_ls: Vec<f64> = params[..n_dims].iter().map(|&x| x.exp()).collect();
     let kernel_scale = params[n_dims].exp();
@@ -57,7 +42,6 @@ fn decode_params(params: &[f64], n_dims: usize, deterministic: bool) -> (Vec<f64
 /// 计算负对数后验 (损失函数): `-(log_marginal_likelihood + log_prior)`。
 ///
 /// 对应 Python `_fit_kernel_params` 中的内部 `loss_func`。
-#[cfg(feature = "gp-lbfgsb")]
 fn neg_log_posterior(
     params: &[f64],
     n_dims: usize,
@@ -99,8 +83,7 @@ fn neg_log_posterior(
 ///
 /// Python 用 PyTorch autograd，Rust 使用中心差分近似:
 /// `∂f/∂x_i ≈ (f(x+h*e_i) - f(x-h*e_i)) / (2h)`
-#[cfg(feature = "gp-lbfgsb")]
-fn _gradient_finite_diff(
+fn gradient_finite_diff(
     params: &[f64],
     n_dims: usize,
     x_train: &[Vec<f64>],
@@ -126,7 +109,6 @@ fn _gradient_finite_diff(
 }
 
 /// 将缓存的核参数编码到 log 空间。
-#[cfg(feature = "gp-lbfgsb")]
 fn encode_cache(cache: &KernelParamsCache, deterministic: bool) -> Vec<f64> {
     let mut params: Vec<f64> = cache.inverse_squared_lengthscales
         .iter()
@@ -140,13 +122,167 @@ fn encode_cache(cache: &KernelParamsCache, deterministic: bool) -> Vec<f64> {
     params
 }
 
-/// 使用 L-BFGS-B 优化 GP 核超参数。
+// ═══════════════════════════════════════════════════════════════════════════
+// 内置 BFGS 优化器
+// ═══════════════════════════════════════════════════════════════════════════
+
+/// 向量点积
+fn dot(a: &[f64], b: &[f64]) -> f64 {
+    a.iter().zip(b.iter()).map(|(x, y)| x * y).sum()
+}
+
+/// 向量范数
+fn norm(v: &[f64]) -> f64 {
+    dot(v, v).sqrt()
+}
+
+/// 矩阵-向量乘法: result = mat * vec
+/// mat 为 n×n 按行存储
+fn mat_vec(mat: &[Vec<f64>], v: &[f64]) -> Vec<f64> {
+    mat.iter().map(|row| dot(row, v)).collect()
+}
+
+/// Armijo 回溯线搜索。
+///
+/// 对齐 scipy 的默认线搜索策略:
+/// 找到步长 α 使得 f(x + α*d) ≤ f(x) + c1*α*(g·d)
+fn line_search(
+    f: &dyn Fn(&[f64]) -> f64,
+    x: &[f64],
+    direction: &[f64],
+    fx: f64,
+    grad: &[f64],
+) -> f64 {
+    let c1 = 1e-4; // Armijo 常数
+    let slope = dot(grad, direction);
+    if slope >= 0.0 {
+        // 非下降方向，返回小步长
+        return 1e-8;
+    }
+
+    let mut alpha = 1.0;
+    let rho = 0.5; // 回溯因子
+
+    for _ in 0..40 {
+        let x_new: Vec<f64> = x.iter().zip(direction.iter())
+            .map(|(&xi, &di)| xi + alpha * di)
+            .collect();
+        let f_new = f(&x_new);
+
+        if f_new <= fx + c1 * alpha * slope {
+            return alpha;
+        }
+        alpha *= rho;
+    }
+
+    alpha
+}
+
+/// BFGS 优化器结果
+struct BfgsResult {
+    /// 最优参数
+    x: Vec<f64>,
+    /// 最优函数值
+    _f: f64,
+}
+
+/// BFGS 无约束优化。
+///
+/// 对齐 `scipy.optimize.minimize(method='BFGS')`，使用:
+/// - 中心差分梯度估计
+/// - Armijo 回溯线搜索
+/// - BFGS Hessian 逆矩阵近似更新
+///
+/// # 参数
+/// * `objective` - 目标函数
+/// * `gradient` - 梯度函数
+/// * `x0` - 初始猜测
+/// * `max_iter` - 最大迭代数 (对齐 Python 默认 50)
+/// * `gtol` - 梯度收敛阈值 (对齐 Python 1e-2)
+fn bfgs_minimize(
+    objective: &dyn Fn(&[f64]) -> f64,
+    gradient: &dyn Fn(&[f64]) -> Vec<f64>,
+    x0: &[f64],
+    max_iter: usize,
+    gtol: f64,
+) -> Option<BfgsResult> {
+    let n = x0.len();
+    if n == 0 {
+        return None;
+    }
+
+    // 初始化 Hessian 逆近似为单位矩阵
+    let mut h_inv: Vec<Vec<f64>> = (0..n).map(|i| {
+        let mut row = vec![0.0; n];
+        row[i] = 1.0;
+        row
+    }).collect();
+
+    let mut x = x0.to_vec();
+    let mut fx = objective(&x);
+    let mut g = gradient(&x);
+
+    for _ in 0..max_iter {
+        // 检查梯度收敛
+        if norm(&g) < gtol {
+            break;
+        }
+
+        // 搜索方向: d = -H^{-1} * g
+        let hg = mat_vec(&h_inv, &g);
+        let direction: Vec<f64> = hg.iter().map(|&v| -v).collect();
+
+        // 线搜索
+        let alpha = line_search(&|p| objective(p), &x, &direction, fx, &g);
+
+        // 更新位置: s = alpha * direction
+        let s: Vec<f64> = direction.iter().map(|&d| alpha * d).collect();
+        let x_new: Vec<f64> = x.iter().zip(s.iter()).map(|(&xi, &si)| xi + si).collect();
+        let fx_new = objective(&x_new);
+        let g_new = gradient(&x_new);
+
+        // y = g_new - g
+        let y: Vec<f64> = g_new.iter().zip(g.iter()).map(|(&gn, &go)| gn - go).collect();
+
+        let sy = dot(&s, &y);
+
+        // 只有当 s·y > 0 时更新 Hessian 逆近似 (保证正定性)
+        if sy > 1e-10 {
+            // BFGS 更新公式:
+            // H' = (I - ρ*s*yᵀ) H (I - ρ*y*sᵀ) + ρ*s*sᵀ
+            // 其中 ρ = 1/(yᵀ*s)
+            let rho = 1.0 / sy;
+
+            // 计算 H*y
+            let hy = mat_vec(&h_inv, &y);
+
+            // 计算 yᵀ*H*y
+            let yhy = dot(&y, &hy);
+
+            // 更新: H' = H + (s·y + y·H·y)/(s·y)² * s*sᵀ - (H*y*sᵀ + s*(H*y)ᵀ)/(s·y)
+            for i in 0..n {
+                for j in 0..n {
+                    h_inv[i][j] = h_inv[i][j]
+                        + rho * (rho * yhy + 1.0) * s[i] * s[j]
+                        - rho * (hy[i] * s[j] + s[i] * hy[j]);
+                }
+            }
+        }
+
+        x = x_new;
+        fx = fx_new;
+        g = g_new;
+    }
+
+    Some(BfgsResult { x, _f: fx })
+}
+
+/// 使用 BFGS 优化 GP 核超参数。
 ///
 /// 对应 Python `optuna.samplers._gp.gp.fit_kernel_params`:
 /// - 先尝试 gpr_cache 作为初始值，失败则用默认值
 /// - `scipy.optimize.minimize(method='l-bfgs-b', jac=True, options={'gtol': 1e-2})`
 /// - 包含 log-prior (from `prior.py`)
-#[cfg(feature = "gp-lbfgsb")]
 pub(crate) fn fit_kernel_params_lbfgsb(
     x_train: &[Vec<f64>],
     y_train: &[f64],
@@ -155,8 +291,6 @@ pub(crate) fn fit_kernel_params_lbfgsb(
     gpr_cache: Option<&KernelParamsCache>,
     deterministic_objective: bool,
 ) -> GPRegressor {
-    use scirs2_optimize::unconstrained::OptimizeResult;
-
     let d = x_train.first().map_or(0, |row| row.len());
 
     if x_train.is_empty() || y_train.is_empty() {
@@ -203,28 +337,26 @@ pub(crate) fn fit_kernel_params_lbfgsb(
         let dims = d;
         let det = deterministic_objective;
 
-        let objective = |x: &ArrayView1<f64>| -> f64 {
-            let params: Vec<f64> = x.iter().copied().collect();
-            neg_log_posterior(&params, dims, &x_t, &y_t, &is_c, det)
+        let objective = |x: &[f64]| -> f64 {
+            neg_log_posterior(x, dims, &x_t, &y_t, &is_c, det)
         };
 
-        let mut options = Options::default();
-        options.max_iter = 50;
-        options.gtol = 1e-2;
+        let x_t2 = x_train_owned.clone();
+        let y_t2 = y_train_owned.clone();
+        let is_c2 = is_cat_owned.clone();
 
-        let result: Result<OptimizeResult<f64>, _> = minimize(
-            objective,
-            &init_params,
-            Method::BFGS,
-            Some(options),
-        );
-
-        let final_params: Vec<f64> = match result {
-            Ok(ref res) => res.x.to_vec(),
-            Err(_) => continue,
+        let gradient = |x: &[f64]| -> Vec<f64> {
+            gradient_finite_diff(x, dims, &x_t2, &y_t2, &is_c2, det)
         };
 
-        let (inv_sq_ls, kernel_scale, noise_var) = decode_params(&final_params, d, deterministic_objective);
+        let result = bfgs_minimize(&objective, &gradient, &init_params, 50, 1e-2);
+
+        let final_params = match result {
+            Some(ref res) => &res.x,
+            None => continue,
+        };
+
+        let (inv_sq_ls, kernel_scale, noise_var) = decode_params(final_params, d, deterministic_objective);
 
         if inv_sq_ls.iter().any(|&v| !v.is_finite())
             || !kernel_scale.is_finite()
@@ -251,19 +383,6 @@ pub(crate) fn fit_kernel_params_lbfgsb(
     ))
 }
 
-// 当 gp-lbfgsb feature 未启用时，回退到随机搜索
-#[cfg(not(feature = "gp-lbfgsb"))]
-pub(crate) fn fit_kernel_params_lbfgsb(
-    x_train: &[Vec<f64>],
-    y_train: &[f64],
-    is_categorical: &[bool],
-    seed: u64,
-    gpr_cache: Option<&crate::samplers::gp::KernelParamsCache>,
-    deterministic_objective: bool,
-) -> crate::samplers::gp::GPRegressor {
-    crate::samplers::gp::fit_kernel_params(x_train, y_train, is_categorical, seed, gpr_cache, deterministic_objective)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -287,7 +406,6 @@ mod tests {
         let _ = fit_kernel_params_lbfgsb(&x, &y, &is_cat, 42, None, false);
     }
 
-    #[cfg(feature = "gp-lbfgsb")]
     #[test]
     fn test_log_prior_at_unity() {
         use crate::samplers::gp::DEFAULT_MINIMUM_NOISE_VAR;
@@ -297,7 +415,6 @@ mod tests {
         assert!(lp1 > lp2, "lprio at 1.0={lp1} should be > at 2.0={lp2}");
     }
 
-    #[cfg(feature = "gp-lbfgsb")]
     #[test]
     fn test_decode_encode_roundtrip() {
         use crate::samplers::gp::DEFAULT_MINIMUM_NOISE_VAR;
@@ -390,7 +507,6 @@ mod tests {
         assert!(m2.abs() < 10.0);
     }
 
-    #[cfg(feature = "gp-lbfgsb")]
     /// 对齐 Python: decode_params 多维
     #[test]
     fn test_decode_params_multidim() {
@@ -402,7 +518,6 @@ mod tests {
         assert!((ks - 0.5_f64.exp()).abs() < 1e-10);
     }
 
-    #[cfg(feature = "gp-lbfgsb")]
     /// 对齐 Python: log_prior 噪声越大先验越低
     #[test]
     fn test_log_prior_noise_penalty() {

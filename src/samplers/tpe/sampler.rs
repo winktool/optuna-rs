@@ -173,7 +173,7 @@ impl TpeSampler {
     ) -> Self {
         let rng = match seed {
             Some(s) => ChaCha8Rng::seed_from_u64(s),
-            None => ChaCha8Rng::from_entropy(),
+            None => ChaCha8Rng::from_rng(&mut rand::rng()),
         };
         Self {
             n_startup_trials,

@@ -1,6 +1,6 @@
 use indexmap::IndexMap;
 use parking_lot::Mutex;
-use rand::Rng;
+use rand::RngExt;
 use rand::SeedableRng;
 use rand_chacha::ChaCha8Rng;
 
@@ -31,7 +31,7 @@ impl RandomSampler {
     pub fn new(seed: Option<u64>) -> Self {
         let rng = match seed {
             Some(s) => ChaCha8Rng::seed_from_u64(s),
-            None => ChaCha8Rng::from_entropy(),
+            None => ChaCha8Rng::from_rng(&mut rand::rng()),
         };
         Self {
             rng: Mutex::new(rng),
@@ -53,7 +53,7 @@ impl RandomSampler {
             let v: f64 = if (hi - lo).abs() < f64::EPSILON {
                 *lo
             } else {
-                rng.gen_range(*lo..*hi)
+                rng.random_range(*lo..*hi)
             };
             encoded.push(v);
         }

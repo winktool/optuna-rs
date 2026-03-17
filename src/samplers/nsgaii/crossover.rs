@@ -1,16 +1,28 @@
-use rand::Rng;
-
 /// Trait for crossover operators used in evolutionary algorithms.
 pub trait Crossover: Send + Sync {
     /// Number of parent solutions required.
     fn n_parents(&self) -> usize;
 
     /// Perform crossover on parent vectors (in \[0,1\] space) to produce a child.
-    fn crossover(&self, parents: &[Vec<f64>], rng: &mut dyn RngCore) -> Vec<f64>;
+    fn crossover(&self, parents: &[Vec<f64>], rng: &mut dyn Rng) -> Vec<f64>;
 }
 
-/// Trait alias to allow `&mut dyn RngCore` usage.
-pub use rand::RngCore;
+/// Re-export `Rng` for `&mut dyn Rng` usage.
+pub use rand::Rng;
+
+/// 从 dyn Rng 生成 [0, 1) 范围的 f64。
+/// rand 0.10 的 `random::<f64>()` 不是 object-safe，需要手动转换。
+#[inline]
+pub(crate) fn rng_f64(rng: &mut dyn Rng) -> f64 {
+    // 标准方法：取 53 位尾数
+    (rng.next_u64() >> 11) as f64 * (1.0 / (1u64 << 53) as f64)
+}
+
+/// 从 dyn Rng 生成随机 bool。
+#[inline]
+pub(crate) fn rng_bool(rng: &mut dyn Rng) -> bool {
+    rng.next_u32() & 1 == 1
+}
 
 /// Uniform crossover: randomly selects each gene from one of the two parents.
 pub struct UniformCrossover {
@@ -37,12 +49,12 @@ impl Crossover for UniformCrossover {
         2
     }
 
-    fn crossover(&self, parents: &[Vec<f64>], rng: &mut dyn RngCore) -> Vec<f64> {
+    fn crossover(&self, parents: &[Vec<f64>], rng: &mut dyn Rng) -> Vec<f64> {
         parents[0]
             .iter()
             .zip(parents[1].iter())
             .map(|(&p0, &p1)| {
-                if rng.r#gen::<f64>() < self.swapping_prob {
+                if rng_f64(rng) < self.swapping_prob {
                     p1
                 } else {
                     p0
@@ -76,7 +88,7 @@ impl Crossover for BLXAlphaCrossover {
         2
     }
 
-    fn crossover(&self, parents: &[Vec<f64>], rng: &mut dyn RngCore) -> Vec<f64> {
+    fn crossover(&self, parents: &[Vec<f64>], rng: &mut dyn Rng) -> Vec<f64> {
         parents[0]
             .iter()
             .zip(parents[1].iter())
@@ -86,7 +98,7 @@ impl Crossover for BLXAlphaCrossover {
                 let d = hi - lo;
                 let lower = lo - self.alpha * d;
                 let upper = hi + self.alpha * d;
-                let v: f64 = rng.r#gen::<f64>() * (upper - lower) + lower;
+                let v: f64 = rng_f64(rng) * (upper - lower) + lower;
                 v.clamp(0.0, 1.0)
             })
             .collect()
@@ -121,7 +133,7 @@ impl Crossover for SBXCrossover {
         2
     }
 
-    fn crossover(&self, parents: &[Vec<f64>], rng: &mut dyn RngCore) -> Vec<f64> {
+    fn crossover(&self, parents: &[Vec<f64>], rng: &mut dyn Rng) -> Vec<f64> {
         parents[0]
             .iter()
             .zip(parents[1].iter())
@@ -130,14 +142,14 @@ impl Crossover for SBXCrossover {
                     return p0;
                 }
 
-                let u: f64 = rng.r#gen();
+                let u: f64 = rng_f64(rng);
                 let beta = if u <= 0.5 {
                     (2.0 * u).powf(1.0 / (self.eta + 1.0))
                 } else {
                     (1.0 / (2.0 * (1.0 - u))).powf(1.0 / (self.eta + 1.0))
                 };
 
-                let c = if rng.r#gen::<bool>() {
+                let c = if rng_bool(rng) {
                     0.5 * ((1.0 + beta) * p0 + (1.0 - beta) * p1)
                 } else {
                     0.5 * ((1.0 - beta) * p0 + (1.0 + beta) * p1)
@@ -173,7 +185,7 @@ impl Crossover for SPXCrossover {
         3 // SPX 始终需要 3 个父代
     }
 
-    fn crossover(&self, parents: &[Vec<f64>], rng: &mut dyn RngCore) -> Vec<f64> {
+    fn crossover(&self, parents: &[Vec<f64>], rng: &mut dyn Rng) -> Vec<f64> {
         let n_parents = 3;
         let n_params = parents[0].len();
 
@@ -191,7 +203,7 @@ impl Crossover for SPXCrossover {
         // 步骤2：生成随机权重 r_s = U(0,1)^(1/(k-1))，其中 k = n_parents - 1
         let mut r_s = Vec::with_capacity(n_parents - 1);
         for _ in 0..(n_parents - 1) {
-            let u: f64 = rng.r#gen();
+            let u: f64 = rng_f64(rng);
             r_s.push(u.powf(1.0 / (n_parents as f64 - 2.0).max(1.0)));
         }
 
@@ -257,7 +269,7 @@ impl Crossover for UNDXCrossover {
         3 // UNDX 始终需要 3 个父代
     }
 
-    fn crossover(&self, parents: &[Vec<f64>], rng: &mut dyn RngCore) -> Vec<f64> {
+    fn crossover(&self, parents: &[Vec<f64>], rng: &mut dyn Rng) -> Vec<f64> {
         let n = parents[0].len(); // 参数维度
 
         // 步骤1：主搜索线 (PSL) 设置
@@ -302,9 +314,9 @@ impl Crossover for UNDXCrossover {
 }
 
 /// 生成标准正态分布随机数（Box-Muller 变换）
-fn normal_sample(rng: &mut dyn RngCore) -> f64 {
-    let u1: f64 = rng.r#gen::<f64>().max(1e-300); // 避免 log(0)
-    let u2: f64 = rng.r#gen();
+fn normal_sample(rng: &mut dyn Rng) -> f64 {
+    let u1: f64 = rng_f64(rng).max(1e-300); // 避免 log(0)
+    let u2: f64 = rng_f64(rng);
     (-2.0 * u1.ln()).sqrt() * (2.0 * std::f64::consts::PI * u2).cos()
 }
 
@@ -403,7 +415,7 @@ impl Crossover for VSBXCrossover {
         2
     }
 
-    fn crossover(&self, parents: &[Vec<f64>], rng: &mut dyn RngCore) -> Vec<f64> {
+    fn crossover(&self, parents: &[Vec<f64>], rng: &mut dyn Rng) -> Vec<f64> {
         let n = parents[0].len();
 
         // 确定 eta（默认：多目标 20.0，保守默认）
@@ -418,7 +430,7 @@ impl Crossover for VSBXCrossover {
             let p0 = parents[0][i];
             let p1 = parents[1][i];
 
-            let u: f64 = rng.r#gen();
+            let u: f64 = rng_f64(rng);
 
             // 计算 beta_1 和 beta_2
             let beta1 = (1.0 / (2.0 * u).max(eps)).powf(1.0 / (eta + 1.0));
@@ -426,14 +438,14 @@ impl Crossover for VSBXCrossover {
                 (1.0 / (2.0 * (1.0 - u)).max(eps)).powf(1.0 / (eta + 1.0));
 
             // 生成两个候选子代
-            let u1: f64 = rng.r#gen();
+            let u1: f64 = rng_f64(rng);
             if u1 <= 0.5 {
                 child1[i] = 0.5 * ((1.0 + beta1) * p0 + (1.0 - beta2) * p1);
             } else {
                 child1[i] = 0.5 * ((1.0 - beta1) * p0 + (1.0 + beta2) * p1);
             }
 
-            let u2: f64 = rng.r#gen();
+            let u2: f64 = rng_f64(rng);
             if u2 <= 0.5 {
                 child2[i] = 0.5 * ((3.0 - beta1) * p0 - (1.0 - beta2) * p1);
             } else {
@@ -441,14 +453,14 @@ impl Crossover for VSBXCrossover {
             }
 
             // 基因选择逻辑
-            let r1: f64 = rng.r#gen();
+            let r1: f64 = rng_f64(rng);
             if r1 >= self.use_child_gene_prob {
                 // 使用父代基因
                 child1[i] = p0;
                 child2[i] = p1;
             } else {
                 // 交叉概率选择
-                let r2: f64 = rng.r#gen();
+                let r2: f64 = rng_f64(rng);
                 if r2 < self.uniform_crossover_prob {
                     std::mem::swap(&mut child1[i], &mut child2[i]);
                 }
@@ -456,7 +468,7 @@ impl Crossover for VSBXCrossover {
         }
 
         // 随机选择一个子代返回
-        let r3: f64 = rng.r#gen();
+        let r3: f64 = rng_f64(rng);
         let chosen = if r3 < 0.5 { &child1 } else { &child2 };
         chosen.iter().map(|&v| v.clamp(0.0, 1.0)).collect()
     }

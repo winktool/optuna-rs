@@ -15,10 +15,9 @@ use std::sync::Arc;
 
 use indexmap::IndexMap;
 use parking_lot::Mutex;
-use rand::Rng;
 use rand::SeedableRng;
 use rand_chacha::ChaCha8Rng;
-use rand_distr::StandardNormal;
+use rand_distr::{Distribution as _, StandardNormal};
 use serde::{Deserialize, Serialize};
 
 use crate::distributions::Distribution;
@@ -193,7 +192,7 @@ impl CmaState {
         for _ in 0..self.lambda {
             let z: Vec<f64> = (0..self.n)
                 .map(|_| {
-                    rng.sample(StandardNormal)
+                    StandardNormal.sample(&mut *rng)
                 })
                 .collect();
 
@@ -518,7 +517,7 @@ impl CmaEsSampler {
 
         let rng = match seed {
             Some(s) => ChaCha8Rng::seed_from_u64(s),
-            None => ChaCha8Rng::from_entropy(),
+            None => ChaCha8Rng::from_rng(&mut rand::rng()),
         };
 
         Self {

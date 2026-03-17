@@ -2,8 +2,7 @@ mod brute_force;
 mod cmaes;
 pub mod ga;
 pub(crate) mod gp;
-#[cfg(feature = "gp-lbfgsb")]
-pub mod gp_lbfgsb;
+pub(crate) mod gp_lbfgsb;
 mod grid;
 pub mod nsgaii;
 pub mod nsgaiii;

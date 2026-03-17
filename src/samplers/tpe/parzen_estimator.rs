@@ -7,7 +7,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use indexmap::IndexMap;
-use rand::Rng;
+use rand::RngExt;
 
 use crate::distributions::Distribution;
 
@@ -447,7 +447,7 @@ impl ParzenEstimator {
     /// Returns: param_name → Vec<f64> of internal-repr values, each of length `size`.
     pub fn sample(
         &self,
-        rng: &mut impl Rng,
+        rng: &mut impl RngExt,
         size: usize,
     ) -> HashMap<String, Vec<f64>> {
         // Choose which mixture component each sample comes from.
@@ -513,7 +513,7 @@ impl ParzenEstimator {
                     let mut samples = Vec::with_capacity(size);
                     for &k in &active_indices {
                         let weights = &cat_weights[k];
-                        let q: f64 = rng.r#gen();
+                        let q: f64 = rng.random();
                         let mut cum = 0.0;
                         let mut choice = *n_choices - 1;
                         for (i, &w) in weights.iter().enumerate() {
@@ -626,10 +626,10 @@ impl ParzenEstimator {
     }
 
     /// Sample mixture component indices.
-    fn sample_component_indices(&self, rng: &mut impl Rng, size: usize) -> Vec<usize> {
+    fn sample_component_indices(&self, rng: &mut impl RngExt, size: usize) -> Vec<usize> {
         let mut indices = Vec::with_capacity(size);
         for _ in 0..size {
-            let q: f64 = rng.r#gen();
+            let q: f64 = rng.random();
             let mut cum = 0.0;
             let mut idx = self.weights.len() - 1;
             for (i, &w) in self.weights.iter().enumerate() {

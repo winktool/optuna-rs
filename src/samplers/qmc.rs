@@ -24,7 +24,7 @@ use std::sync::Arc;
 
 use indexmap::IndexMap;
 use parking_lot::Mutex;
-use rand::RngCore;
+use rand::Rng as _;
 
 use crate::distributions::Distribution;
 use crate::error::Result;
@@ -115,7 +115,7 @@ impl QmcSampler {
         // 当 seed=None 时自动生成随机种子（对应 Python `np.random.PCG64().random_raw()`）
         let seed_val = match seed {
             Some(s) => s,
-            None => rand::thread_rng().next_u64(),
+            None => rand::rng().next_u64(),
         };
 
         // 当 scramble=true 且 seed 未手动设置时发出警告

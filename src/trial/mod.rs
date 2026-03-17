@@ -1,8 +1,10 @@
+mod base;
 mod fixed;
 mod frozen;
 mod state;
 mod handle;
 
+pub use base::BaseTrial;
 pub use fixed::FixedTrial;
 pub use frozen::FrozenTrial;
 pub use handle::Trial;

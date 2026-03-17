@@ -169,6 +169,10 @@ impl Pruner for WilcoxonPruner {
 ///
 /// 使用 zsplit 零值处理方法（与 Python scipy.stats.wilcoxon 的 zero_method="zsplit" 一致）。
 ///
+/// 对齐 Python scipy `method='auto'` 行为：
+/// - 无并列值且无零值，n ≤ 50: 使用精确分布
+/// - 否则使用正态近似（correction=False，对齐 Python optuna 默认）
+///
 /// # 参数
 /// * `diff_values` - 差值序列 (current - best)
 /// * `direction` - 优化方向：
@@ -202,8 +206,10 @@ fn wilcoxon_signed_rank_test(diff_values: &[f64], direction: StudyDirection) -> 
     let ranks = assign_ranks(&abs_diffs);
 
     // 计算正秩和与负秩和
-    let mut r_plus = 0.0; // 正差值的秩和
-    let mut r_minus = 0.0; // 负差值的秩和
+    let mut r_plus = 0.0;
+    let mut r_minus = 0.0;
+    let mut has_zero = false;
+    let mut has_ties = false;
 
     for (rank, &(_abs_d, orig_idx)) in ranks.iter().zip(abs_diffs.iter()) {
         let d = diff_values[orig_idx];
@@ -215,41 +221,103 @@ fn wilcoxon_signed_rank_test(diff_values: &[f64], direction: StudyDirection) -> 
             // zsplit：零值平分到两边
             r_plus += rank / 2.0;
             r_minus += rank / 2.0;
+            has_zero = true;
         }
     }
 
-    // 使用正态近似（适用于 n >= 10 的情况）
-    // 并列修正：减去每组并列秩次的 (t^3 - t) / 2
-    let nn = n as f64;
-    let mean = nn * (nn + 1.0) / 4.0;
-    let tie_correction = compute_tie_correction(&abs_diffs);
-    let se_raw = nn * (nn + 1.0) * (2.0 * nn + 1.0) - tie_correction;
-    let var = se_raw.max(0.0) / 24.0;
-
-    if var == 0.0 {
-        return 1.0; // 所有差值相同 → 无法检验
+    // 检查并列
+    {
+        let mut i = 0;
+        while i < abs_diffs.len() {
+            let mut j = i;
+            while j < abs_diffs.len() && (abs_diffs[j].0 - abs_diffs[i].0).abs() < 1e-14 {
+                j += 1;
+            }
+            if j - i > 1 {
+                has_ties = true;
+                break;
+            }
+            i = j;
+        }
     }
 
-    let std_dev = var.sqrt();
+    // 对齐 scipy method='auto':
+    // 无并列且无零值时，n ≤ 50 使用精确分布
+    let use_exact = !has_ties && !has_zero && n <= 50;
 
-    // 根据方向选择检验统计量
-    // 对齐 Python scipy: 应用连续性修正 (continuity correction)
-    let t_stat = match direction {
-        StudyDirection::Maximize => {
-            // alternative="less": 检验 current < best → 使用 R-
-            let z = (r_minus - mean) / std_dev;
-            // 连续性修正：向零方向收缩 0.5/std_dev
-            if z > 0.0 { (z - 0.5 / std_dev).max(0.0) } else { z + 0.5 / std_dev }
+    if use_exact {
+        // 精确分布
+        let pmf = wilcoxon_exact_pmf(n);
+        let stat = match direction {
+            StudyDirection::Maximize => r_minus,
+            _ => r_plus,
+        };
+        // alternative="greater": P(T >= stat) = sf(stat)
+        // alternative="less": P(T <= stat) = cdf(stat)
+        // Python scipy 对齐: 单尾测试
+        // greater: p = P(T >= stat) = 1 - P(T <= stat-1)
+        // Rust 对齐: both directions use the same formula
+        // For Minimize (alternative "greater"): test if r_plus is large → p = P(R+ >= r_plus)
+        // For Maximize (alternative "less"): test if r_minus is large → p = P(R- >= r_minus)
+        //   Since R+ + R- = n(n+1)/2, P(R- >= x) = P(R+ <= n(n+1)/2 - x)
+        //   But it's symmetric, so we can also compute: P(R_stat >= stat) directly
+        let stat_int = stat.floor() as usize;
+        // P(T >= stat) = sum of pmf[stat_int..]
+        if stat_int >= pmf.len() {
+            0.0
+        } else {
+            pmf[stat_int..].iter().sum()
         }
-        _ => {
-            // alternative="greater": 检验 current > best → 使用 R+
-            let z = (r_plus - mean) / std_dev;
-            if z > 0.0 { (z - 0.5 / std_dev).max(0.0) } else { z + 0.5 / std_dev }
-        }
-    };
+    } else {
+        // 正态近似（correction=False，对齐 Python optuna 默认）
+        let nn = n as f64;
+        let mean = nn * (nn + 1.0) / 4.0;
+        let tie_correction = compute_tie_correction(&abs_diffs);
+        let se_raw = nn * (nn + 1.0) * (2.0 * nn + 1.0) - tie_correction;
+        let var = se_raw.max(0.0) / 24.0;
 
-    // 单尾 p 值（正态近似）
-    1.0 - normal_cdf(t_stat)
+        if var == 0.0 {
+            return 1.0;
+        }
+
+        let std_dev = var.sqrt();
+
+        // 根据方向选择检验统计量
+        // 不使用连续性修正（对齐 Python optuna: correction=False）
+        let z = match direction {
+            StudyDirection::Maximize => (r_minus - mean) / std_dev,
+            _ => (r_plus - mean) / std_dev,
+        };
+
+        // 单尾 p 值
+        1.0 - normal_cdf(z)
+    }
+}
+
+/// 计算 Wilcoxon 符号秩统计量 R+ 的精确 PMF。
+///
+/// 对齐 scipy `_get_wilcoxon_distr`: 枚举所有 2^n 种正负号分配，
+/// 动态规划构建 R+ 的精确概率质量函数。
+///
+/// 返回 pmf[k] = P(R+ = k)，k = 0, 1, ..., n*(n+1)/2
+fn wilcoxon_exact_pmf(n: usize) -> Vec<f64> {
+    let mut c = vec![1.0_f64]; // P(R+=0) = 1.0
+    for k in 1..=n {
+        let prev = c;
+        let new_len = k * (k + 1) / 2 + 1;
+        let mut new_c = vec![0.0_f64; new_len];
+        let m = prev.len();
+        // 不包含秩 k（贡献到低位）
+        for i in 0..m {
+            new_c[i] += prev[i] * 0.5;
+        }
+        // 包含秩 k（右移 k 位）
+        for i in 0..m {
+            new_c[i + k] += prev[i] * 0.5;
+        }
+        c = new_c;
+    }
+    c
 }
 
 /// 为排序后的绝对差值分配秩次，处理并列情况。
@@ -480,25 +548,24 @@ mod tests {
         assert!((p - 1.0).abs() < 0.05, "Python p=1.0, got {p}");
     }
 
-    /// Python: wilcoxon(mixed, alt='greater', zero_method='zsplit').pvalue ≈ 0.0439
-    /// 混合正负差值 → 中等 p 值
+    /// Python: wilcoxon(mixed, alt='greater', zero_method='zsplit').pvalue ≈ 0.0439453125
+    /// 混合正负差值, abs值有并列(0.5出现2次) → 正态近似（无连续性修正）
     #[test]
     fn test_python_cross_wilcoxon_mixed() {
         let diff = vec![1.0, -0.5, 2.0, -0.3, 1.5, 0.8, -0.1, 1.2, 0.5, -0.2];
         let p = wilcoxon_signed_rank_test(&diff, StudyDirection::Minimize);
-        // Python 精确值: 0.0439453125
-        // 正态近似可能有 ~0.01 偏移，允许 0.03 容差
-        assert!((p - 0.044).abs() < 0.03, "Python p≈0.044, got {p}");
+        // Python 精确值: 0.0439453125 (permutation); normal approx ≈ 0.0415
+        assert!((p - 0.044).abs() < 0.01, "Python p≈0.044, got {p}");
     }
 
-    /// Python: wilcoxon(mixed, alt='less', zero_method='zsplit').pvalue ≈ 0.9600
-    /// 同数据用 Maximize 方向 → p 值大 → 不剪枝
+    /// Python: wilcoxon(mixed, alt='less', zero_method='zsplit').pvalue ≈ 0.9599609375
+    /// 同数据用 Maximize 方向, 有并列 → 正态近似
     #[test]
     fn test_python_cross_wilcoxon_mixed_maximize() {
         let diff = vec![1.0, -0.5, 2.0, -0.3, 1.5, 0.8, -0.1, 1.2, 0.5, -0.2];
         let p = wilcoxon_signed_rank_test(&diff, StudyDirection::Maximize);
-        // Python 精确值: 0.9599609375
-        assert!((p - 0.96).abs() < 0.03, "Python p≈0.96, got {p}");
+        // Python 精确值: 0.9599609375; normal approx ≈ 0.9585
+        assert!((p - 0.96).abs() < 0.01, "Python p≈0.96, got {p}");
     }
 
     #[test]
@@ -558,5 +625,71 @@ mod tests {
         assert!((normal_cdf(-2.0) - 0.022750131948179198).abs() < 1e-7);
         // Python: norm.cdf(2) = 0.9772498680518208
         assert!((normal_cdf(2.0) - 0.9772498680518208).abs() < 1e-7);
+    }
+
+    // ========================================================================
+    // 精确分布测试
+    // ========================================================================
+
+    #[test]
+    fn test_wilcoxon_exact_pmf_n1() {
+        let pmf = wilcoxon_exact_pmf(1);
+        // R+ ∈ {0, 1}, 各概率 0.5
+        assert_eq!(pmf.len(), 2);
+        assert!((pmf[0] - 0.5).abs() < 1e-14);
+        assert!((pmf[1] - 0.5).abs() < 1e-14);
+    }
+
+    #[test]
+    fn test_wilcoxon_exact_pmf_n3() {
+        let pmf = wilcoxon_exact_pmf(3);
+        // R+ ∈ {0,1,...,6}, 8 种组合
+        assert_eq!(pmf.len(), 7);
+        let sum: f64 = pmf.iter().sum();
+        assert!((sum - 1.0).abs() < 1e-14, "PMF sum = {sum}");
+        // P(R+=0) = 1/8, P(R+=6) = 1/8
+        assert!((pmf[0] - 0.125).abs() < 1e-14);
+        assert!((pmf[6] - 0.125).abs() < 1e-14);
+    }
+
+    #[test]
+    fn test_wilcoxon_exact_pmf_n5() {
+        let pmf = wilcoxon_exact_pmf(5);
+        // R+ ∈ {0,...,15}, 32 种组合
+        assert_eq!(pmf.len(), 16);
+        let sum: f64 = pmf.iter().sum();
+        assert!((sum - 1.0).abs() < 1e-14, "PMF sum = {sum}");
+    }
+
+    #[test]
+    fn test_exact_vs_scipy_n5() {
+        // scipy.stats.wilcoxon([1,2,3,4,5], alternative='greater', zero_method='zsplit')
+        // R+ = 15, P(R+ >= 15) = P(R+=15) = 1/32 = 0.03125
+        let diff = vec![1.0, 2.0, 3.0, 4.0, 5.0];
+        let p = wilcoxon_signed_rank_test(&diff, StudyDirection::Minimize);
+        assert!((p - 0.03125).abs() < 1e-10, "expected 0.03125, got {p}");
+    }
+
+    #[test]
+    fn test_exact_vs_scipy_n3_all_positive() {
+        // n=3, all positive: R+ = 6, P(R+ >= 6) = 1/8 = 0.125
+        let diff = vec![1.0, 2.0, 3.0];
+        let p = wilcoxon_signed_rank_test(&diff, StudyDirection::Minimize);
+        assert!((p - 0.125).abs() < 1e-10, "expected 0.125, got {p}");
+    }
+
+    #[test]
+    fn test_exact_small_n_accuracy() {
+        // n=4, diffs = [1, -2, 3, 4]: R+ ranked by |d|: 1(r1), 2(r2), 3(r3), 4(r4)
+        // signs: +, -, +, +  → R+ = 1 + 3 + 4 = 8
+        // P(R+ >= 8) via exact = sum pmf[8..10] for n=4 (max=10)
+        let diff = vec![1.0, -2.0, 3.0, 4.0];
+        let p = wilcoxon_signed_rank_test(&diff, StudyDirection::Minimize);
+        // Verify it's a valid p-value computed exactly
+        assert!(p > 0.0 && p < 1.0, "p should be in (0,1), got {p}");
+        // For exact: should not be affected by normal approximation bias
+        let pmf = wilcoxon_exact_pmf(4);
+        let expected_p: f64 = pmf[8..].iter().sum();
+        assert!((p - expected_p).abs() < 1e-10, "expected {expected_p}, got {p}");
     }
 }

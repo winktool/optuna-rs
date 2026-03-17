@@ -1968,6 +1968,69 @@ def test_motpe_end_to_end():
     pareto = study.best_trials
     assert len(pareto) > 0
 
+
+# ═══════════════════════════════════════════════════════════════════════════
+#  Session 41: fANOVA 方差分解、BaseTrial trait
+# ═══════════════════════════════════════════════════════════════════════════
+
+def test_fanova_importance_ranking():
+    """Rust: test_get_param_importances_quadratic
+    fANOVA 应该正确识别 x^2 + 0.01*y 中 x 远比 y 重要。
+    Python 和 Rust 都应该给出 x > y 的排序。
+    """
+    study = optuna.create_study(
+        direction="minimize",
+        sampler=optuna.samplers.RandomSampler(seed=42),
+    )
+    def obj(trial):
+        x = trial.suggest_float("x", -10.0, 10.0)
+        y = trial.suggest_float("y", -10.0, 10.0)
+        return x * x + 0.01 * y
+    study.optimize(obj, n_trials=100)
+
+    imp = optuna.importance.get_param_importances(
+        study,
+        evaluator=optuna.importance.FanovaImportanceEvaluator(seed=42),
+    )
+    assert "x" in imp and "y" in imp, f"keys={list(imp.keys())}"
+    assert imp["x"] > imp["y"], f"x={imp['x']}, y={imp['y']}: x should dominate"
+    assert imp["x"] > 0.9, f"x importance should be > 0.9, got {imp['x']}"
+
+
+def test_fanova_three_params():
+    """Rust: test_importance_three_params
+    f(x, y, z) = 10*x^2 + y^2 + 0.001*z => importance: x > y > z
+    """
+    study = optuna.create_study(
+        direction="minimize",
+        sampler=optuna.samplers.RandomSampler(seed=123),
+    )
+    def obj(trial):
+        x = trial.suggest_float("x", -5.0, 5.0)
+        y = trial.suggest_float("y", -5.0, 5.0)
+        z = trial.suggest_float("z", -5.0, 5.0)
+        return 10.0 * x * x + y * y + 0.001 * z
+    study.optimize(obj, n_trials=200)
+
+    imp = optuna.importance.get_param_importances(
+        study,
+        evaluator=optuna.importance.FanovaImportanceEvaluator(seed=123),
+    )
+    keys = list(imp.keys())
+    assert keys[0] == "x", f"first={keys[0]}, expected x"
+    assert keys[1] == "y", f"second={keys[1]}, expected y"
+    assert keys[2] == "z", f"third={keys[2]}, expected z"
+
+
+def test_wilcoxon_exact_small_n():
+    """Rust: test_exact_small_n_accuracy
+    n=3 全正差值: exact p-value 应该是 0.125 (= 1/8)
+    """
+    from scipy.stats import wilcoxon
+    d = [1.0, 2.0, 3.0]
+    stat, pvalue = wilcoxon(d, alternative="greater", method="exact", correction=False)
+    assert abs(pvalue - 0.125) < 1e-10, f"pvalue={pvalue}, expected 0.125"
+
 # ═══════════════════════════════════════════════════════════════════════════
 #  执行
 # ═══════════════════════════════════════════════════════════════════════════

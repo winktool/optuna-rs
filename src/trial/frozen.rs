@@ -422,6 +422,54 @@ impl FrozenTrial {
     }
 }
 
+impl crate::trial::BaseTrial for FrozenTrial {
+    fn suggest_float(&mut self, name: &str, low: f64, high: f64, step: Option<f64>, log: bool) -> crate::error::Result<f64> {
+        self.suggest_float(name, low, high, step, log)
+    }
+
+    fn suggest_int(&mut self, name: &str, low: i64, high: i64, step: i64, log: bool) -> crate::error::Result<i64> {
+        self.suggest_int(name, low, high, step, log)
+    }
+
+    fn suggest_categorical(&mut self, name: &str, choices: Vec<crate::distributions::CategoricalChoice>) -> crate::error::Result<crate::distributions::CategoricalChoice> {
+        self.suggest_categorical(name, choices)
+    }
+
+    fn report(&mut self, value: f64, step: i64) -> crate::error::Result<()> {
+        FrozenTrial::report(self, value, step);
+        Ok(())
+    }
+
+    fn should_prune(&self) -> crate::error::Result<bool> {
+        Ok(FrozenTrial::should_prune(self))
+    }
+
+    fn set_user_attr(&mut self, key: &str, value: serde_json::Value) -> crate::error::Result<()> {
+        FrozenTrial::set_user_attr(self, key.to_string(), value);
+        Ok(())
+    }
+
+    fn number(&self) -> i64 {
+        self.number
+    }
+
+    fn params(&self) -> std::collections::HashMap<String, crate::distributions::ParamValue> {
+        self.params.clone()
+    }
+
+    fn distributions(&self) -> std::collections::HashMap<String, crate::distributions::Distribution> {
+        self.distributions.clone()
+    }
+
+    fn user_attrs(&self) -> crate::error::Result<std::collections::HashMap<String, serde_json::Value>> {
+        Ok(self.user_attrs.clone())
+    }
+
+    fn datetime_start(&self) -> Option<chrono::DateTime<chrono::Utc>> {
+        self.datetime_start
+    }
+}
+
 /// 对应 Python `FrozenTrial.__eq__`：比较所有字段（不仅仅是 number）。
 /// `__lt__` / `__le__` 按 number 排序。
 ///

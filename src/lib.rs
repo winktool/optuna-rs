@@ -147,4 +147,4 @@ pub use terminators::{
     RegretBoundEvaluator, StaticErrorEvaluator, TargetValueTerminator, Terminator,
     report_cross_validation_scores, DEFAULT_MIN_N_TRIALS,
 };
-pub use trial::{create_trial, FixedTrial, FrozenTrial, Trial, TrialState};
+pub use trial::{create_trial, BaseTrial, FixedTrial, FrozenTrial, Trial, TrialState};

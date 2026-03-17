@@ -287,6 +287,54 @@ impl FixedTrial {
     }
 }
 
+impl crate::trial::BaseTrial for FixedTrial {
+    fn suggest_float(&mut self, name: &str, low: f64, high: f64, step: Option<f64>, log: bool) -> crate::error::Result<f64> {
+        self.suggest_float(name, low, high, log, step)
+    }
+
+    fn suggest_int(&mut self, name: &str, low: i64, high: i64, step: i64, log: bool) -> crate::error::Result<i64> {
+        self.suggest_int(name, low, high, log, step)
+    }
+
+    fn suggest_categorical(&mut self, name: &str, choices: Vec<CategoricalChoice>) -> crate::error::Result<CategoricalChoice> {
+        self.suggest_categorical(name, choices)
+    }
+
+    fn report(&mut self, value: f64, step: i64) -> crate::error::Result<()> {
+        FixedTrial::report(self, value, step);
+        Ok(())
+    }
+
+    fn should_prune(&self) -> crate::error::Result<bool> {
+        Ok(FixedTrial::should_prune(self))
+    }
+
+    fn set_user_attr(&mut self, key: &str, value: serde_json::Value) -> crate::error::Result<()> {
+        FixedTrial::set_user_attr(self, key.to_string(), value);
+        Ok(())
+    }
+
+    fn number(&self) -> i64 {
+        FixedTrial::number(self)
+    }
+
+    fn params(&self) -> HashMap<String, ParamValue> {
+        FixedTrial::params(self).clone()
+    }
+
+    fn distributions(&self) -> HashMap<String, Distribution> {
+        FixedTrial::distributions(self).clone()
+    }
+
+    fn user_attrs(&self) -> crate::error::Result<HashMap<String, serde_json::Value>> {
+        Ok(FixedTrial::user_attrs(self).clone())
+    }
+
+    fn datetime_start(&self) -> Option<DateTime<Utc>> {
+        FixedTrial::datetime_start(self)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

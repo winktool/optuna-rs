@@ -27,25 +27,30 @@ pub trait ImportanceEvaluator: Send + Sync {
 
 /// Functional ANOVA (fANOVA) importance evaluator.
 ///
-/// Estimates parameter importance by computing between-group variance
-/// of objective values when trials are grouped by discretized parameter
-/// values. Parameters that produce large variance between groups are
-/// considered more important.
+/// 对齐 Python `optuna.importance.FanovaImportanceEvaluator`:
+/// 使用随机森林训练模型，然后对每棵树进行方差分解——
+/// 通过边际化（积分掉非目标特征）计算单个特征对预测值方差的贡献。
+///
+/// importance(feature) = E_trees[ marginal_var(feature) / total_var(tree) ]
 pub struct FanovaEvaluator {
-    /// Number of bins for discretizing continuous parameters.
-    n_bins: usize,
+    /// 随机森林树数量
+    n_trees: usize,
+    /// 最大深度
+    max_depth: usize,
+    /// 随机种子
+    seed: Option<u64>,
 }
 
 impl Default for FanovaEvaluator {
     fn default() -> Self {
-        Self { n_bins: 16 }
+        Self { n_trees: 64, max_depth: 64, seed: None }
     }
 }
 
 impl FanovaEvaluator {
-    /// Create a new evaluator with the given number of bins.
-    pub fn new(n_bins: usize) -> Self {
-        Self { n_bins }
+    /// Create a new fANOVA evaluator.
+    pub fn new(n_trees: usize, max_depth: usize, seed: Option<u64>) -> Self {
+        Self { n_trees, max_depth, seed }
     }
 }
 
@@ -60,41 +65,97 @@ impl ImportanceEvaluator for FanovaEvaluator {
             return Ok(IndexMap::new());
         }
 
-        let global_mean: f64 = target_values.iter().sum::<f64>() / target_values.len() as f64;
+        let n_features = params.len();
 
-        let mut raw_importances: Vec<(String, f64)> = Vec::new();
+        // 构建特征矩阵 + search_spaces
+        let mut x_matrix: Vec<Vec<f64>> = Vec::new();
+        let mut filtered_targets: Vec<f64> = Vec::new();
+        // 搜索空间: 每个参数的 [low, high]
+        let mut search_spaces: Vec<[f64; 2]> = vec![[f64::INFINITY, f64::NEG_INFINITY]; n_features];
 
-        for param_name in params {
-            // Collect (param_value, objective_value) pairs
-            let mut pairs: Vec<(f64, f64)> = Vec::new();
-            for (i, trial) in trials.iter().enumerate() {
-                if let Some(pv) = trial.params.get(param_name) {
-                    let dist = trial.distributions.get(param_name);
-                    let internal = param_value_to_f64(pv, dist);
-                    pairs.push((internal, target_values[i]));
-                }
+        for (i, trial) in trials.iter().enumerate() {
+            let has_all = params.iter().all(|name| trial.params.contains_key(name));
+            if !has_all {
+                continue;
             }
+            let mut row = Vec::with_capacity(n_features);
+            for (p_idx, param_name) in params.iter().enumerate() {
+                let pv = trial.params.get(param_name).unwrap();
+                let dist = trial.distributions.get(param_name);
+                let v = param_value_to_f64(pv, dist);
+                row.push(v);
+                if v < search_spaces[p_idx][0] { search_spaces[p_idx][0] = v; }
+                if v > search_spaces[p_idx][1] { search_spaces[p_idx][1] = v; }
+            }
+            x_matrix.push(row);
+            filtered_targets.push(target_values[i]);
+        }
 
-            if pairs.is_empty() {
-                raw_importances.push((param_name.clone(), 0.0));
+        if x_matrix.is_empty() || x_matrix.len() < 2 {
+            return Ok(IndexMap::new());
+        }
+
+        // 确保 search_spaces 有正的范围
+        for ss in &mut search_spaces {
+            if (ss[1] - ss[0]).abs() < 1e-14 {
+                ss[0] -= 0.5;
+                ss[1] += 0.5;
+            }
+        }
+
+        // 训练随机森林并构建 FanovaTree 进行方差分解
+        let base_seed = self.seed.unwrap_or(42);
+        let n_samples = x_matrix.len();
+        let feature_indices: Vec<usize> = (0..n_features).collect();
+
+        let mut per_feature_fractions: Vec<Vec<f64>> = vec![Vec::new(); n_features];
+
+        for tree_idx in 0..self.n_trees {
+            let mut rng = SimpleRng::new(base_seed.wrapping_add(tree_idx as u64));
+
+            // Bootstrap
+            let bootstrap_indices: Vec<usize> = (0..n_samples)
+                .map(|_| rng.next_usize(n_samples))
+                .collect();
+
+            // 构建决策树
+            let tree = build_tree(
+                &x_matrix, &filtered_targets, &bootstrap_indices,
+                0, self.max_depth, 2, 1, &feature_indices, &mut rng,
+            );
+
+            // 转换为数组式布局 + fANOVA
+            let flat = flatten_tree(&tree);
+            let ftree = FanovaTree::new(&flat, &search_spaces);
+            let tree_var = ftree.variance();
+
+            if tree_var <= 0.0 {
                 continue;
             }
 
-            // Discretize into bins and compute between-group variance
-            let importance = between_group_variance(&pairs, self.n_bins, global_mean);
-            raw_importances.push((param_name.clone(), importance));
+            for feat in 0..n_features {
+                let mv = ftree.get_marginal_variance(&[feat]);
+                per_feature_fractions[feat].push(mv / tree_var);
+            }
         }
 
-        // 对齐 Python: 返回原始未归一化的重要性值，归一化由 get_param_importances 统一处理
-        let total: f64 = raw_importances.iter().map(|(_, v)| *v).sum();
+        // 取平均
+        let mut importances: Vec<(String, f64)> = Vec::new();
+        for (i, name) in params.iter().enumerate() {
+            let fracs = &per_feature_fractions[i];
+            let mean = if fracs.is_empty() {
+                0.0
+            } else {
+                fracs.iter().sum::<f64>() / fracs.len() as f64
+            };
+            importances.push((name.clone(), mean));
+        }
+
+        importances.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
         let mut result = IndexMap::new();
-
-        // Sort by importance descending
-        raw_importances.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
-        for (name, imp) in raw_importances {
-            result.insert(name, if total > 0.0 { imp } else { 0.0 });
+        for (name, imp) in importances {
+            result.insert(name, imp);
         }
-
         Ok(result)
     }
 }
@@ -134,52 +195,6 @@ fn categorical_choice_fallback(c: &CategoricalChoice) -> f64 {
         // 有意义的距离度量）。
         CategoricalChoice::Str(_) => 0.0,
     }
-}
-
-/// Compute between-group variance for a set of (param_value, objective_value) pairs.
-///
-/// Groups values into `n_bins` equally-spaced bins based on param_value,
-/// then computes weighted variance of group means around the global mean.
-fn between_group_variance(pairs: &[(f64, f64)], n_bins: usize, global_mean: f64) -> f64 {
-    if pairs.len() <= 1 {
-        return 0.0;
-    }
-
-    let min_val = pairs.iter().map(|(v, _)| *v).fold(f64::INFINITY, f64::min);
-    let max_val = pairs
-        .iter()
-        .map(|(v, _)| *v)
-        .fold(f64::NEG_INFINITY, f64::max);
-
-    // If all param values are the same, this parameter has no importance
-    let range = max_val - min_val;
-    if range < 1e-14 {
-        return 0.0;
-    }
-
-    // Group into bins
-    let mut bin_sums = vec![0.0_f64; n_bins];
-    let mut bin_counts = vec![0_usize; n_bins];
-
-    for &(param_val, obj_val) in pairs {
-        let bin = ((param_val - min_val) / range * (n_bins as f64 - 1.0)).round() as usize;
-        let bin = bin.min(n_bins - 1);
-        bin_sums[bin] += obj_val;
-        bin_counts[bin] += 1;
-    }
-
-    // Compute between-group variance: sum of n_k * (mean_k - global_mean)^2
-    let n_total = pairs.len() as f64;
-    let mut variance = 0.0;
-    for k in 0..n_bins {
-        if bin_counts[k] > 0 {
-            let group_mean = bin_sums[k] / bin_counts[k] as f64;
-            let diff = group_mean - global_mean;
-            variance += (bin_counts[k] as f64 / n_total) * diff * diff;
-        }
-    }
-
-    variance
 }
 
 // ============================================================================
@@ -596,6 +611,401 @@ fn random_forest_feature_importances(
     }
 
     total_importances
+}
+
+// ============================================================================
+// fANOVA 树方差分解
+// 对齐 Python `optuna.importance._fanova._tree._FanovaTree`
+// ============================================================================
+
+/// 扁平化的决策树节点（数组式布局，与 sklearn Tree 对齐）。
+struct FlatNode {
+    feature: i32,       // 分裂特征，-1 = 叶子
+    threshold: f64,     // 分裂阈值
+    left_child: i32,    // 左子节点索引，-1 = 无
+    right_child: i32,   // 右子节点索引，-1 = 无
+    value: f64,         // 预测值（叶子节点的均值）
+    n_samples: usize,   // 样本数
+}
+
+/// 将递归 TreeNode 转换为数组式布局。
+fn flatten_tree(root: &TreeNode) -> Vec<FlatNode> {
+    let mut nodes = Vec::new();
+    flatten_tree_recursive(root, &mut nodes);
+    nodes
+}
+
+fn flatten_tree_recursive(node: &TreeNode, nodes: &mut Vec<FlatNode>) -> usize {
+    let idx = nodes.len();
+    match node {
+        TreeNode::Leaf { _value, _n_samples } => {
+            nodes.push(FlatNode {
+                feature: -1,
+                threshold: 0.0,
+                left_child: -1,
+                right_child: -1,
+                value: *_value,
+                n_samples: *_n_samples,
+            });
+            idx
+        }
+        TreeNode::Internal { feature, _threshold, left, right, _n_samples, .. } => {
+            // 先占位
+            nodes.push(FlatNode {
+                feature: *feature as i32,
+                threshold: *_threshold,
+                left_child: -1,
+                right_child: -1,
+                value: 0.0,
+                n_samples: *_n_samples,
+            });
+            let left_idx = flatten_tree_recursive(left, nodes);
+            let right_idx = flatten_tree_recursive(right, nodes);
+            nodes[idx].left_child = left_idx as i32;
+            nodes[idx].right_child = right_idx as i32;
+            // 内部节点的值可以从子节点加权平均得到（_precompute_statistics 会覆盖）
+            idx
+        }
+    }
+}
+
+/// fANOVA 树包装器。
+struct FanovaTree {
+    /// 节点数组（数组式布局）
+    nodes: Vec<FlatNode>,
+    /// search_spaces[feat] = [low, high]
+    search_spaces: Vec<[f64; 2]>,
+    /// 预计算的统计量: statistics[node_idx] = (value, weight)
+    statistics: Vec<(f64, f64)>,
+    /// 预计算的分裂中点: split_midpoints[feat] = vec of midpoints
+    split_midpoints: Vec<Vec<f64>>,
+    /// 预计算的分裂区间大小: split_sizes[feat] = vec of sizes
+    split_sizes: Vec<Vec<f64>>,
+    /// 子树活跃特征: subtree_active[node_idx] = BitSet-like Vec<bool>
+    subtree_active: Vec<Vec<bool>>,
+}
+
+impl FanovaTree {
+    fn new(nodes: &[FlatNode], search_spaces: &[[f64; 2]]) -> Self {
+        let n_features = search_spaces.len();
+        let n_nodes = nodes.len();
+
+        // 预计算统计量
+        let statistics = Self::precompute_statistics(nodes, search_spaces);
+
+        // 预计算分裂中点和大小
+        let (split_midpoints, split_sizes) =
+            Self::precompute_split_midpoints_and_sizes(nodes, search_spaces);
+
+        // 预计算子树活跃特征
+        let subtree_active = Self::precompute_subtree_active_features(nodes, n_features, n_nodes);
+
+        Self {
+            nodes: nodes.to_vec(),
+            search_spaces: search_spaces.to_vec(),
+            statistics,
+            split_midpoints,
+            split_sizes,
+            subtree_active,
+        }
+    }
+
+    /// 总方差：叶子节点的加权方差
+    fn variance(&self) -> f64 {
+        let leaves: Vec<usize> = (0..self.nodes.len())
+            .filter(|&i| self.nodes[i].feature < 0)
+            .collect();
+        if leaves.is_empty() {
+            return 0.0;
+        }
+        let values: Vec<f64> = leaves.iter().map(|&i| self.statistics[i].0).collect();
+        let weights: Vec<f64> = leaves.iter().map(|&i| self.statistics[i].1).collect();
+        weighted_variance(&values, &weights)
+    }
+
+    /// 对齐 Python `get_marginal_variance`:
+    /// 计算给定特征集的边际方差。
+    fn get_marginal_variance(&self, features: &[usize]) -> f64 {
+        let n_features = self.search_spaces.len();
+
+        // 收集目标特征的分裂中点
+        let selected_midpoints: Vec<&Vec<f64>> = features.iter()
+            .map(|&f| &self.split_midpoints[f])
+            .collect();
+        let selected_sizes: Vec<&Vec<f64>> = features.iter()
+            .map(|&f| &self.split_sizes[f])
+            .collect();
+
+        // 笛卡尔积遍历
+        let mut values = Vec::new();
+        let mut weights = Vec::new();
+
+        let mut indices = vec![0usize; features.len()];
+        let lengths: Vec<usize> = selected_midpoints.iter().map(|v| v.len()).collect();
+
+        // 检查是否有空
+        if lengths.iter().any(|&l| l == 0) {
+            return 0.0;
+        }
+
+        loop {
+            // 构建 sample 向量: NaN 表示边际化的维度
+            let mut sample = vec![f64::NAN; n_features];
+            let mut size_product = 1.0_f64;
+            for (k, &feat) in features.iter().enumerate() {
+                sample[feat] = selected_midpoints[k][indices[k]];
+                size_product *= selected_sizes[k][indices[k]];
+            }
+
+            let (value, weight) = self.get_marginalized_statistics(&sample);
+            let w = weight * size_product;
+            values.push(value);
+            weights.push(w);
+
+            // 推进笛卡尔积索引
+            let mut carry = true;
+            for k in (0..indices.len()).rev() {
+                if carry {
+                    indices[k] += 1;
+                    if indices[k] < lengths[k] {
+                        carry = false;
+                    } else {
+                        indices[k] = 0;
+                    }
+                }
+            }
+            if carry {
+                break; // 所有组合已遍历
+            }
+        }
+
+        weighted_variance(&values, &weights)
+    }
+
+    /// 对齐 Python `_get_marginalized_statistics`:
+    /// 从根节点遍历树，固定目标特征，边际化其余特征。
+    fn get_marginalized_statistics(&self, sample: &[f64]) -> (f64, f64) {
+        let n_features = self.search_spaces.len();
+        let active_features: Vec<bool> = sample.iter().map(|v| !v.is_nan()).collect();
+
+        // 起始搜索空间: 非活跃维度设为 [0, 1]
+        let mut init_ss = self.search_spaces.clone();
+        for i in 0..n_features {
+            if !active_features[i] {
+                init_ss[i] = [0.0, 1.0];
+            }
+        }
+
+        let mut active_nodes: Vec<(usize, Vec<[f64; 2]>)> = vec![(0, init_ss)];
+        let mut leaf_nodes: Vec<(usize, Vec<[f64; 2]>)> = Vec::new();
+
+        while let Some((node_idx, ss)) = active_nodes.pop() {
+            let node = &self.nodes[node_idx];
+
+            if node.feature >= 0 {
+                let feat = node.feature as usize;
+                let response = sample[feat];
+
+                if !response.is_nan() {
+                    // 活跃特征: 走对应子节点
+                    if response <= node.threshold {
+                        let child = node.left_child as usize;
+                        let mut child_ss = ss;
+                        child_ss[feat][1] = node.threshold; // 缩小右边界
+                        active_nodes.push((child, child_ss));
+                    } else {
+                        let child = node.right_child as usize;
+                        let mut child_ss = ss;
+                        child_ss[feat][0] = node.threshold; // 缩小左边界
+                        active_nodes.push((child, child_ss));
+                    }
+                    continue;
+                }
+
+                // 非活跃特征: 检查子树是否还分裂在活跃特征上
+                let subtree_has_active = self.subtree_active[node_idx]
+                    .iter()
+                    .enumerate()
+                    .any(|(i, &a)| a && active_features[i]);
+
+                if subtree_has_active {
+                    // 走两个子节点（积分掉此维度）
+                    active_nodes.push((node.left_child as usize, ss.clone()));
+                    active_nodes.push((node.right_child as usize, ss));
+                    continue;
+                }
+            }
+
+            // 叶子或子树不再分裂在活跃特征上
+            leaf_nodes.push((node_idx, ss));
+        }
+
+        if leaf_nodes.is_empty() {
+            return (0.0, 0.0);
+        }
+
+        // 计算加权平均
+        let mut total_weight = 0.0;
+        let mut weighted_sum = 0.0;
+        for &(idx, ref ss) in &leaf_nodes {
+            let (val, stat_weight) = self.statistics[idx];
+            // cardinality = 搜索空间各维度范围之积 (只看活跃维度)
+            let card: f64 = ss.iter()
+                .enumerate()
+                .filter(|&(i, _)| active_features[i])
+                .map(|(_, r)| (r[1] - r[0]).max(0.0))
+                .product();
+            let w = stat_weight / card.max(1e-300);
+            weighted_sum += val * w;
+            total_weight += w;
+        }
+
+        if total_weight <= 0.0 {
+            return (0.0, 0.0);
+        }
+
+        (weighted_sum / total_weight, total_weight)
+    }
+
+    /// 预计算每个节点的 (加权平均值, 权重总和)。
+    fn precompute_statistics(nodes: &[FlatNode], search_spaces: &[[f64; 2]]) -> Vec<(f64, f64)> {
+        let n_nodes = nodes.len();
+        let mut stats = vec![(0.0, 0.0); n_nodes];
+        let mut subspaces: Vec<Option<Vec<[f64; 2]>>> = vec![None; n_nodes];
+        subspaces[0] = Some(search_spaces.to_vec());
+
+        // 前向: 传播搜索空间
+        for i in 0..n_nodes {
+            let node = &nodes[i];
+            if let Some(ss) = subspaces[i].take() {
+                if node.feature < 0 {
+                    // 叶子: value * cardinality
+                    let card: f64 = ss.iter().map(|r| (r[1] - r[0]).max(0.0)).product();
+                    stats[i] = (node.value, card);
+                } else {
+                    let feat = node.feature as usize;
+                    let left = node.left_child as usize;
+                    let right = node.right_child as usize;
+                    let mut left_ss = ss.clone();
+                    left_ss[feat][1] = node.threshold;
+                    let mut right_ss = ss;
+                    right_ss[feat][0] = node.threshold;
+                    subspaces[left] = Some(left_ss);
+                    subspaces[right] = Some(right_ss);
+                }
+            }
+        }
+
+        // 后向: 从叶子到根汇总内部节点
+        for i in (0..n_nodes).rev() {
+            let node = &nodes[i];
+            if node.feature >= 0 {
+                let left = node.left_child as usize;
+                let right = node.right_child as usize;
+                let (lv, lw) = stats[left];
+                let (rv, rw) = stats[right];
+                let tw = lw + rw;
+                let val = if tw > 0.0 { (lv * lw + rv * rw) / tw } else { 0.0 };
+                stats[i] = (val, tw);
+            }
+        }
+
+        stats
+    }
+
+    /// 预计算每个特征的分裂中点和区间大小。
+    fn precompute_split_midpoints_and_sizes(
+        nodes: &[FlatNode],
+        search_spaces: &[[f64; 2]],
+    ) -> (Vec<Vec<f64>>, Vec<Vec<f64>>) {
+        let n_features = search_spaces.len();
+        let mut all_splits: Vec<Vec<f64>> = vec![Vec::new(); n_features];
+
+        // 收集所有分裂阈值
+        for node in nodes {
+            if node.feature >= 0 {
+                let feat = node.feature as usize;
+                all_splits[feat].push(node.threshold);
+            }
+        }
+
+        let mut midpoints_out = Vec::with_capacity(n_features);
+        let mut sizes_out = Vec::with_capacity(n_features);
+
+        for feat in 0..n_features {
+            let mut splits = all_splits[feat].clone();
+            splits.sort_by(|a, b| a.partial_cmp(b).unwrap());
+            splits.dedup();
+
+            // 加入搜索空间边界
+            let mut boundaries = Vec::with_capacity(splits.len() + 2);
+            boundaries.push(search_spaces[feat][0]);
+            boundaries.extend(splits);
+            boundaries.push(search_spaces[feat][1]);
+
+            let mut mids = Vec::new();
+            let mut szs = Vec::new();
+            for w in boundaries.windows(2) {
+                let mid = (w[0] + w[1]) / 2.0;
+                let sz = w[1] - w[0];
+                if sz > 0.0 {
+                    mids.push(mid);
+                    szs.push(sz);
+                }
+            }
+
+            midpoints_out.push(mids);
+            sizes_out.push(szs);
+        }
+
+        (midpoints_out, sizes_out)
+    }
+
+    /// 预计算子树活跃特征。
+    fn precompute_subtree_active_features(
+        nodes: &[FlatNode],
+        n_features: usize,
+        n_nodes: usize,
+    ) -> Vec<Vec<bool>> {
+        let mut active = vec![vec![false; n_features]; n_nodes];
+        for i in (0..n_nodes).rev() {
+            let node = &nodes[i];
+            if node.feature >= 0 {
+                let feat = node.feature as usize;
+                active[i][feat] = true;
+                let left = node.left_child as usize;
+                let right = node.right_child as usize;
+                for f in 0..n_features {
+                    active[i][f] = active[i][f] || active[left][f] || active[right][f];
+                }
+            }
+        }
+        active
+    }
+}
+
+impl Clone for FlatNode {
+    fn clone(&self) -> Self {
+        FlatNode {
+            feature: self.feature,
+            threshold: self.threshold,
+            left_child: self.left_child,
+            right_child: self.right_child,
+            value: self.value,
+            n_samples: self.n_samples,
+        }
+    }
+}
+
+/// 加权方差: Var = sum(w_i * (x_i - mean)^2) / sum(w_i)
+fn weighted_variance(values: &[f64], weights: &[f64]) -> f64 {
+    let total_w: f64 = weights.iter().sum();
+    if total_w <= 0.0 {
+        return 0.0;
+    }
+    let mean: f64 = values.iter().zip(weights).map(|(&v, &w)| v * w).sum::<f64>() / total_w;
+    let var: f64 = values.iter().zip(weights).map(|(&v, &w)| w * (v - mean) * (v - mean)).sum::<f64>() / total_w;
+    var.max(0.0)
 }
 
 /// Compute parameter importances for a study.
@@ -1139,13 +1549,16 @@ mod tests {
     #[test]
     fn test_fanova_evaluator_basic() {
         let evaluator = FanovaEvaluator::default();
-        assert_eq!(evaluator.n_bins, 16);
+        assert_eq!(evaluator.n_trees, 64);
+        assert_eq!(evaluator.max_depth, 64);
     }
 
     #[test]
-    fn test_fanova_evaluator_custom_bins() {
-        let evaluator = FanovaEvaluator::new(8);
-        assert_eq!(evaluator.n_bins, 8);
+    fn test_fanova_evaluator_custom() {
+        let evaluator = FanovaEvaluator::new(32, 16, Some(123));
+        assert_eq!(evaluator.n_trees, 32);
+        assert_eq!(evaluator.max_depth, 16);
+        assert_eq!(evaluator.seed, Some(123));
     }
 
     #[test]
@@ -1247,26 +1660,64 @@ mod tests {
     }
 
     #[test]
-    fn test_between_group_variance_identical() {
-        // All same param value => zero importance
-        let pairs = vec![(1.0, 2.0), (1.0, 3.0), (1.0, 4.0)];
-        let v = between_group_variance(&pairs, 8, 3.0);
-        assert!((v - 0.0).abs() < 1e-14);
+    fn test_fanova_flatten_tree() {
+        // 构造一个简单的树: root splits on feat 0 at 0.5, left=1.0, right=2.0
+        let tree = TreeNode::Internal {
+            feature: 0,
+            _threshold: 0.5,
+            left: Box::new(TreeNode::Leaf { _value: 1.0, _n_samples: 5 }),
+            right: Box::new(TreeNode::Leaf { _value: 2.0, _n_samples: 5 }),
+            impurity_decrease: 0.0,
+            _n_samples: 10,
+        };
+        let flat = flatten_tree(&tree);
+        assert_eq!(flat.len(), 3);
+        assert_eq!(flat[0].feature, 0);
+        assert!(flat[0].threshold == 0.5);
+        assert_eq!(flat[1].feature, -1); // leaf
+        assert!(flat[1].value == 1.0);
+        assert_eq!(flat[2].feature, -1); // leaf
+        assert!(flat[2].value == 2.0);
     }
 
     #[test]
-    fn test_between_group_variance_distinct() {
-        // Two clearly separated groups
-        let mut pairs = Vec::new();
-        for _ in 0..10 {
-            pairs.push((0.0, 1.0)); // group 1: low param, low obj
-        }
-        for _ in 0..10 {
-            pairs.push((10.0, 100.0)); // group 2: high param, high obj
-        }
-        let global_mean = 50.5;
-        let v = between_group_variance(&pairs, 8, global_mean);
-        assert!(v > 0.0, "variance should be positive for distinct groups");
+    fn test_fanova_tree_variance() {
+        let tree = TreeNode::Internal {
+            feature: 0,
+            _threshold: 0.5,
+            left: Box::new(TreeNode::Leaf { _value: 1.0, _n_samples: 5 }),
+            right: Box::new(TreeNode::Leaf { _value: 3.0, _n_samples: 5 }),
+            impurity_decrease: 0.0,
+            _n_samples: 10,
+        };
+        let flat = flatten_tree(&tree);
+        let search_spaces = vec![[0.0, 1.0]];
+        let ftree = FanovaTree::new(&flat, &search_spaces);
+
+        let v = ftree.variance();
+        assert!(v > 0.0, "variance of [1.0, 3.0] leaves should be positive");
+    }
+
+    #[test]
+    fn test_fanova_marginal_variance_single_feature() {
+        // 单特征树: 分裂在 feature 0, 两个叶子相差很大
+        let tree = TreeNode::Internal {
+            feature: 0,
+            _threshold: 0.5,
+            left: Box::new(TreeNode::Leaf { _value: 0.0, _n_samples: 5 }),
+            right: Box::new(TreeNode::Leaf { _value: 10.0, _n_samples: 5 }),
+            impurity_decrease: 0.0,
+            _n_samples: 10,
+        };
+        let flat = flatten_tree(&tree);
+        let search_spaces = vec![[0.0, 1.0]];
+        let ftree = FanovaTree::new(&flat, &search_spaces);
+
+        let mv = ftree.get_marginal_variance(&[0]);
+        let tv = ftree.variance();
+        // 单特征时，marginal variance 应该接近 total variance
+        assert!((mv - tv).abs() / (tv + 1e-14) < 0.01,
+            "marginal variance should equal total variance for single feature tree");
     }
 
     #[test]

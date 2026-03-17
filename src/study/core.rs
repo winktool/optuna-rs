@@ -340,14 +340,17 @@ impl Study {
         let trial = self.storage.get_trial(trial_id)?;
         let all_trials = self.storage.get_all_trials(self.study_id, None)?;
 
+        // 对齐 Python _filter_study: Hyperband 时只传同括号试验给采样器
+        let filtered_trials = self.pruner.filter_trials(&all_trials, &trial);
+
         // Run sampler hooks
-        self.sampler.before_trial(&all_trials);
+        self.sampler.before_trial(&filtered_trials);
 
         // Determine search space: fixed_distributions override sampler's relative space
         let search_space = if let Some(fixed) = fixed_distributions {
             fixed.clone()
         } else {
-            self.sampler.infer_relative_search_space(&all_trials)
+            self.sampler.infer_relative_search_space(&filtered_trials)
         };
 
         // Sample relative params
@@ -361,7 +364,7 @@ impl Study {
 
         let mut relative_params = if !search_space.is_empty() {
             self.sampler
-                .sample_relative(&all_trials, &search_space)?
+                .sample_relative(&filtered_trials, &search_space)?
         } else {
             HashMap::new()
         };
@@ -372,7 +375,8 @@ impl Study {
             for (name, dist) in fixed {
                 if !relative_params.contains_key(name) {
                     let all_trials = self.storage.get_all_trials(self.study_id, None)?;
-                    let v = self.sampler.sample_independent(&all_trials, &trial, name, dist)?;
+                    let filtered = self.pruner.filter_trials(&all_trials, &trial);
+                    let v = self.sampler.sample_independent(&filtered, &trial, name, dist)?;
                     relative_params.insert(name.clone(), v);
                 }
             }
@@ -541,7 +545,8 @@ impl Study {
         //    即使 after_trial 失败，也必须写入试验最终状态。
         let all_trials = self.storage.get_all_trials(self.study_id, None)?;
 
-        // 对齐 Python _process_constraints_after_trial:
+        // 对齐 Python _filter_study: Hyperband 时只传同括号试验给 after_trial
+        let filtered_trials = self.pruner.filter_trials(&all_trials, &frozen);
         // 计算约束值并存储到 trial.system_attrs（在 after_trial 之前）
         if let Some(constraints) = self.sampler.compute_constraints(&frozen, state) {
             let _ = self.storage.set_trial_system_attr(
@@ -554,7 +559,7 @@ impl Study {
         // 对齐 Python try/finally: 无论 after_trial 是否出错，都写入最终状态
         let after_trial_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             self.sampler.after_trial(
-                &all_trials,
+                &filtered_trials,
                 &frozen,
                 state,
                 final_values.as_deref(),

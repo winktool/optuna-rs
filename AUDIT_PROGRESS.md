@@ -390,3 +390,111 @@
 | 🟡 低 | Wilcoxon 精确分布表 | 小样本精确分布缺失 |
 | 🟡 低 | BaseTrial trait | Trial/FrozenTrial/FixedTrial 统一接口 |
 | 🟡 低 | Hyperband _filter_study | after_trial 不经过 _filter_study 过滤 |
+
+---
+
+## Session 41 — fANOVA 方差分解 + Wilcoxon 精确分布 + BaseTrial trait + Hyperband _filter_study
+
+### 已完成修复（全部 4 项低优先级待修复清零）
+
+#### 1. fANOVA 真正方差分解（importance.rs）
+- **FanovaEvaluator 重写**: 从简单分箱方差改为真正的随机森林 + 树方差分解
+  - 参数: `n_bins: usize` → `n_trees: usize, max_depth: usize, seed: Option<u64>`
+  - 默认: `n_trees=64, max_depth=64, seed=None`
+  - `evaluate()` 对每棵树: bootstrap → `build_tree()` → `flatten_tree()` → `FanovaTree::new()` → `marginal_variance / total_variance`
+  - 平均所有树的方差分解结果
+- **FanovaTree 完整实现**（~300 行，对齐 Python `_fanova._tree._FanovaTree`）:
+  - `FlatNode` 数组式树节点布局
+  - `flatten_tree()` 递归 TreeNode → 数组式布局
+  - `precompute_statistics()` 前向传播搜索空间 + 后向汇总叶子值/权重
+  - `precompute_split_midpoints_and_sizes()` 收集分裂阈值、加入边界、计算中点和区间大小
+  - `precompute_subtree_active_features()` 后向传播特征活跃位图
+  - `variance()` 叶子节点加权方差
+  - `get_marginal_variance(features)` 笛卡尔积遍历中点、边际化统计
+  - `get_marginalized_statistics(sample)` 树遍历：活跃维度沿路径走、非活跃维度积分掉
+  - `weighted_variance()` 辅助函数
+- 删除旧 `between_group_variance()` 函数（不再使用）
+
+#### 2. Wilcoxon 精确分布表（pruners/wilcoxon.rs）
+- **`wilcoxon_exact_pmf(n)`**: DP 算法匹配 scipy `_get_wilcoxon_distr`
+  - 枚举所有 2^n 符号分配，O(n²) 空间
+  - `n ≤ 50` 无系无零差值时使用精确分布
+- **自动方法选择**: 检测 ties/zeros，有则回退正态近似
+- **修正正态近似**: 移除错误的连续性修正（Python optuna 使用 `correction=False`）
+- 小样本精度大幅提升: n=3 误差从 56% 降至精确 0
+
+#### 3. BaseTrial trait（trial/base.rs — 新文件）
+- **BaseTrial trait**: 11 个方法统一 Trial/FrozenTrial/FixedTrial 接口
+  - `suggest_float`, `suggest_int`, `suggest_categorical`
+  - `report`, `should_prune`, `set_user_attr`
+  - `number`, `params`, `distributions`, `user_attrs`, `datetime_start`
+- **impl for Trial**: 委托给 inherent 方法，处理 Result 返回类型
+- **impl for FrozenTrial**: no-op report/should_prune 包装在 Ok()
+- **impl for FixedTrial**: 同 FrozenTrial 模式
+- 导出: `pub use trial::BaseTrial`
+
+#### 4. Hyperband _filter_study（pruners/mod.rs + hyperband.rs + study/core.rs + trial/handle.rs）
+- **Pruner trait 扩展**: 添加 `filter_trials(&self, trials: &[FrozenTrial], trial: &FrozenTrial) -> Vec<FrozenTrial>`，默认返回全部 trials
+- **HyperbandPruner**: 覆写 `filter_trials()`，只返回相同 bracket 的 trials（读取 `hyperband:bracket_id` 系统属性）
+- **Study::ask()**: 用 `filter_trials` 过滤后传给 `before_trial`、`infer_relative_search_space`、`sample_relative`、`sample_independent`
+- **Study::tell_with_options()**: 用 `filter_trials` 过滤后传给 `after_trial`
+- **Trial::suggest()**: independent sampling fallback 也经过 `filter_trials`
+
+### 新增测试
+
+#### Rust 单元测试 (+5 个新增, 2 个旧测试替换)
+| 文件 | 测试名 | 描述 |
+|------|--------|------|
+| importance.rs | test_fanova_evaluator_basic | n_trees=64, max_depth=64 |
+| importance.rs | test_fanova_evaluator_custom | 自定义参数 |
+| importance.rs | test_fanova_flatten_tree | 递归→数组转换 |
+| importance.rs | test_fanova_tree_variance | 叶子加权方差 |
+| importance.rs | test_fanova_marginal_variance_single_feature | 单特征边际方差 ≈ 总方差 |
+| wilcoxon.rs | test_wilcoxon_exact_pmf_n1 | PMF n=1 |
+| wilcoxon.rs | test_wilcoxon_exact_pmf_n3 | PMF n=3 |
+| wilcoxon.rs | test_wilcoxon_exact_pmf_n5 | PMF n=5 |
+| wilcoxon.rs | test_exact_vs_scipy_n5 | 精确 vs scipy n=5 |
+| wilcoxon.rs | test_exact_vs_scipy_n3_all_positive | 精确 vs scipy n=3 |
+| wilcoxon.rs | test_exact_small_n_accuracy | 小样本精度验证 |
+
+#### Python 交叉验证测试 (+3 个)
+| 测试名 | 描述 |
+|--------|------|
+| test_fanova_importance_ranking | fANOVA x>>y 排序对齐 |
+| test_fanova_three_params | fANOVA x>y>z 排序对齐 |
+| test_wilcoxon_exact_small_n | 精确 p-value=0.125 对齐 |
+
+### 测试统计
+
+| 指标 | 数值 |
+|------|------|
+| Rust 测试总数 | 775 (770 unit + 5 doc) |
+| Python 交叉验证 | 149 |
+| 本次新增 Rust | +2 (净: 5 新增 - 2 删除旧 between_group + 6 wilcoxon 重新计入) |
+| 本次新增 Python | +3 |
+| 修改文件数 | 12 |
+
+### 修改文件清单
+
+| 文件 | 修改内容 |
+|------|---------|
+| src/importance.rs | FanovaEvaluator 重写, FanovaTree 完整实现, 删除 between_group_variance |
+| src/pruners/wilcoxon.rs | wilcoxon_exact_pmf, 自动方法选择, 移除连续性修正, 6 个新测试 |
+| src/pruners/mod.rs | Pruner trait 添加 filter_trials() |
+| src/pruners/hyperband.rs | HyperbandPruner 实现 filter_trials() |
+| src/study/core.rs | ask() 和 tell_with_options() 使用 filter_trials |
+| src/trial/handle.rs | suggest() 使用 filter_trials, BaseTrial impl for Trial |
+| src/trial/base.rs | (新) BaseTrial trait 定义 |
+| src/trial/mod.rs | 添加 mod base, pub use BaseTrial |
+| src/trial/frozen.rs | BaseTrial impl for FrozenTrial |
+| src/trial/fixed.rs | BaseTrial impl for FixedTrial |
+| src/lib.rs | 导出 BaseTrial |
+| tests/test_cross_validation.py | 3 个新 Python 测试 |
+
+### 待修复项
+
+**全部低优先级项已清零。** 剩余待修复项:
+
+| 优先级 | 项目 | 说明 |
+|--------|------|------|
+| 🟠 中 | Heartbeat 功能 | 分布式试验心跳检测 |

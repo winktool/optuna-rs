@@ -37,6 +37,15 @@ pub trait Pruner: Send + Sync {
         trial: &FrozenTrial,
         storage: Option<&dyn Storage>,
     ) -> Result<bool>;
+
+    /// 对齐 Python `_filter_study`: 为采样器过滤试验列表。
+    ///
+    /// 默认返回所有试验（无过滤）。HyperbandPruner 覆盖此方法，
+    /// 仅返回与指定试验同一括号的试验，使采样器只看到同括号数据。
+    fn filter_trials(&self, trials: &[FrozenTrial], trial: &FrozenTrial) -> Vec<FrozenTrial> {
+        let _ = trial;
+        trials.to_vec()
+    }
 }
 
 /// 检查当前步骤是否是剪枝检查间隔中的第一个步骤。

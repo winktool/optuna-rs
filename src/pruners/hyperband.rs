@@ -238,6 +238,35 @@ impl Pruner for HyperbandPruner {
         // 委托给对应括号的 SuccessiveHalvingPruner
         inner.pruners[bracket_id].prune(&bracket_trials, trial, storage)
     }
+
+    /// 对齐 Python `_filter_study` / `_create_bracket_study`:
+    /// 仅返回与给定试验同一括号的试验。
+    fn filter_trials(&self, trials: &[FrozenTrial], trial: &FrozenTrial) -> Vec<FrozenTrial> {
+        let inner = self.inner.lock().unwrap();
+        if inner.trial_allocation_budgets.is_empty() {
+            // 尚未初始化 → 返回全部（无法过滤）
+            return trials.to_vec();
+        }
+
+        let bracket_id = self.get_bracket_id(
+            trial.number,
+            &self.study_name,
+            &inner.trial_allocation_budgets,
+        );
+
+        trials
+            .iter()
+            .filter(|t| {
+                let t_bracket = self.get_bracket_id(
+                    t.number,
+                    &self.study_name,
+                    &inner.trial_allocation_budgets,
+                );
+                t_bracket == bracket_id
+            })
+            .cloned()
+            .collect()
+    }
 }
 
 #[cfg(test)]

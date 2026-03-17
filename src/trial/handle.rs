@@ -280,13 +280,16 @@ impl Trial {
                 v
             } else {
                 let all_trials = self.storage.get_all_trials(self.study_id, None)?;
-                self.sampler.sample_independent(&all_trials, &self.cached_trial, name, dist)?
+                let filtered = self.pruner.filter_trials(&all_trials, &self.cached_trial);
+                self.sampler.sample_independent(&filtered, &self.cached_trial, name, dist)?
             }
         } else {
             // Fall back to independent sampling
             // 获取所有历史试验供采样器参考（对齐 Python study._get_trials）
             let all_trials = self.storage.get_all_trials(self.study_id, None)?;
-            self.sampler.sample_independent(&all_trials, &self.cached_trial, name, dist)?
+            // 对齐 Python _filter_study: Hyperband 时只传同括号试验
+            let filtered = self.pruner.filter_trials(&all_trials, &self.cached_trial);
+            self.sampler.sample_independent(&filtered, &self.cached_trial, name, dist)?
         };
 
         // Record the param in storage
@@ -410,6 +413,52 @@ impl Trial {
     /// 对应 Python 从 trial system attrs 读取 fixed_params 的可见语义。
     pub fn fixed_params(&self) -> HashMap<String, ParamValue> {
         self.fixed_params.clone()
+    }
+}
+
+impl crate::trial::BaseTrial for Trial {
+    fn suggest_float(&mut self, name: &str, low: f64, high: f64, step: Option<f64>, log: bool) -> Result<f64> {
+        self.suggest_float(name, low, high, log, step)
+    }
+
+    fn suggest_int(&mut self, name: &str, low: i64, high: i64, step: i64, log: bool) -> Result<i64> {
+        self.suggest_int(name, low, high, log, step)
+    }
+
+    fn suggest_categorical(&mut self, name: &str, choices: Vec<CategoricalChoice>) -> Result<CategoricalChoice> {
+        self.suggest_categorical(name, choices)
+    }
+
+    fn report(&mut self, value: f64, step: i64) -> Result<()> {
+        self.report(value, step)
+    }
+
+    fn should_prune(&self) -> Result<bool> {
+        self.should_prune()
+    }
+
+    fn set_user_attr(&mut self, key: &str, value: serde_json::Value) -> Result<()> {
+        Trial::set_user_attr(self, key, value)
+    }
+
+    fn number(&self) -> i64 {
+        self.number()
+    }
+
+    fn params(&self) -> HashMap<String, ParamValue> {
+        self.params()
+    }
+
+    fn distributions(&self) -> HashMap<String, Distribution> {
+        self.distributions()
+    }
+
+    fn user_attrs(&self) -> Result<HashMap<String, serde_json::Value>> {
+        self.user_attrs()
+    }
+
+    fn datetime_start(&self) -> Option<chrono::DateTime<chrono::Utc>> {
+        self.datetime_start().unwrap_or(None)
     }
 }
 

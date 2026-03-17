@@ -2614,6 +2614,107 @@ def test_journal_duplicate_running_rejection():
     finally:
         os.unlink(path)
 
+
+def test_journal_python_flat_format_no_data_wrapper():
+    """对齐: Python JournalStorage 写入的日志应该是扁平格式（无 data 包裹）"""
+    import optuna
+    import json
+    import tempfile, os
+
+    with tempfile.NamedTemporaryFile(suffix=".log", delete=False) as f:
+        path = f.name
+
+    try:
+        # Python 写入日志
+        backend = optuna.storages.JournalFileStorage(path)
+        storage = optuna.storages.JournalStorage(backend)
+        study = optuna.create_study(storage=storage, study_name="flat_check",
+                                     direction="minimize")
+        study.set_user_attr("py_key", "py_value")
+        trial = study.ask()
+        trial.suggest_float("x", 0.0, 1.0)
+        trial.report(0.5, step=0)
+        study.tell(trial, 0.42)
+
+        # 验证每一行日志都是扁平格式
+        with open(path) as f:
+            for i, line in enumerate(f):
+                line = line.strip()
+                if not line:
+                    continue
+                entry = json.loads(line)
+                assert "data" not in entry, f"Line {i}: Python log should be flat (no 'data' key), got: {list(entry.keys())}"
+                assert "op_code" in entry, f"Line {i}: missing op_code"
+                assert "worker_id" in entry, f"Line {i}: missing worker_id"
+    finally:
+        os.unlink(path)
+
+
+def test_journal_interop_python_write_rust_format_read():
+    """对齐: Python 能正确读取严格 Python 扁平格式的日志"""
+    import optuna
+    import json
+    import tempfile, os
+
+    with tempfile.NamedTemporaryFile(suffix=".log", delete=False) as f:
+        path = f.name
+
+    try:
+        # 构造 Python 扁平格式日志
+        with open(path, "w") as f:
+            # Python 扁平格式: create study
+            f.write(json.dumps({
+                "op_code": 0, "worker_id": "py-1",
+                "study_name": "mixed_test", "directions": [1]
+            }) + "\n")
+            # Python 扁平格式: set study user attr (from_python)
+            f.write(json.dumps({
+                "op_code": 2, "worker_id": "py-1",
+                "study_id": 0, "user_attr": {"from_python": "flat"}
+            }) + "\n")
+            # Python 扁平格式: set study user attr (from_rust — 新扁平格式)
+            f.write(json.dumps({
+                "op_code": 2, "worker_id": "rust:0",
+                "study_id": 0, "user_attr": {"from_rust": "new_flat"}
+            }) + "\n")
+            # Python 扁平格式: create trial
+            f.write(json.dumps({
+                "op_code": 4, "worker_id": "py-1", "study_id": 0,
+                "datetime_start": "2024-01-01T00:00:00.000000"
+            }) + "\n")
+            # Python 扁平格式: set intermediate value
+            f.write(json.dumps({
+                "op_code": 7, "worker_id": "py-1", "trial_id": 0,
+                "step": 0, "intermediate_value": 0.95
+            }) + "\n")
+            # Python 扁平格式: complete trial
+            f.write(json.dumps({
+                "op_code": 6, "worker_id": "py-1", "trial_id": 0,
+                "state": 1, "values": [0.42],
+                "datetime_complete": "2024-01-01T00:01:00.000000"
+            }) + "\n")
+
+        # Python 应能读取扁平格式日志
+        storage = optuna.storages.JournalStorage(
+            optuna.storages.JournalFileStorage(path)
+        )
+        study = optuna.load_study(storage=storage, study_name="mixed_test")
+
+        # 验证 study attrs
+        assert study.user_attrs.get("from_python") == "flat", \
+            f"Should read Python flat attrs, got: {study.user_attrs}"
+        assert study.user_attrs.get("from_rust") == "new_flat", \
+            f"Should read Rust new flat attrs, got: {study.user_attrs}"
+
+        # 验证 trial
+        trials = study.trials
+        assert len(trials) == 1
+        assert trials[0].state == optuna.trial.TrialState.COMPLETE
+        assert trials[0].values == [0.42]
+    finally:
+        os.unlink(path)
+
+
 # ═══════════════════════════════════════════════════════════════════════════
 #  执行
 # ═══════════════════════════════════════════════════════════════════════════

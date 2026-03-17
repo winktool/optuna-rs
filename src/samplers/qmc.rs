@@ -207,53 +207,12 @@ fn halton_point(index: u64, dim: usize, scramble: bool, seed: u64) -> Vec<f64> {
 // Sobol' 序列生成器
 // ════════════════════════════════════════════════════════════════════════
 
-/// Sobol' 序列方向数（前 20 维的初始化参数）。
-/// 使用 Joe-Kuo 方向数（简化版本）。
+/// Sobol' 序列方向数（1000 维）。
+/// 使用 Joe-Kuo 方向数，从 scipy new-joe-kuo-6.21201 (D(6) 搜索准则) 提取。
+/// 与 scipy.stats.qmc.Sobol 使用完全相同的数据源。
 /// Sobol' 参数表：(s = 原始多项式的阶数, a = 多项式系数, 初始方向数 m_i[])
-/// 来源: new-joe-kuo-6.21201 (D(6) 搜索准则)，与 scipy.stats.qmc.Sobol 一致
 /// 维度 0 使用 Van der Corput 序列 (s=0, a=0)
-const SOBOL_PARAMS: [(usize, u64, [u64; 13]); 20] = [
-    // dim 0: Van der Corput (base 2)
-    (0, 0, [1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]),
-    // dim 1 (JK d=2): s=1, a=0, poly=x+1
-    (1, 0, [1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]),
-    // dim 2 (JK d=3): s=2, a=1, poly=x²+x+1
-    (2, 1, [1, 3, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]),
-    // dim 3 (JK d=4): s=3, a=1, poly=x³+x+1
-    (3, 1, [1, 3, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]),
-    // dim 4 (JK d=5): s=3, a=2, poly=x³+x²+1
-    (3, 2, [1, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]),
-    // dim 5 (JK d=6): s=4, a=1, poly=x⁴+x+1
-    (4, 1, [1, 1, 3, 3, 0, 0, 0, 0, 0, 0, 0, 0, 0]),
-    // dim 6 (JK d=7): s=4, a=4, poly=x⁴+x³+1
-    (4, 4, [1, 3, 5, 13, 0, 0, 0, 0, 0, 0, 0, 0, 0]),
-    // dim 7 (JK d=8): s=5, a=2, poly=x⁵+x²+1
-    (5, 2, [1, 1, 5, 5, 17, 0, 0, 0, 0, 0, 0, 0, 0]),
-    // dim 8 (JK d=9): s=5, a=4, poly=x⁵+x³+1
-    (5, 4, [1, 1, 5, 5, 5, 0, 0, 0, 0, 0, 0, 0, 0]),
-    // dim 9 (JK d=10): s=5, a=7, poly=x⁵+x³+x²+x+1
-    (5, 7, [1, 1, 7, 11, 19, 0, 0, 0, 0, 0, 0, 0, 0]),
-    // dim 10 (JK d=11): s=5, a=11, poly=x⁵+x⁴+x²+x+1
-    (5, 11, [1, 1, 5, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0]),
-    // dim 11 (JK d=12): s=5, a=13, poly=x⁵+x⁴+x³+x+1
-    (5, 13, [1, 1, 1, 3, 11, 0, 0, 0, 0, 0, 0, 0, 0]),
-    // dim 12 (JK d=13): s=5, a=14, poly=x⁵+x⁴+x³+x²+1
-    (5, 14, [1, 3, 5, 5, 31, 0, 0, 0, 0, 0, 0, 0, 0]),
-    // dim 13 (JK d=14): s=6, a=1, poly=x⁶+x+1
-    (6, 1, [1, 3, 3, 9, 7, 49, 0, 0, 0, 0, 0, 0, 0]),
-    // dim 14 (JK d=15): s=6, a=13, poly=x⁶+x⁴+x³+x+1
-    (6, 13, [1, 1, 1, 15, 21, 21, 0, 0, 0, 0, 0, 0, 0]),
-    // dim 15 (JK d=16): s=6, a=16, poly=x⁶+x⁵+1
-    (6, 16, [1, 3, 1, 13, 27, 49, 0, 0, 0, 0, 0, 0, 0]),
-    // dim 16 (JK d=17): s=6, a=19, poly=x⁶+x⁵+x²+x+1
-    (6, 19, [1, 1, 1, 15, 7, 5, 0, 0, 0, 0, 0, 0, 0]),
-    // dim 17 (JK d=18): s=6, a=22, poly=x⁶+x⁵+x³+x²+1
-    (6, 22, [1, 3, 1, 15, 13, 25, 0, 0, 0, 0, 0, 0, 0]),
-    // dim 18 (JK d=19): s=6, a=25, poly=x⁶+x⁵+x⁴+x+1
-    (6, 25, [1, 1, 5, 5, 19, 61, 0, 0, 0, 0, 0, 0, 0]),
-    // dim 19 (JK d=20): s=7, a=1, poly=x⁷+x+1
-    (7, 1, [1, 3, 7, 11, 23, 15, 103, 0, 0, 0, 0, 0, 0]),
-];
+include!("sobol_direction_numbers.rs");
 
 /// 生成 Sobol' 序列的第 index 个点（灰码实现）。
 ///
@@ -286,10 +245,14 @@ fn sobol_point(index: u64, dim: usize, scramble: bool, seed: u64) -> Vec<f64> {
                     }
                 }
             } else {
-                // 高维回退: 使用种子驱动的伪 Sobol
+                // 高维回退: 维度超出方向数表 (1000维)
+                // 使用确定性哈希生成 — 质量低于真正的 Sobol 但保证确定性
+                use std::collections::hash_map::DefaultHasher;
+                use std::hash::{Hash, Hasher};
                 for i in 0..bits as usize {
-                    v[i] = (seed.wrapping_add(d as u64).wrapping_mul(2654435761).wrapping_add(i as u64))
-                        | (1u64 << (bits as usize - 1 - i));
+                    let mut hasher = DefaultHasher::new();
+                    (seed, d as u64, i as u64).hash(&mut hasher);
+                    v[i] = hasher.finish() | (1u64 << (bits as usize - 1 - i));
                 }
             }
 

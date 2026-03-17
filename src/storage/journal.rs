@@ -56,19 +56,77 @@ pub enum JournalOp {
 }
 
 /// 单条日志记录
-#[derive(Debug, Clone, Serialize, Deserialize)]
+///
+/// 对齐 Python: 序列化为扁平格式（所有字段在同一层级），
+/// 反序列化同时支持扁平格式（Python）和嵌套格式（旧 Rust `data` 包裹）。
+#[derive(Debug, Clone)]
 pub struct JournalLogEntry {
     /// 操作类型
     pub op_code: i32,
     /// 关联的 study_id
-    #[serde(skip_serializing_if = "Option::is_none")]
     pub study_id: Option<i64>,
     /// 关联的 trial_id
-    #[serde(skip_serializing_if = "Option::is_none")]
     pub trial_id: Option<i64>,
     /// 通用数据载荷（JSON）
-    #[serde(default)]
     pub data: serde_json::Value,
+}
+
+// 对齐 Python: 扁平序列化 — 与 Python JournalStorage 日志格式完全兼容
+impl Serialize for JournalLogEntry {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error> {
+        use serde::ser::SerializeMap;
+        let data_fields = self.data.as_object();
+        let mut count = 2; // op_code + worker_id
+        if self.study_id.is_some() { count += 1; }
+        if self.trial_id.is_some() { count += 1; }
+        if let Some(obj) = data_fields { count += obj.len(); }
+
+        let mut map = serializer.serialize_map(Some(count))?;
+        map.serialize_entry("op_code", &self.op_code)?;
+        map.serialize_entry("worker_id", "rust:0")?;
+        if let Some(sid) = &self.study_id {
+            map.serialize_entry("study_id", sid)?;
+        }
+        if let Some(tid) = &self.trial_id {
+            map.serialize_entry("trial_id", tid)?;
+        }
+        if let Some(obj) = data_fields {
+            for (k, v) in obj {
+                map.serialize_entry(k, v)?;
+            }
+        }
+        map.end()
+    }
+}
+
+// 对齐 Python: 反序列化同时支持扁平（Python）和嵌套（旧 Rust）格式
+impl<'de> Deserialize<'de> for JournalLogEntry {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> std::result::Result<Self, D::Error> {
+        let map: serde_json::Map<String, serde_json::Value> =
+            serde_json::Map::deserialize(deserializer)?;
+
+        let op_code = map.get("op_code")
+            .and_then(|v| v.as_i64())
+            .unwrap_or(0) as i32;
+        let study_id = map.get("study_id").and_then(|v| v.as_i64());
+        let trial_id = map.get("trial_id").and_then(|v| v.as_i64());
+
+        // 兼容旧 Rust 嵌套格式: {"data": {...}} 和 Python 扁平格式
+        let data = if let Some(data_val) = map.get("data") {
+            data_val.clone()
+        } else {
+            let mut data_map = serde_json::Map::new();
+            for (k, v) in &map {
+                match k.as_str() {
+                    "op_code" | "study_id" | "trial_id" | "worker_id" => continue,
+                    _ => { data_map.insert(k.clone(), v.clone()); }
+                }
+            }
+            serde_json::Value::Object(data_map)
+        };
+
+        Ok(JournalLogEntry { op_code, study_id, trial_id, data })
+    }
 }
 
 // ════════════════════════════════════════════════════════════════════════
@@ -458,9 +516,13 @@ impl JournalState {
     fn replay_set_trial_intermediate_value(&mut self, entry: &JournalLogEntry) -> Result<()> {
         if let Some(tid) = entry.trial_id {
             if let Some(trial) = self.trials.get_mut(&tid) {
+                // 对齐 Python: 键名为 "intermediate_value"，同时兼容旧 Rust 的 "value"
+                let value = entry.data.get("intermediate_value")
+                    .or_else(|| entry.data.get("value"))
+                    .and_then(|v| v.as_f64());
                 if let (Some(step), Some(value)) = (
                     entry.data.get("step").and_then(|v| v.as_i64()),
-                    entry.data.get("value").and_then(|v| v.as_f64()),
+                    value,
                 ) {
                     trial.intermediate_values.insert(step, value);
                 }
@@ -881,13 +943,14 @@ impl Storage for JournalStorage {
         step: i64,
         intermediate_value: f64,
     ) -> Result<()> {
+        // 对齐 Python: 使用 "intermediate_value" 键名
         self.write_log(&JournalLogEntry {
             op_code: 7,
             study_id: None,
             trial_id: Some(trial_id),
             data: serde_json::json!({
                 "step": step,
-                "value": intermediate_value,
+                "intermediate_value": intermediate_value,
             }),
         })
     }
@@ -1407,11 +1470,12 @@ impl Storage for JournalFileStorage {
                     format!("trial {} not found", trial_id)))?
         };
 
+        // 对齐 Python: 使用 "intermediate_value" 键名
         let entry = JournalLogEntry {
             op_code: 7,
             study_id: Some(study_id),
             trial_id: Some(trial_id),
-            data: serde_json::json!({"step": step, "value": intermediate_value}),
+            data: serde_json::json!({"step": step, "intermediate_value": intermediate_value}),
         };
         self.append_log(&entry)
     }
@@ -1944,6 +2008,105 @@ mod tests {
         assert!(t.datetime_start.is_some());
         assert!(t.datetime_complete.is_some());
 
+        fs::remove_file(&path).ok();
+    }
+
+    // ── 对齐 Python: 验证序列化输出为扁平格式（无 data 包裹） ───────
+
+    #[test]
+    fn test_journal_serializes_flat_format() {
+        let entry = JournalLogEntry {
+            op_code: 0,
+            study_id: None,
+            trial_id: None,
+            data: serde_json::json!({"study_name": "flat", "directions": [1]}),
+        };
+        let json = serde_json::to_string(&entry).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
+        // 应无 "data" 字段
+        assert!(parsed.get("data").is_none(), "should not have nested 'data' field");
+        // 字段应在顶层
+        assert_eq!(parsed["op_code"], 0);
+        assert_eq!(parsed["study_name"], "flat");
+        assert_eq!(parsed["worker_id"], "rust:0");
+    }
+
+    // ── 对齐 Python: 反序列化支持 Python 扁平格式 ──────────────────
+
+    #[test]
+    fn test_journal_deserialize_python_flat_format() {
+        // 模拟 Python 写入的扁平日志行（无 data 包裹）
+        let json = r#"{"op_code":0,"worker_id":"abc-123","study_name":"py_flat","directions":[1]}"#;
+        let entry: JournalLogEntry = serde_json::from_str(json).unwrap();
+        assert_eq!(entry.op_code, 0);
+        assert!(entry.study_id.is_none());
+        assert_eq!(entry.data.get("study_name").unwrap(), "py_flat");
+        assert!(entry.data.get("worker_id").is_none(), "worker_id should not be in data");
+    }
+
+    // ── 对齐 Python: Python 扁平日志完整端到端测试 ─────────────────
+
+    #[test]
+    fn test_journal_replay_python_flat_log_end_to_end() {
+        let path = temp_path();
+        // 模拟 Python 实际输出的扁平日志格式（无 data 包裹，有 worker_id）
+        {
+            let mut f = File::create(&path).unwrap();
+            writeln!(f, r#"{{"op_code":0,"worker_id":"uuid-1","study_name":"flat_e2e","directions":[1]}}"#).unwrap();
+            writeln!(f, r#"{{"op_code":2,"worker_id":"uuid-1","study_id":0,"user_attr":{{"my_key":"my_val"}}}}"#).unwrap();
+            writeln!(f, r#"{{"op_code":4,"worker_id":"uuid-1","study_id":0,"datetime_start":"2024-06-01T12:00:00.000000"}}"#).unwrap();
+            writeln!(f, r#"{{"op_code":5,"worker_id":"uuid-1","trial_id":0,"param_name":"lr","param_value_internal":0.01,"distribution":"{{\"name\":\"FloatDistribution\",\"attributes\":{{\"low\":0.001,\"high\":1.0,\"log\":true,\"step\":null}}}}"}}"#).unwrap();
+            writeln!(f, r#"{{"op_code":7,"worker_id":"uuid-1","trial_id":0,"step":0,"intermediate_value":0.95}}"#).unwrap();
+            writeln!(f, r#"{{"op_code":6,"worker_id":"uuid-1","trial_id":0,"state":1,"values":[0.85],"datetime_complete":"2024-06-01T12:01:00.000000"}}"#).unwrap();
+            writeln!(f, r#"{{"op_code":8,"worker_id":"uuid-1","trial_id":0,"user_attr":{{"note":"good"}}}}"#).unwrap();
+        }
+
+        let storage = JournalFileStorage::new(&path).unwrap();
+        let sid = storage.get_study_id_from_name("flat_e2e").unwrap();
+
+        let study_ua = storage.get_study_user_attrs(sid).unwrap();
+        assert_eq!(study_ua["my_key"], serde_json::json!("my_val"));
+
+        let trials = storage.get_all_trials(sid, None).unwrap();
+        assert_eq!(trials.len(), 1);
+        let t = &trials[0];
+        assert_eq!(t.state, TrialState::Complete);
+        assert_eq!(t.values.as_ref().unwrap(), &[0.85]);
+        assert!(t.params.contains_key("lr"));
+        assert!(t.distributions.contains_key("lr"));
+        assert_eq!(t.intermediate_values[&0], 0.95);
+        assert_eq!(t.user_attrs["note"], serde_json::json!("good"));
+        assert!(t.datetime_start.is_some());
+        assert!(t.datetime_complete.is_some());
+        fs::remove_file(&path).ok();
+    }
+
+    // ── 对齐 Python: Rust 写入后 replay 扁平格式正确 ──────────────
+
+    #[test]
+    fn test_journal_rust_write_replay_flat() {
+        let path = temp_path();
+        {
+            let storage = JournalFileStorage::new(&path).unwrap();
+            let sid = storage.create_new_study(&[StudyDirection::Minimize], Some("flat_rw")).unwrap();
+            let tid = storage.create_new_trial(sid, None).unwrap();
+            storage.set_trial_intermediate_value(tid, 0, 0.5).unwrap();
+            storage.set_trial_state_values(tid, TrialState::Complete, Some(&[1.0])).unwrap();
+        }
+
+        // 验证文件内容是扁平格式
+        let content = fs::read_to_string(&path).unwrap();
+        assert!(!content.contains("\"data\""), "output should not contain nested 'data' field");
+        assert!(content.contains("\"worker_id\""), "output should contain 'worker_id'");
+        assert!(content.contains("\"intermediate_value\""), "should use 'intermediate_value' key");
+
+        // replay 应成功恢复
+        let storage = JournalFileStorage::new(&path).unwrap();
+        let sid = storage.get_study_id_from_name("flat_rw").unwrap();
+        let trials = storage.get_all_trials(sid, None).unwrap();
+        assert_eq!(trials.len(), 1);
+        assert_eq!(trials[0].state, TrialState::Complete);
+        assert_eq!(trials[0].intermediate_values[&0], 0.5);
         fs::remove_file(&path).ok();
     }
 }

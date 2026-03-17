@@ -285,111 +285,234 @@ pub(crate) fn default_log_prior(
     ls_prior + ks_prior + nv_prior
 }
 
-/// 拟合 GP 超参数 — 使用随机重启 + log_prior 评估。
-/// `gpr_cache`: 上一轮拟合的核参数缓存，作为额外的初始候选点。
+/// 拟合 GP 超参数 — 对齐 Python: 梯度优化 (有限差分 + 准牛顿法)。
+///
+/// 对应 Python `gp.fit_kernel_params`:
+/// - 在 log 空间中编码超参数，使用 L-BFGS-B 优化 -(LML + log_prior)
+/// - 先用 cache 初始值尝试，失败则用默认值再试
+///
+/// `gpr_cache`: 上一轮拟合的核参数缓存，作为初始起点。
 /// `deterministic_objective`: 是否为确定性目标（若 true，固定 noise_var）。
 /// 对应 Python `gp.fit_kernel_params(..., gpr_cache=cache)`。
 pub(crate) fn fit_kernel_params(
     x_train: &[Vec<f64>],
     y_train: &[f64],
     is_categorical: &[bool],
-    seed: u64,
+    _seed: u64,
     gpr_cache: Option<&KernelParamsCache>,
     deterministic_objective: bool,
 ) -> GPRegressor {
     let n_params = if x_train.is_empty() { 0 } else { x_train[0].len() };
-    let mut rng = ChaCha8Rng::seed_from_u64(seed);
 
-    let mut best_gpr: Option<GPRegressor> = None;
-    let mut best_score = f64::NEG_INFINITY;
-
-    // 评估函数: log_marginal_likelihood + log_prior (对应 Python 的 log posterior)
-    let score_gpr = |gpr: &GPRegressor| -> f64 {
-        let lml = gpr.log_marginal_likelihood();
-        if !lml.is_finite() { return f64::NEG_INFINITY; }
-        let lp = default_log_prior(
-            &gpr.inverse_squared_lengthscales,
-            gpr.kernel_scale,
-            gpr.noise_var,
+    if x_train.is_empty() || y_train.is_empty() {
+        return GPRegressor::new(
+            x_train.to_vec(), y_train.to_vec(), is_categorical.to_vec(),
+            vec![1.0; n_params], 1.0, DEFAULT_MINIMUM_NOISE_VAR,
         );
-        lml + lp
+    }
+
+    // 对齐 Python 的 log 空间编码:
+    // raw_params = [log(inv_sq_ls[0..d]), log(kernel_scale), log(noise_var - 0.99*min_noise)]
+    let encode = |cache: &KernelParamsCache| -> Vec<f64> {
+        let mut params: Vec<f64> = cache.inverse_squared_lengthscales
+            .iter().map(|&x| x.max(1e-12).ln()).collect();
+        params.push(cache.kernel_scale.max(1e-12).ln());
+        if !deterministic_objective {
+            let raw = (cache.noise_var - 0.99 * DEFAULT_MINIMUM_NOISE_VAR).max(1e-12);
+            params.push(raw.ln());
+        }
+        params
     };
 
-    // 若有缓存，先用缓存的核参数作为初始值尝试一次
-    // 对应 Python: for gpr_cache_to_use in [gpr_cache, default_gpr_cache]
-    if let Some(cache) = gpr_cache {
-        let noise = if deterministic_objective { DEFAULT_MINIMUM_NOISE_VAR } else { cache.noise_var };
-        let gpr = GPRegressor::new(
-            x_train.to_vec(),
-            y_train.to_vec(),
-            is_categorical.to_vec(),
-            cache.inverse_squared_lengthscales.clone(),
-            cache.kernel_scale,
-            noise,
-        );
-        let s = score_gpr(&gpr);
-        if s > best_score {
-            best_score = s;
-            best_gpr = Some(gpr);
-        }
-    }
-
-    // 默认参数候选 (对应 Python 的 default gpr_cache: all-ones)
-    {
-        let noise = if deterministic_objective { DEFAULT_MINIMUM_NOISE_VAR } else { DEFAULT_MINIMUM_NOISE_VAR + 0.01 };
-        let gpr = GPRegressor::new(
-            x_train.to_vec(),
-            y_train.to_vec(),
-            is_categorical.to_vec(),
-            vec![1.0; n_params],
-            1.0,
-            noise,
-        );
-        let s = score_gpr(&gpr);
-        if s > best_score {
-            best_score = s;
-            best_gpr = Some(gpr);
-        }
-    }
-
-    // 多次随机重启优化
-    let n_restarts = 10;
-    for _ in 0..n_restarts {
-        // 随机初始化超参数 (log 空间 uniform(-1, 1) 然后 exp)
-        let inv_sq_ls: Vec<f64> = (0..n_params)
-            .map(|_| rng.gen_range(-1.0_f64..1.0).exp())
-            .collect();
-        let kernel_scale = rng.gen_range(-1.0_f64..1.0).exp();
+    let decode = |params: &[f64]| -> (Vec<f64>, f64, f64) {
+        let inv_sq_ls: Vec<f64> = params[..n_params].iter().map(|&x| x.exp()).collect();
+        let kernel_scale = params[n_params].exp();
         let noise_var = if deterministic_objective {
             DEFAULT_MINIMUM_NOISE_VAR
         } else {
-            DEFAULT_MINIMUM_NOISE_VAR + rng.gen_range(-1.0_f64..1.0).exp() * 0.01
+            DEFAULT_MINIMUM_NOISE_VAR + params[n_params + 1].exp()
         };
+        (inv_sq_ls, kernel_scale, noise_var)
+    };
 
+    // 负对数后验 (损失函数): -(LML + log_prior)
+    let neg_log_posterior = |params: &[f64]| -> f64 {
+        let (inv_sq_ls, kernel_scale, noise_var) = decode(params);
+        if inv_sq_ls.iter().any(|&x| !x.is_finite() || x > 1e10)
+            || !kernel_scale.is_finite() || kernel_scale > 1e10
+            || !noise_var.is_finite() || noise_var > 1e10
+        {
+            return 1e30;
+        }
         let gpr = GPRegressor::new(
-            x_train.to_vec(),
-            y_train.to_vec(),
-            is_categorical.to_vec(),
-            inv_sq_ls,
-            kernel_scale,
-            noise_var,
+            x_train.to_vec(), y_train.to_vec(), is_categorical.to_vec(),
+            inv_sq_ls.clone(), kernel_scale, noise_var,
         );
+        let lml = gpr.log_marginal_likelihood();
+        if !lml.is_finite() { return 1e30; }
+        -(lml + default_log_prior(&inv_sq_ls, kernel_scale, noise_var))
+    };
 
-        let s = score_gpr(&gpr);
-        if s > best_score {
-            best_score = s;
-            best_gpr = Some(gpr);
+    // 有限差分梯度 (中心差分)
+    let gradient = |params: &[f64], f0: f64| -> Vec<f64> {
+        let h = 1e-5;
+        let n = params.len();
+        let mut grad = vec![0.0; n];
+        for i in 0..n {
+            let mut p_fwd = params.to_vec();
+            let mut p_bwd = params.to_vec();
+            p_fwd[i] += h;
+            p_bwd[i] -= h;
+            let f_fwd = neg_log_posterior(&p_fwd);
+            let f_bwd = neg_log_posterior(&p_bwd);
+            grad[i] = (f_fwd - f_bwd) / (2.0 * h);
+        }
+        let _ = f0; // f0 unused in central diff, but available for forward diff
+        grad
+    };
+
+    // L-BFGS 优化 (有限记忆 BFGS, 对齐 Python scipy L-BFGS-B)
+    let optimize = |init_params: &[f64]| -> Option<(Vec<f64>, f64)> {
+        let n = init_params.len();
+        let m = 5; // L-BFGS memory size
+        let max_iter = 50;
+        let gtol = 1e-2;
+
+        let mut x = init_params.to_vec();
+        let mut f = neg_log_posterior(&x);
+        if !f.is_finite() { return None; }
+        let mut g = gradient(&x, f);
+
+        // L-BFGS 历史存储
+        let mut s_hist: Vec<Vec<f64>> = Vec::new(); // x_{k+1} - x_k
+        let mut y_hist: Vec<Vec<f64>> = Vec::new(); // g_{k+1} - g_k
+        let mut rho_hist: Vec<f64> = Vec::new();    // 1 / (y_k^T s_k)
+
+        for _ in 0..max_iter {
+            // 检查收敛: ||g||_inf < gtol
+            let g_norm = g.iter().map(|&v| v.abs()).fold(0.0_f64, f64::max);
+            if g_norm < gtol { break; }
+
+            // L-BFGS 两环递推求搜索方向 d = -H_k * g
+            let mut q = g.clone();
+            let k = s_hist.len();
+            let mut alpha_save = vec![0.0; k];
+
+            // 第一环: 从最新到最旧
+            for i in (0..k).rev() {
+                let alpha_i: f64 = rho_hist[i] * s_hist[i].iter()
+                    .zip(q.iter()).map(|(s, q)| s * q).sum::<f64>();
+                alpha_save[i] = alpha_i;
+                for j in 0..n {
+                    q[j] -= alpha_i * y_hist[i][j];
+                }
+            }
+
+            // 初始 Hessian 近似 H_0 = gamma * I
+            let gamma = if k > 0 {
+                let yk = &y_hist[k - 1];
+                let sk = &s_hist[k - 1];
+                let ys: f64 = yk.iter().zip(sk.iter()).map(|(y, s)| y * s).sum();
+                let yy: f64 = yk.iter().map(|y| y * y).sum();
+                if yy > 0.0 { ys / yy } else { 1.0 }
+            } else {
+                1.0
+            };
+            let mut d: Vec<f64> = q.iter().map(|&qi| gamma * qi).collect();
+
+            // 第二环: 从最旧到最新
+            for i in 0..k {
+                let beta: f64 = rho_hist[i] * y_hist[i].iter()
+                    .zip(d.iter()).map(|(y, dd)| y * dd).sum::<f64>();
+                for j in 0..n {
+                    d[j] += s_hist[i][j] * (alpha_save[i] - beta);
+                }
+            }
+
+            // d = -d (搜索方向)
+            for v in d.iter_mut() { *v = -*v; }
+
+            // Armijo 回溯线搜索
+            let c1 = 1e-4;
+            let dg: f64 = g.iter().zip(d.iter()).map(|(gi, di)| gi * di).sum();
+            if dg >= 0.0 { break; } // 非下降方向
+
+            let mut step = 1.0;
+            let mut x_new;
+            let mut f_new;
+            loop {
+                x_new = x.iter().zip(d.iter()).map(|(&xi, &di)| xi + step * di).collect::<Vec<_>>();
+                f_new = neg_log_posterior(&x_new);
+                if f_new <= f + c1 * step * dg || step < 1e-10 {
+                    break;
+                }
+                step *= 0.5;
+            }
+
+            if !f_new.is_finite() { break; }
+
+            let g_new = gradient(&x_new, f_new);
+
+            // 更新 L-BFGS 历史
+            let s_k: Vec<f64> = x_new.iter().zip(x.iter()).map(|(xn, xo)| xn - xo).collect();
+            let y_k: Vec<f64> = g_new.iter().zip(g.iter()).map(|(gn, go)| gn - go).collect();
+            let ys: f64 = y_k.iter().zip(s_k.iter()).map(|(y, s)| y * s).sum();
+
+            if ys > 1e-10 {
+                if s_hist.len() >= m {
+                    s_hist.remove(0);
+                    y_hist.remove(0);
+                    rho_hist.remove(0);
+                }
+                s_hist.push(s_k);
+                y_hist.push(y_k);
+                rho_hist.push(1.0 / ys);
+            }
+
+            x = x_new;
+            f = f_new;
+            g = g_new;
+        }
+
+        Some((x, f))
+    };
+
+    // 对齐 Python: 先用 cache 初始值，再用默认值 — 共 2 次尝试
+    let default_cache = KernelParamsCache {
+        inverse_squared_lengthscales: vec![1.0; n_params],
+        kernel_scale: 1.0,
+        noise_var: DEFAULT_MINIMUM_NOISE_VAR + 0.01,
+    };
+
+    let attempts: Vec<Vec<f64>> = if let Some(cache) = gpr_cache {
+        vec![encode(cache), encode(&default_cache)]
+    } else {
+        vec![encode(&default_cache)]
+    };
+
+    let mut best_gpr: Option<GPRegressor> = None;
+    let mut best_loss = f64::MAX;
+
+    for init_params in &attempts {
+        if let Some((opt_params, loss)) = optimize(init_params) {
+            let (inv_sq_ls, kernel_scale, noise_var) = decode(&opt_params);
+            if inv_sq_ls.iter().all(|&v| v.is_finite())
+                && kernel_scale.is_finite() && noise_var.is_finite()
+                && loss < best_loss
+            {
+                best_loss = loss;
+                best_gpr = Some(GPRegressor::new(
+                    x_train.to_vec(), y_train.to_vec(), is_categorical.to_vec(),
+                    inv_sq_ls, kernel_scale, noise_var,
+                ));
+            }
         }
     }
 
-    // 如果所有尝试都失败，使用默认参数
+    // 所有优化都失败则使用默认参数 (对齐 Python 行为)
     best_gpr.unwrap_or_else(|| GPRegressor::new(
-        x_train.to_vec(),
-        y_train.to_vec(),
-        is_categorical.to_vec(),
-        vec![1.0; n_params],
-        1.0,
-        DEFAULT_MINIMUM_NOISE_VAR,
+        x_train.to_vec(), y_train.to_vec(), is_categorical.to_vec(),
+        vec![1.0; n_params], 1.0, DEFAULT_MINIMUM_NOISE_VAR,
     ))
 }
 

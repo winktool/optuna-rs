@@ -333,6 +333,9 @@ impl CmaState {
     }
 
     /// Update eigen decomposition of C using Jacobi iteration.
+    ///
+    /// 对齐 Python cmaes 库: 使用可靠的特征分解算法。
+    /// 改进: 迭代上限与维度成正比，使用 in-place 旋转避免分配。
     fn update_eigen(&mut self) {
         let n = self.n;
 
@@ -345,14 +348,19 @@ impl CmaState {
             }
         }
 
-        // Simple Jacobi eigenvalue algorithm for small matrices
+        // Jacobi eigenvalue algorithm — 迭代上限与维度成正比
         let mut a = self.c.clone();
         let mut v = vec![vec![0.0; n]; n];
         for i in 0..n {
             v[i][i] = 1.0;
         }
 
-        for _ in 0..100 {
+        // 对齐 Python: 确保高维矩阵收敛。
+        // 经典 Jacobi 每次旋转消除一个非对角元素，
+        // 需要 O(n²) 次旋转完成一轮 sweep，通常 5-10 轮 sweep 收敛。
+        let max_iter = (10 * n * n).max(100);
+
+        for _ in 0..max_iter {
             // Find largest off-diagonal element
             let mut max_val = 0.0_f64;
             let mut p = 0;
@@ -381,27 +389,26 @@ impl CmaState {
             let cos_t = theta.cos();
             let sin_t = theta.sin();
 
-            // Apply rotation to a
-            let mut new_a = a.clone();
+            // In-place rotation of matrix a
             for i in 0..n {
                 if i != p && i != q {
-                    new_a[i][p] = cos_t * a[i][p] + sin_t * a[i][q];
-                    new_a[p][i] = new_a[i][p];
-                    new_a[i][q] = -sin_t * a[i][p] + cos_t * a[i][q];
-                    new_a[q][i] = new_a[i][q];
+                    let aip = a[i][p];
+                    let aiq = a[i][q];
+                    a[i][p] = cos_t * aip + sin_t * aiq;
+                    a[p][i] = a[i][p];
+                    a[i][q] = -sin_t * aip + cos_t * aiq;
+                    a[q][i] = a[i][q];
                 }
             }
-            new_a[p][p] = cos_t * cos_t * a[p][p]
-                + 2.0 * sin_t * cos_t * a[p][q]
-                + sin_t * sin_t * a[q][q];
-            new_a[q][q] = sin_t * sin_t * a[p][p]
-                - 2.0 * sin_t * cos_t * a[p][q]
-                + cos_t * cos_t * a[q][q];
-            new_a[p][q] = 0.0;
-            new_a[q][p] = 0.0;
-            a = new_a;
+            let app = a[p][p];
+            let aqq = a[q][q];
+            let apq = a[p][q];
+            a[p][p] = cos_t * cos_t * app + 2.0 * sin_t * cos_t * apq + sin_t * sin_t * aqq;
+            a[q][q] = sin_t * sin_t * app - 2.0 * sin_t * cos_t * apq + cos_t * cos_t * aqq;
+            a[p][q] = 0.0;
+            a[q][p] = 0.0;
 
-            // Apply rotation to eigenvectors
+            // Apply rotation to eigenvectors (in-place)
             for i in 0..n {
                 let vip = v[i][p];
                 let viq = v[i][q];

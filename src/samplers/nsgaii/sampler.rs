@@ -11,9 +11,11 @@ use crate::error::Result;
 use crate::multi_objective::{
     constrained_fast_non_dominated_sort, crowding_distance, fast_non_dominated_sort,
 };
+use crate::samplers::ga::GaSampler;
 use crate::samplers::random::RandomSampler;
 use crate::samplers::Sampler;
 use crate::search_space::{IntersectionSearchSpace, SearchSpaceTransform};
+use crate::storage::Storage;
 use crate::study::StudyDirection;
 use crate::trial::{FrozenTrial, TrialState};
 
@@ -58,6 +60,10 @@ pub struct NSGAIISampler {
     /// Custom after-trial strategy.
     /// 对应 Python `after_trial_strategy` 参数。
     after_trial_strategy: Option<AfterTrialStrategy>,
+    /// 对齐 Python: 持有 storage 引用用于代际管理。
+    storage: Mutex<Option<Arc<dyn Storage>>>,
+    /// Study ID for storage operations.
+    study_id: Mutex<Option<i64>>,
 }
 
 impl std::fmt::Debug for NSGAIISampler {
@@ -119,6 +125,8 @@ impl NSGAIISampler {
             elite_population_selection_strategy,
             child_generation_strategy,
             after_trial_strategy,
+            storage: Mutex::new(None),
+            study_id: Mutex::new(None),
         }
     }
 
@@ -156,6 +164,82 @@ impl NSGAIISampler {
         }
         ranks
     }
+
+    /// 对齐 Python `_elite_population_selection_strategy` 默认行为:
+    /// 非支配排序 + 拥挤距离截断，选出 population_size 个精英。
+    fn elite_select(&self, candidates: &[FrozenTrial]) -> Vec<FrozenTrial> {
+        if candidates.len() <= self.population_size {
+            return candidates.to_vec();
+        }
+
+        let refs: Vec<&FrozenTrial> = candidates.iter().collect();
+        let ranks_by_rank = if self.constraints_func.is_some() {
+            constrained_fast_non_dominated_sort(&refs, &self.directions)
+        } else {
+            fast_non_dominated_sort(&refs, &self.directions)
+        };
+
+        let mut elite = Vec::new();
+        for rank_indices in &ranks_by_rank {
+            if elite.len() + rank_indices.len() <= self.population_size {
+                for &idx in rank_indices {
+                    elite.push(candidates[idx].clone());
+                }
+            } else {
+                let remaining = self.population_size - elite.len();
+                let rank_trials: Vec<&FrozenTrial> = rank_indices.iter()
+                    .map(|&i| &candidates[i])
+                    .collect();
+                let cd = crowding_distance(&rank_trials, &self.directions);
+                let mut indexed: Vec<(usize, f64)> = cd.into_iter().enumerate().collect();
+                indexed.sort_by(|(_, a), (_, b)| b.partial_cmp(a).unwrap_or(std::cmp::Ordering::Equal));
+                for (local_idx, _) in indexed.into_iter().take(remaining) {
+                    elite.push(candidates[rank_indices[local_idx]].clone());
+                }
+                break;
+            }
+        }
+        elite
+    }
+}
+
+/// 对齐 Python `NSGAIISampler(BaseGASampler)`:
+/// 实现 GaSampler trait 提供代际管理功能。
+impl GaSampler for NSGAIISampler {
+    fn generation_key(&self) -> &str {
+        "NSGAIISampler:generation"
+    }
+
+    fn parent_cache_key_prefix(&self) -> &str {
+        "NSGAIISampler:parent:"
+    }
+
+    fn population_size(&self) -> usize {
+        self.population_size
+    }
+
+    /// 对齐 Python `NSGAIISampler._elite_population_selection_strategy`:
+    /// select_parent = elite_select(get_population(gen-1) + get_parent_population(gen-1))
+    fn select_parent(
+        &self,
+        storage: &dyn Storage,
+        study_id: i64,
+        generation: i32,
+    ) -> Result<Vec<FrozenTrial>> {
+        if generation <= 0 {
+            return Ok(vec![]);
+        }
+
+        let mut candidates = self.get_population(storage, study_id, generation - 1)?;
+        let parent_pop = self.get_parent_population(storage, study_id, generation - 1)?;
+        candidates.extend(parent_pop);
+
+        if let Some(ref strategy) = self.elite_population_selection_strategy {
+            Ok(strategy(&candidates, &self.directions, self.population_size))
+        } else {
+            Ok(self.elite_select(&candidates))
+        }
+    }
 }
 
 impl Sampler for NSGAIISampler {
@@ -191,57 +275,39 @@ impl Sampler for NSGAIISampler {
         }
 
         // ── 步骤1: 精英种群选择 ──
-        // 对应 Python `_elite_population_selection_strategy(...)`
-        let parent_trials: Vec<FrozenTrial> = if let Some(ref strategy) = self.elite_population_selection_strategy {
-            // 使用自定义精英选择策略
-            let all_trials: Vec<FrozenTrial> = complete.iter().map(|t| (*t).clone()).collect();
-            strategy(&all_trials, &self.directions, self.population_size)
-        } else {
-            // 对齐 Python 默认精英选择: NSGA-II 非支配排序 + 拥挤距离
-            // Python: population_per_rank = _rank_population(population, study.directions, ...)
-            //         按 rank 填充精英池，最后一级用拥挤距离截断
-            let population: Vec<FrozenTrial> = {
-                // 取最后 population_size 个完成的试验作为候选种群
-                let start = if complete.len() > self.population_size {
-                    complete.len() - self.population_size
+        // 对齐 Python BaseGASampler.sample_relative:
+        //   generation = get_trial_generation(study, trial)
+        //   parent_population = get_parent_population(study, generation)
+        //   if generation == 0: return {} (random sampling via sample_independent)
+        let parent_trials: Vec<FrozenTrial> = {
+            let storage_guard = self.storage.lock();
+            let study_id_guard = self.study_id.lock();
+            if let (Some(storage), Some(study_id)) = (&*storage_guard, *study_id_guard) {
+                // 使用代际系统获取父代种群
+                // 找到当前最新的未完成 trial，计算其代际编号
+                let all = storage.get_all_trials(study_id, None)?;
+                let running_trial = all.iter().rev().find(|t| t.state == TrialState::Running);
+                if let Some(trial) = running_trial {
+                    let generation = self.get_trial_generation(storage.as_ref(), study_id, trial)?;
+                    if generation == 0 {
+                        // 第0代: 返回空，使用 sample_independent 随机采样
+                        return Ok(HashMap::new());
+                    }
+                    let parent_pop = self.get_parent_population(storage.as_ref(), study_id, generation)?;
+                    parent_pop
                 } else {
-                    0
-                };
-                complete[start..].iter().map(|t| (*t).clone()).collect()
-            };
-
-            // 非支配排序
-            let pop_refs: Vec<&FrozenTrial> = population.iter().collect();
-            let ranks_by_rank = if self.constraints_func.is_some() {
-                constrained_fast_non_dominated_sort(&pop_refs, &self.directions)
+                    // 没有 running trial，回退到精英选择
+                    self.elite_select(&complete.iter().map(|t| (*t).clone()).collect::<Vec<_>>())
+                }
             } else {
-                fast_non_dominated_sort(&pop_refs, &self.directions)
-            };
-
-            let mut elite = Vec::new();
-            for rank_indices in &ranks_by_rank {
-                if elite.len() + rank_indices.len() <= self.population_size {
-                    // 整级都放入精英池
-                    for &idx in rank_indices {
-                        elite.push(population[idx].clone());
-                    }
+                // 没有 storage 注入，回退到旧行为（取最后 N 个）
+                if let Some(ref strategy) = self.elite_population_selection_strategy {
+                    let all_trials: Vec<FrozenTrial> = complete.iter().map(|t| (*t).clone()).collect();
+                    strategy(&all_trials, &self.directions, self.population_size)
                 } else {
-                    // 最后一级: 按拥挤距离排序，取 remaining 个
-                    let remaining = self.population_size - elite.len();
-                    let rank_trials: Vec<&FrozenTrial> = rank_indices.iter()
-                        .map(|&i| &population[i])
-                        .collect();
-                    let cd = crowding_distance(&rank_trials, &self.directions);
-                    // 按拥挤距离降序排序
-                    let mut indexed: Vec<(usize, f64)> = cd.into_iter().enumerate().collect();
-                    indexed.sort_by(|(_, a), (_, b)| b.partial_cmp(a).unwrap_or(std::cmp::Ordering::Equal));
-                    for (local_idx, _) in indexed.into_iter().take(remaining) {
-                        elite.push(population[rank_indices[local_idx]].clone());
-                    }
-                    break;
+                    self.elite_select(&complete.iter().map(|t| (*t).clone()).collect::<Vec<_>>())
                 }
             }
-            elite
         };
 
         if parent_trials.is_empty() {
@@ -382,19 +448,28 @@ impl Sampler for NSGAIISampler {
         // 如果设置了自定义 after_trial_strategy，优先使用
         if let Some(ref strategy) = self.after_trial_strategy {
             strategy(_trials, trial, state, _values);
-            return;
-        }
-        // 默认行为: 评估约束函数
-        if let Some(ref cf) = self.constraints_func {
-            if state == TrialState::Complete || state == TrialState::Pruned {
-                let _constraints = cf(trial);
+        } else {
+            // 默认行为: 评估约束函数
+            if let Some(ref cf) = self.constraints_func {
+                if state == TrialState::Complete || state == TrialState::Pruned {
+                    let _constraints = cf(trial);
+                }
             }
         }
+
+        // 对齐 Python: 链式调用 random_sampler.after_trial()
+        self.random_sampler.after_trial(_trials, trial, state, _values);
     }
 
     /// 对齐 Python `NSGAIISampler.reseed_rng(seed)`: 重新设置随机种子。
     fn reseed_rng(&self, seed: u64) {
         *self.rng.lock() = ChaCha8Rng::seed_from_u64(seed);
+    }
+
+    /// 注入 storage 引用用于代际管理。
+    fn inject_storage(&self, storage: std::sync::Arc<dyn Storage>, study_id: i64) {
+        *self.storage.lock() = Some(storage);
+        *self.study_id.lock() = Some(study_id);
     }
 }
 

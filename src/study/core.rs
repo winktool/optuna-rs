@@ -86,6 +86,8 @@ impl Study {
         sampler: Arc<dyn Sampler>,
         pruner: Arc<dyn Pruner>,
     ) -> Self {
+        // 对齐 Python: 注入 storage 引用到需要持久化的采样器（如 CMA-ES）
+        sampler.inject_storage(storage.clone(), study_id);
         Self {
             study_name,
             study_id,

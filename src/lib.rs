@@ -138,7 +138,7 @@ pub use testing::{
 };
 pub use study::{
     copy_study, create_study, delete_study, get_all_study_names, get_all_study_summaries,
-    load_study, FrozenStudy, Study, StudyDirection,
+    load_study, FrozenStudy, Study, StudyDirection, StudySummary,
 };
 pub use terminators::{
     BestValueStagnationEvaluator, BestValueStagnationTerminator, CrossValidationErrorEvaluator,

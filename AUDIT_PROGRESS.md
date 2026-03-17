@@ -310,3 +310,83 @@
 | 🟡 低 | Wilcoxon 精确分布表 | 小样本精确分布缺失 |
 | 🟡 低 | BaseTrial trait | Trial/FrozenTrial/FixedTrial 统一接口 |
 | 🟡 低 | Hyperband _filter_study | after_trial 不经过 _filter_study 过滤 |
+
+---
+
+## Session 40 — MOTPE 多目标 TPE 完成 + 修复汇总
+
+### 已完成修复
+
+#### 1. MOTPE 多目标 TPE（重大功能补全）
+- `TpeSampler.direction` → `directions: Vec<StudyDirection>`，支持多目标
+- `new_multi()` 构造函数接受多个优化方向
+- `split_trials_multi_objective()`: 非支配排序 + HSSP 平局打断
+- `fast_non_domination_rank()`: 直接在 loss values 上计算非支配层级
+- `dominates_values()`: Pareto 支配判定
+- `get_reference_point()`: 超体积参考点（对齐 Python 1.1/0.9 规则）
+- `calculate_mo_weights()`: 基于 leave-one-out 超体积贡献度的权重，对齐 Python 的 max-normalization
+- `TpeSamplerBuilder::new_multi()` 多目标构建器
+- `tpe_sample()` 中多目标 below 组使用 HV 权重作为 ParzenEstimator 的 `predetermined_weights`
+
+#### 2. NSGA-II 代际系统（Session 39 完成，Session 40 编译修复）
+- `GaSampler for NSGAIISampler` 实现
+- `elite_select()` 提取方法
+- storage/study_id 注入
+- `after_trial` 链式调用 `random_sampler.after_trial()`
+
+#### 3. CMA-ES 状态持久化（Session 39 完成）
+- `CmaState` serde 序列化/反序列化
+- JSON 分块存储到 trial system_attrs（匹配 Python RDB 2045 字符限制）
+- 从已完成 trial 恢复状态
+
+#### 4. StudySummary 类（Session 39 完成）
+- `StudySummary` 结构体（study_name, directions, best_trial, user_attrs, system_attrs, n_trials, datetime_start, study_id）
+- `build_study_summaries()` 聚合函数
+- `get_all_study_summaries()` 返回 `Vec<StudySummary>`
+
+#### 5. Sampler trait 扩展
+- `inject_storage()` 默认空操作方法，允许有状态采样器接收 storage 引用
+- `Study::new()` 自动调用 `sampler.inject_storage()`
+
+### 新增测试
+
+#### Rust 单元测试 (8 个新增，20 个 TPE 总计)
+| 文件 | 测试名 | 描述 |
+|------|--------|------|
+| tpe/sampler.rs | test_fast_non_domination_rank | 非支配排序层级验证 |
+| tpe/sampler.rs | test_dominates_values | Pareto 支配判定 |
+| tpe/sampler.rs | test_get_reference_point | 正值参考点 |
+| tpe/sampler.rs | test_get_reference_point_negative | 负值参考点 |
+| tpe/sampler.rs | test_split_trials_multi_objective | 多目标分割 |
+| tpe/sampler.rs | test_calculate_mo_weights_all_pareto | 全 Pareto 权重 |
+| tpe/sampler.rs | test_calculate_mo_weights_dominated | 有支配权重 |
+| tpe/sampler.rs | test_motpe_builder_multi | 多目标构建器 |
+| tpe/sampler.rs | test_motpe_builder_single | 单目标构建器 |
+
+#### Python 交叉验证测试 (6 个新增)
+| 测试名 | 描述 |
+|--------|------|
+| test_motpe_reference_point | 参考点计算对齐 |
+| test_motpe_nondomination_rank | 非支配排序对齐 |
+| test_motpe_split_multi_objective | 多目标分割对齐 |
+| test_motpe_weights_all_pareto | 全 Pareto 权重对齐 |
+| test_motpe_weights_dominated | 有支配权重对齐 |
+| test_motpe_end_to_end | 端到端多目标优化 |
+
+### 测试统计
+
+| 指标 | 数值 |
+|------|------|
+| Rust 测试总数 | 773 (768 unit + 5 doc) |
+| Python 交叉验证 | 146 |
+| 本次新增 Rust | +9 (MOTPE) |
+| 本次新增 Python | +6 (MOTPE) |
+
+### 待修复 (后续 Session)
+
+| 优先级 | 项目 | 说明 |
+|--------|------|------|
+| 🟡 低 | fANOVA 方差分解 | 使用 bin variance 而非随机森林边际方差 |
+| 🟡 低 | Wilcoxon 精确分布表 | 小样本精确分布缺失 |
+| 🟡 低 | BaseTrial trait | Trial/FrozenTrial/FixedTrial 统一接口 |
+| 🟡 低 | Hyperband _filter_study | after_trial 不经过 _filter_study 过滤 |

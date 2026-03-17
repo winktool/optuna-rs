@@ -106,6 +106,12 @@ pub trait Sampler: Send + Sync {
     /// 重新设置随机数生成器种子。用于多线程模式下确保线程间随机性独立。
     /// 默认空操作。
     fn reseed_rng(&self, _seed: u64) {}
+
+    /// 注入 storage 引用。
+    ///
+    /// 需要状态持久化的采样器（如 CMA-ES）覆盖此方法。
+    /// 在 Study 构造时自动调用。默认空操作。
+    fn inject_storage(&self, _storage: std::sync::Arc<dyn crate::storage::Storage>, _study_id: i64) {}
 }
 
 #[cfg(test)]

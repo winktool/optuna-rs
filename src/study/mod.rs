@@ -1,12 +1,14 @@
 mod direction;
 mod frozen;
 mod core;
+mod summary;
 #[cfg(feature = "dataframe")]
 pub mod dataframe;
 
 pub use core::Study;
 pub use direction::StudyDirection;
 pub use frozen::FrozenStudy;
+pub use summary::{StudySummary, build_study_summaries};
 
 use std::sync::Arc;
 
@@ -209,8 +211,15 @@ pub fn get_all_study_names(storage: &dyn Storage) -> Result<Vec<String>> {
 /// 获取所有研究摘要。
 ///
 /// 对应 Python `optuna.get_all_study_summaries()`。
-pub fn get_all_study_summaries(storage: &dyn Storage) -> Result<Vec<FrozenStudy>> {
-    storage.get_all_studies()
+///
+/// # 参数
+/// * `storage` - 存储后端
+/// * `include_best_trial` - 是否包含最优 trial（单目标时）
+pub fn get_all_study_summaries(
+    storage: &dyn Storage,
+    include_best_trial: bool,
+) -> Result<Vec<StudySummary>> {
+    build_study_summaries(storage, include_best_trial)
 }
 
 #[cfg(test)]

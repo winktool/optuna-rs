@@ -19,6 +19,7 @@ use rand::Rng;
 use rand::SeedableRng;
 use rand_chacha::ChaCha8Rng;
 use rand_distr::StandardNormal;
+use serde::{Deserialize, Serialize};
 
 use crate::distributions::Distribution;
 use crate::error::Result;
@@ -54,6 +55,11 @@ pub struct CmaEsSampler {
     source_trials: Option<Vec<FrozenTrial>>,
     /// Whether to warn when independent sampling is used (default: true).
     warn_independent_sampling: bool,
+    /// 对齐 Python: 持有 storage 引用用于状态持久化。
+    /// 在 Study 构造时通过 `set_storage()` 注入。
+    storage: Mutex<Option<Arc<dyn crate::storage::Storage>>>,
+    /// Study ID for storage operations.
+    study_id: Mutex<Option<i64>>,
 }
 
 impl std::fmt::Debug for CmaEsSampler {
@@ -65,6 +71,10 @@ impl std::fmt::Debug for CmaEsSampler {
 }
 
 /// Internal CMA-ES algorithm state.
+///
+/// 可序列化/反序列化，支持持久化到 storage system_attrs。
+/// 对应 Python `cmaes.CMA` 对象的 pickle 序列化。
+#[derive(Serialize, Deserialize)]
 struct CmaState {
     mean: Vec<f64>,
     sigma: f64,
@@ -405,6 +415,62 @@ impl CmaState {
         }
         self.b = v;
     }
+
+    // ── 状态持久化方法 ──────────────────────────────────────────
+
+    /// 对齐 Python `CmaEsSampler._serialize_optimizer`:
+    /// 序列化 CMA 状态为 JSON 字符串。
+    fn serialize_state(&self) -> Result<String> {
+        serde_json::to_string(self).map_err(|e| {
+            crate::error::OptunaError::RuntimeError(format!("CMA-ES state serialization failed: {e}"))
+        })
+    }
+
+    /// 对齐 Python `CmaEsSampler._restore_optimizer`:
+    /// 从 JSON 字符串反序列化 CMA 状态。
+    fn deserialize_state(s: &str) -> Result<Self> {
+        serde_json::from_str(s).map_err(|e| {
+            crate::error::OptunaError::RuntimeError(format!("CMA-ES state deserialization failed: {e}"))
+        })
+    }
+
+    /// 对齐 Python `_split_optimizer_str`:
+    /// 将序列化字符串分片为多个键值对（适配 storage system_attrs 的大小限制）。
+    ///
+    /// Python RDBStorage 限制 system_attr 值长度为 2045 字符。
+    /// 这里使用相同的分片大小。
+    fn split_state_str(s: &str) -> HashMap<String, serde_json::Value> {
+        const CHUNK_SIZE: usize = 2045;
+        const KEY_PREFIX: &str = "cma:optimizer";
+        let mut attrs = HashMap::new();
+        for (i, chunk) in s.as_bytes().chunks(CHUNK_SIZE).enumerate() {
+            let key = format!("{KEY_PREFIX}:{i}");
+            let val = String::from_utf8_lossy(chunk).into_owned();
+            attrs.insert(key, serde_json::Value::String(val));
+        }
+        attrs
+    }
+
+    /// 对齐 Python `_concat_optimizer_attrs`:
+    /// 将分片重新拼合为完整字符串。
+    fn concat_state_attrs(attrs: &HashMap<String, serde_json::Value>) -> Option<String> {
+        const KEY_PREFIX: &str = "cma:optimizer";
+        let mut indexed: Vec<(usize, &str)> = Vec::new();
+        for (k, v) in attrs {
+            if let Some(idx_str) = k.strip_prefix(&format!("{KEY_PREFIX}:")) {
+                if let Ok(idx) = idx_str.parse::<usize>() {
+                    if let Some(s) = v.as_str() {
+                        indexed.push((idx, s));
+                    }
+                }
+            }
+        }
+        if indexed.is_empty() {
+            return None;
+        }
+        indexed.sort_by_key(|(i, _)| *i);
+        Some(indexed.into_iter().map(|(_, s)| s).collect())
+    }
 }
 
 impl CmaEsSampler {
@@ -466,11 +532,27 @@ impl CmaEsSampler {
             lr_adapt,
             source_trials,
             warn_independent_sampling: true,
+            storage: Mutex::new(None),
+            study_id: Mutex::new(None),
         }
     }
 
     fn default_popsize(n: usize) -> usize {
         (4 + (3.0 * (n as f64).ln()).floor() as usize).max(5)
+    }
+
+    /// 对齐 Python `CmaEsSampler._restore_optimizer`:
+    /// 从已完成 trial 的 system_attrs 恢复 CMA-ES 状态。
+    /// 按逆序扫描 trial，找到第一个包含 `cma:optimizer:0` 的 trial 并反序列化。
+    fn try_restore_state<'a>(trials: impl Iterator<Item = &'a FrozenTrial>) -> Option<CmaState> {
+        for trial in trials {
+            if let Some(state_str) = CmaState::concat_state_attrs(&trial.system_attrs) {
+                if let Ok(state) = CmaState::deserialize_state(&state_str) {
+                    return Some(state);
+                }
+            }
+        }
+        None
     }
 }
 
@@ -543,6 +625,12 @@ impl Sampler for CmaEsSampler {
 
         // Initialize state if needed
         if state_guard.is_none() {
+            // 对齐 Python `_restore_optimizer`:
+            // 优先从最近的已完成 trial 的 system_attrs 恢复状态
+            let restored = Self::try_restore_state(complete.iter().rev().copied());
+            if let Some(restored_state) = restored {
+                *state_guard = Some(restored_state);
+            } else {
             // 对齐 Python: sigma0 默认值 = min(upper - lower) / 6
             // 在变换空间中, bounds 通常为 [0, 1]，min_range = 1.0
             let sigma = self.sigma0.unwrap_or_else(|| {
@@ -632,6 +720,7 @@ impl Sampler for CmaEsSampler {
             }
 
             *state_guard = Some(new_state);
+            } // end else (no restored state)
         }
 
         let state = state_guard.as_mut().unwrap();
@@ -750,6 +839,28 @@ impl Sampler for CmaEsSampler {
                     effective_value
                 };
                 cma_state.tell(encoded, value);
+
+                // 对齐 Python: 将 CMA 状态和 generation 信息持久化到 trial system_attrs
+                if let Some(ref storage) = *self.storage.lock() {
+                    // 写入 generation 标记
+                    let _ = storage.set_trial_system_attr(
+                        trial.trial_id,
+                        "cma:generation",
+                        serde_json::json!(cma_state.generation),
+                    );
+
+                    // 序列化并分片写入 optimizer 状态
+                    if let Ok(state_str) = cma_state.serialize_state() {
+                        let attrs = CmaState::split_state_str(&state_str);
+                        for (key, val) in attrs {
+                            let _ = storage.set_trial_system_attr(
+                                trial.trial_id,
+                                &key,
+                                val,
+                            );
+                        }
+                    }
+                }
             }
         }
     }
@@ -757,6 +868,12 @@ impl Sampler for CmaEsSampler {
     /// 对齐 Python `CmaEsSampler.reseed_rng(seed)`: 重新设置随机种子。
     fn reseed_rng(&self, seed: u64) {
         *self.rng.lock() = ChaCha8Rng::seed_from_u64(seed);
+    }
+
+    /// 注入 storage 引用用于 CMA-ES 状态持久化。
+    fn inject_storage(&self, storage: Arc<dyn crate::storage::Storage>, study_id: i64) {
+        *self.storage.lock() = Some(storage);
+        *self.study_id.lock() = Some(study_id);
     }
 }
 
@@ -1137,5 +1254,113 @@ mod tests {
             StudyDirection::Minimize, None, None, None, None, None,
             None, false, true, false, true, None,
         );
+    }
+
+    /// 对齐 Python: CMA-ES 状态序列化/反序列化往返一致性
+    #[test]
+    fn test_cmaes_state_serialization_roundtrip() {
+        let state = CmaState::new(
+            vec![0.5, 0.3, 0.7],
+            0.3,
+            6,
+            vec!["x".into(), "y".into(), "z".into()],
+        );
+        let json = state.serialize_state().unwrap();
+        let restored = CmaState::deserialize_state(&json).unwrap();
+        assert_eq!(state.mean, restored.mean);
+        assert_eq!(state.sigma, restored.sigma);
+        assert_eq!(state.n, restored.n);
+        assert_eq!(state.generation, restored.generation);
+        assert_eq!(state.lambda, restored.lambda);
+        assert_eq!(state.param_names, restored.param_names);
+    }
+
+    /// 对齐 Python: CMA-ES 状态分片与拼合
+    #[test]
+    fn test_cmaes_state_split_concat() {
+        let state = CmaState::new(
+            vec![0.5; 100],
+            0.1,
+            20,
+            (0..100).map(|i| format!("p{i}")).collect(),
+        );
+        let json = state.serialize_state().unwrap();
+        let attrs = CmaState::split_state_str(&json);
+
+        // 应该至少有一个分片
+        assert!(!attrs.is_empty());
+
+        // 拼合后应恢复原始 JSON
+        let restored_json = CmaState::concat_state_attrs(&attrs).unwrap();
+        assert_eq!(json, restored_json);
+
+        // 反序列化应成功
+        let restored = CmaState::deserialize_state(&restored_json).unwrap();
+        assert_eq!(restored.n, 100);
+        assert_eq!(restored.param_names.len(), 100);
+    }
+
+    /// 对齐 Python: CMA-ES 状态持久化到 storage 并恢复
+    #[test]
+    fn test_cmaes_state_persistence_via_storage() {
+        use crate::storage::InMemoryStorage;
+        use crate::storage::Storage;
+        use std::sync::Arc;
+
+        let storage = Arc::new(InMemoryStorage::new());
+        let study_id = storage
+            .create_new_study(&[StudyDirection::Minimize], Some("cma_persist"))
+            .unwrap();
+
+        // 创建 CmaEsSampler 并注入 storage
+        let sampler: Arc<dyn Sampler> = Arc::new(CmaEsSampler::new(
+            StudyDirection::Minimize,
+            Some(0.5),
+            Some(5),
+            Some(6),
+            None,
+            Some(42),
+            None,
+            false,
+            false,
+            false,
+            false,
+            None,
+        ));
+        sampler.inject_storage(storage.clone(), study_id);
+
+        let study = crate::study::Study::new(
+            "cma_persist".into(),
+            study_id,
+            storage.clone(),
+            vec![StudyDirection::Minimize],
+            sampler,
+            Arc::new(crate::pruners::NopPruner),
+        );
+
+        // 运行足够多的 trial 使 CMA-ES 初始化并更新
+        study.optimize(
+            |trial| {
+                let x = trial.suggest_float("x", -5.0, 5.0, false, None)?;
+                let y = trial.suggest_float("y", -5.0, 5.0, false, None)?;
+                Ok(x * x + y * y)
+            },
+            Some(15),
+            None,
+            None,
+        ).unwrap();
+
+        let trials = study.trials().unwrap();
+        // 检查至少有一个 trial 包含 CMA 状态
+        let has_cma_state = trials.iter().any(|t| {
+            t.system_attrs.keys().any(|k| k.starts_with("cma:optimizer"))
+        });
+        assert!(has_cma_state, "至少一个 trial 应包含 CMA-ES 持久化状态");
+
+        // 检查有 generation 标记
+        let has_gen = trials.iter().any(|t| {
+            t.system_attrs.contains_key("cma:generation")
+        });
+        assert!(has_gen, "至少一个 trial 应包含 generation 标记");
     }
 }

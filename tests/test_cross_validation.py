@@ -1875,6 +1875,100 @@ def test_suggest_updates_params_immediately():
     assert len(trial.params) == 2
 
 # ═══════════════════════════════════════════════════════════════════════════
+#  17. MOTPE 多目标 TPE — 对应 Rust MOTPE 实现
+# ═══════════════════════════════════════════════════════════════════════════
+
+def test_motpe_reference_point():
+    """Rust: test_get_reference_point / test_get_reference_point_negative"""
+    from optuna.samplers._tpe.sampler import _get_reference_point
+    # 正值
+    loss_vals = np.array([[1.0, 2.0], [3.0, 1.0]])
+    rp = _get_reference_point(loss_vals)
+    assert abs(rp[0] - 3.3) < 1e-9, f"rp[0]={rp[0]}"
+    assert abs(rp[1] - 2.2) < 1e-9, f"rp[1]={rp[1]}"
+    # 负值
+    loss_vals2 = np.array([[-3.0, -1.0]])
+    rp2 = _get_reference_point(loss_vals2)
+    assert abs(rp2[0] - (-2.7)) < 1e-9, f"rp2[0]={rp2[0]}"
+    assert abs(rp2[1] - (-0.9)) < 1e-9, f"rp2[1]={rp2[1]}"
+
+def test_motpe_nondomination_rank():
+    """Rust: test_fast_non_domination_rank"""
+    from optuna.samplers._tpe.sampler import _fast_non_domination_rank
+    # 全 Pareto
+    loss = np.array([[1.0, 3.0], [2.0, 2.0], [3.0, 1.0]])
+    ranks = _fast_non_domination_rank(loss)
+    assert list(ranks) == [0, 0, 0], f"ranks={ranks}"
+    # 层次
+    loss2 = np.array([[1.0, 1.0], [2.0, 2.0], [3.0, 3.0]])
+    ranks2 = _fast_non_domination_rank(loss2)
+    assert ranks2[0] == 0
+    assert ranks2[1] == 1
+    assert ranks2[2] == 2
+
+def test_motpe_split_multi_objective():
+    """Rust: test_split_trials_multi_objective
+    多目标分割：所有试验在 Pareto 前沿上"""
+    study = optuna.create_study(directions=["minimize", "minimize"],
+                                sampler=optuna.samplers.TPESampler(seed=42))
+    for i in range(10):
+        trial = study.ask()
+        trial.suggest_float("x", -10.0, 10.0)
+        study.tell(trial, [float(i), 10.0 - float(i)])
+    # 使用内部方法验证分割
+    from optuna.samplers._tpe.sampler import _split_complete_trials_multi_objective
+    n_below = max(1, int(0.1 * 10))  # 与 default gamma 一致
+    below, above = _split_complete_trials_multi_objective(
+        list(study.trials), study, n_below
+    )
+    assert len(below) > 0
+    assert len(above) > 0
+    assert len(below) + len(above) == 10
+
+def test_motpe_weights_all_pareto():
+    """Rust: test_calculate_mo_weights_all_pareto
+    所有解都在 Pareto 前沿上，权重应全部正"""
+    from optuna.samplers._tpe.sampler import _calculate_weights_below_for_multi_objective
+    study = optuna.create_study(directions=["minimize", "minimize"])
+    for i, vals in enumerate([(1.0, 3.0), (2.0, 2.0), (3.0, 1.0)]):
+        trial = study.ask()
+        study.tell(trial, list(vals))
+    below = list(study.trials)
+    weights = _calculate_weights_below_for_multi_objective(study, below, None)
+    assert len(weights) == 3
+    for w in weights:
+        assert w > 0, f"weight should be positive: {w}"
+
+def test_motpe_weights_dominated():
+    """Rust: test_calculate_mo_weights_dominated
+    有支配关系时，Pareto 前沿解权重应最大"""
+    from optuna.samplers._tpe.sampler import _calculate_weights_below_for_multi_objective
+    study = optuna.create_study(directions=["minimize", "minimize"])
+    for vals in [(1.0, 1.0), (2.0, 2.0), (3.0, 3.0)]:
+        trial = study.ask()
+        study.tell(trial, list(vals))
+    below = list(study.trials)
+    weights = _calculate_weights_below_for_multi_objective(study, below, None)
+    # dominated points should have lower weights (EPS)
+    assert weights[0] > weights[1], f"w0={weights[0]} should > w1={weights[1]}"
+    assert weights[0] > weights[2], f"w0={weights[0]} should > w2={weights[2]}"
+
+def test_motpe_end_to_end():
+    """Rust: end-to-end MOTPE 优化应能运行并产出 Pareto 前沿"""
+    study = optuna.create_study(
+        directions=["minimize", "minimize"],
+        sampler=optuna.samplers.TPESampler(seed=42, n_startup_trials=5)
+    )
+    def objective(trial):
+        x = trial.suggest_float("x", 0.0, 1.0)
+        return x, 1.0 - x
+    study.optimize(objective, n_trials=30)
+    assert len(study.trials) == 30
+    # 应有 Pareto 最优解
+    pareto = study.best_trials
+    assert len(pareto) > 0
+
+# ═══════════════════════════════════════════════════════════════════════════
 #  执行
 # ═══════════════════════════════════════════════════════════════════════════
 

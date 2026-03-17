@@ -81,8 +81,9 @@ pub struct TpeSampler {
     n_startup_trials: usize,
     /// Number of EI candidates to draw from l(x).
     n_ei_candidates: usize,
-    /// Study direction for sorting trials.
-    direction: StudyDirection,
+    /// 对齐 Python: 支持单目标和多目标。
+    /// 单目标时长度为 1，多目标时 >= 2 (MOTPE)。
+    directions: Vec<StudyDirection>,
     /// Whether to sample parameters jointly (multivariate) or independently.
     multivariate: bool,
     /// Whether to use group-decomposed search space (requires multivariate=true).
@@ -143,6 +144,33 @@ impl TpeSampler {
         categorical_distance_func: Option<HashMap<String, CategoricalDistanceFunc>>,
         warn_independent_sampling: bool,
     ) -> Self {
+        Self::new_multi(
+            vec![direction], seed, n_startup_trials, n_ei_candidates,
+            multivariate, consider_magic_clip, consider_endpoints, prior_weight,
+            group, constant_liar, constraints_func, gamma, weights,
+            categorical_distance_func, warn_independent_sampling,
+        )
+    }
+
+    /// 多目标 TPE 构造函数 (MOTPE).
+    #[allow(clippy::too_many_arguments)]
+    pub fn new_multi(
+        directions: Vec<StudyDirection>,
+        seed: Option<u64>,
+        n_startup_trials: usize,
+        n_ei_candidates: usize,
+        multivariate: bool,
+        consider_magic_clip: bool,
+        consider_endpoints: bool,
+        prior_weight: f64,
+        group: bool,
+        constant_liar: bool,
+        constraints_func: Option<ConstraintsFn>,
+        gamma: Option<GammaFn>,
+        weights: Option<WeightsFn>,
+        categorical_distance_func: Option<HashMap<String, CategoricalDistanceFunc>>,
+        warn_independent_sampling: bool,
+    ) -> Self {
         let rng = match seed {
             Some(s) => ChaCha8Rng::seed_from_u64(s),
             None => ChaCha8Rng::from_entropy(),
@@ -150,7 +178,7 @@ impl TpeSampler {
         Self {
             n_startup_trials,
             n_ei_candidates,
-            direction,
+            directions,
             multivariate,
             group,
             constant_liar,
@@ -231,12 +259,24 @@ impl TpeSampler {
 
     /// Split trials into below/above groups for TPE.
     ///
-    /// When constraints are enabled, infeasible trials are separated and
-    /// only fill below if feasible trials don't fill it.
+    /// 单目标: 按目标值排序分割。
+    /// 多目标 (MOTPE): 使用非支配排序 + HSSP 平局打断分割。
     fn split_trials<'a>(
         &self,
         trials: &'a [FrozenTrial],
     ) -> (Vec<&'a FrozenTrial>, Vec<&'a FrozenTrial>) {
+        if self.directions.len() > 1 {
+            return self.split_trials_multi_objective(trials);
+        }
+        self.split_trials_single_objective(trials)
+    }
+
+    /// 单目标分割。
+    fn split_trials_single_objective<'a>(
+        &self,
+        trials: &'a [FrozenTrial],
+    ) -> (Vec<&'a FrozenTrial>, Vec<&'a FrozenTrial>) {
+        let direction = self.directions[0];
         let constraints_enabled = self.constraints_func.is_some();
 
         let mut complete: Vec<&FrozenTrial> = Vec::new();
@@ -260,7 +300,7 @@ impl TpeSampler {
         let n_below = (self.gamma)(n);
 
         // Sort complete trials by objective value.
-        match self.direction {
+        match direction {
             StudyDirection::Minimize | StudyDirection::NotSet => {
                 complete.sort_by(|a, b| {
                     let va = a.value().ok().flatten().unwrap_or(f64::INFINITY);
@@ -277,18 +317,12 @@ impl TpeSampler {
             }
         }
 
-        // Sort pruned by (-last_step, direction-aware intermediate_value).
-        // 对齐 Python _get_pruned_trial_score：
-        //   有中间值时返回 (-step, value) 或 (-step, -value for Maximize)
-        //   无中间值时返回 (1, 0.0)
-        // 对齐 Python: NaN 中间值映射为 inf，确保排在同步骤试验的最后
         pruned.sort_by(|a, b| {
-            let score_a = Self::pruned_trial_score(a, self.direction);
-            let score_b = Self::pruned_trial_score(b, self.direction);
+            let score_a = Self::pruned_trial_score(a, direction);
+            let score_b = Self::pruned_trial_score(b, direction);
             score_a.partial_cmp(&score_b).unwrap_or(std::cmp::Ordering::Equal)
         });
 
-        // Split: best n_below from complete, then pruned, then infeasible.
         let mut below = Vec::new();
         let mut above = Vec::new();
 
@@ -310,7 +344,6 @@ impl TpeSampler {
             }
         }
 
-        // Infeasible trials sorted by violation score (less violation first).
         infeasible.sort_by(|a, b| {
             Self::infeasible_score(a)
                 .partial_cmp(&Self::infeasible_score(b))
@@ -325,16 +358,262 @@ impl TpeSampler {
             }
         }
 
-        // Running trials always go to above.
         above.extend(running);
 
-        // 对齐 Python: 按 trial.number 排序，确保权重按时间顺序分配
-        // Python: below_trials.sort(key=lambda trial: trial.number)
-        //         above_trials.sort(key=lambda trial: trial.number)
         below.sort_by_key(|t| t.number);
         above.sort_by_key(|t| t.number);
 
         (below, above)
+    }
+
+    /// 对齐 Python `_split_complete_trials_multi_objective`:
+    /// 多目标分割 — 非支配排序 + HSSP 平局打断。
+    fn split_trials_multi_objective<'a>(
+        &self,
+        trials: &'a [FrozenTrial],
+    ) -> (Vec<&'a FrozenTrial>, Vec<&'a FrozenTrial>) {
+        let mut complete: Vec<&FrozenTrial> = Vec::new();
+        let mut running: Vec<&FrozenTrial> = Vec::new();
+
+        for t in trials {
+            match t.state {
+                TrialState::Running => running.push(t),
+                TrialState::Complete if t.values.is_some() => complete.push(t),
+                _ => {}
+            }
+        }
+
+        let n = complete.len();
+        if n == 0 {
+            return (vec![], running);
+        }
+
+        let n_below = (self.gamma)(n);
+        if n_below == 0 || n_below >= n {
+            let mut below: Vec<&FrozenTrial> = complete.clone();
+            below.sort_by_key(|t| t.number);
+            let mut above: Vec<&FrozenTrial> = running;
+            above.sort_by_key(|t| t.number);
+            return (below, above);
+        }
+
+        // 将目标值转为 loss 值（Maximize 方向取负）
+        let loss_values: Vec<Vec<f64>> = complete.iter().map(|t| {
+            let vals = t.values.as_ref().unwrap();
+            vals.iter().enumerate().map(|(i, &v)| {
+                if self.directions[i] == StudyDirection::Maximize { -v } else { v }
+            }).collect()
+        }).collect();
+
+        // 非支配排序 (直接在 loss values 上操作)
+        let ranks = Self::fast_non_domination_rank(&loss_values);
+
+        let mut below_indices = Vec::new();
+        let mut above_indices = Vec::new();
+
+        // 按 rank 分配到 below
+        let max_rank = *ranks.iter().max().unwrap_or(&0);
+        for rank in 0..=max_rank {
+            let rank_indices: Vec<usize> = ranks.iter().enumerate()
+                .filter(|&(_, &r)| r == rank)
+                .map(|(i, _)| i)
+                .collect();
+
+            if below_indices.len() + rank_indices.len() <= n_below {
+                below_indices.extend(rank_indices);
+            } else {
+                // 需要部分选择 — 用 HSSP 打破平局
+                let remaining = n_below - below_indices.len();
+                if remaining > 0 {
+                    let rank_losses: Vec<Vec<f64>> = rank_indices.iter()
+                        .map(|&i| loss_values[i].clone())
+                        .collect();
+                    let ref_point = Self::get_reference_point(&loss_values);
+                    let hssp_indices: Vec<usize> = (0..rank_losses.len()).collect();
+                    let selected = crate::multi_objective::solve_hssp(
+                        &rank_losses, &hssp_indices, remaining, &ref_point,
+                    );
+                    for sel_idx in selected {
+                        below_indices.push(rank_indices[sel_idx]);
+                    }
+                }
+                // 余下放入 above
+                for &idx in &rank_indices {
+                    if !below_indices.contains(&idx) {
+                        above_indices.push(idx);
+                    }
+                }
+                // 后续所有 rank 都放入 above
+                for higher_rank in (rank + 1)..=max_rank {
+                    for (i, &r) in ranks.iter().enumerate() {
+                        if r == higher_rank {
+                            above_indices.push(i);
+                        }
+                    }
+                }
+                break;
+            }
+        }
+
+        // 未在 below 也未在 above 中的放入 above
+        for i in 0..n {
+            if !below_indices.contains(&i) && !above_indices.contains(&i) {
+                above_indices.push(i);
+            }
+        }
+
+        let mut below: Vec<&FrozenTrial> = below_indices.iter().map(|&i| complete[i]).collect();
+        let mut above: Vec<&FrozenTrial> = above_indices.iter().map(|&i| complete[i]).collect();
+        above.extend(running);
+
+        below.sort_by_key(|t| t.number);
+        above.sort_by_key(|t| t.number);
+
+        (below, above)
+    }
+
+    /// 对齐 Python `_fast_non_domination_rank`:
+    /// 直接在 loss values 矩阵上计算非支配层级。
+    fn fast_non_domination_rank(loss_values: &[Vec<f64>]) -> Vec<usize> {
+        let n = loss_values.len();
+        if n == 0 {
+            return vec![];
+        }
+
+        let mut dominated_count = vec![0usize; n];
+        let mut dominates_list: Vec<Vec<usize>> = vec![vec![]; n];
+
+        for i in 0..n {
+            for j in (i + 1)..n {
+                let dom_ij = Self::dominates_values(&loss_values[i], &loss_values[j]);
+                let dom_ji = Self::dominates_values(&loss_values[j], &loss_values[i]);
+                if dom_ij {
+                    dominates_list[i].push(j);
+                    dominated_count[j] += 1;
+                } else if dom_ji {
+                    dominates_list[j].push(i);
+                    dominated_count[i] += 1;
+                }
+            }
+        }
+
+        let mut ranks = vec![0usize; n];
+        let mut current_front: Vec<usize> = (0..n).filter(|&i| dominated_count[i] == 0).collect();
+        let mut rank = 0;
+
+        while !current_front.is_empty() {
+            let mut next_front = Vec::new();
+            for &i in &current_front {
+                ranks[i] = rank;
+                for &j in &dominates_list[i] {
+                    dominated_count[j] -= 1;
+                    if dominated_count[j] == 0 {
+                        next_front.push(j);
+                    }
+                }
+            }
+            current_front = next_front;
+            rank += 1;
+        }
+
+        ranks
+    }
+
+    /// Check if values `a` dominates `b` (all <= and at least one <).
+    fn dominates_values(a: &[f64], b: &[f64]) -> bool {
+        let mut any_strictly_better = false;
+        for (ai, bi) in a.iter().zip(b.iter()) {
+            if ai > bi {
+                return false;
+            }
+            if ai < bi {
+                any_strictly_better = true;
+            }
+        }
+        any_strictly_better
+    }
+
+    /// 对齐 Python `_get_reference_point`:
+    /// 计算超体积参考点。
+    fn get_reference_point(loss_values: &[Vec<f64>]) -> Vec<f64> {
+        if loss_values.is_empty() {
+            return vec![];
+        }
+        let n_objectives = loss_values[0].len();
+        let mut worst = vec![f64::NEG_INFINITY; n_objectives];
+        for vals in loss_values {
+            for (i, &v) in vals.iter().enumerate() {
+                if v > worst[i] {
+                    worst[i] = v;
+                }
+            }
+        }
+        // 对齐 Python: reference_point = max(1.1 * worst, 0.9 * worst); [==0] = EPS
+        let eps = 1e-10;
+        worst.iter().map(|&w| {
+            if w == 0.0 { eps }
+            else if w > 0.0 { 1.1 * w }
+            else { 0.9 * w }
+        }).collect()
+    }
+
+    /// 对齐 Python `_calculate_weights_below_for_multi_objective`:
+    /// 基于超体积贡献计算 below 组的权重。
+    fn calculate_mo_weights(below_trials: &[&FrozenTrial], directions: &[StudyDirection]) -> Vec<f64> {
+        let n = below_trials.len();
+        if n == 0 {
+            return vec![];
+        }
+
+        // 转换为 loss values
+        let loss_values: Vec<Vec<f64>> = below_trials.iter().map(|t| {
+            let vals = t.values.as_ref().unwrap();
+            vals.iter().enumerate().map(|(i, &v)| {
+                if directions[i] == StudyDirection::Maximize { -v } else { v }
+            }).collect()
+        }).collect();
+
+        // 找 Pareto 前沿
+        let ranks = Self::fast_non_domination_rank(&loss_values);
+        let pareto_indices: Vec<usize> = ranks.iter().enumerate()
+            .filter(|&(_, &r)| r == 0)
+            .map(|(i, _)| i)
+            .collect();
+
+        if pareto_indices.is_empty() {
+            return vec![1.0 / n as f64; n];
+        }
+
+        let ref_point = Self::get_reference_point(&loss_values);
+        let pareto_losses: Vec<Vec<f64>> = pareto_indices.iter()
+            .map(|&i| loss_values[i].clone())
+            .collect();
+
+        // 计算完整 Pareto 前沿的超体积
+        let full_hv = crate::multi_objective::hypervolume(&pareto_losses, &ref_point);
+
+        // Leave-one-out: 每个 Pareto 点的 HV 贡献
+        let eps = 1e-10_f64;
+        let mut contribs = vec![0.0_f64; n];
+        for (pi, &orig_idx) in pareto_indices.iter().enumerate() {
+            let without: Vec<Vec<f64>> = pareto_losses.iter().enumerate()
+                .filter(|(i, _)| *i != pi)
+                .map(|(_, v)| v.clone())
+                .collect();
+            let hv_without = if without.is_empty() {
+                0.0
+            } else {
+                crate::multi_objective::hypervolume(&without, &ref_point)
+            };
+            contribs[orig_idx] = full_hv - hv_without;
+        }
+
+        // 对齐 Python: weights = max(contribs / max(max(contribs), EPS), EPS)
+        let max_contrib = contribs.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
+        let denom = max_contrib.max(eps);
+        let weights: Vec<f64> = contribs.iter().map(|&c| (c / denom).max(eps)).collect();
+
+        weights
     }
 
     /// Get observations from trials for the given search space.
@@ -397,11 +676,17 @@ impl TpeSampler {
         let obs_below = Self::get_observations(&below, search_space);
         let obs_above = Self::get_observations(&above, search_space);
 
-        // 对齐 Python: 将自定义 weights 函数传递给 ParzenEstimator
+        // 对齐 Python: 多目标时 below 组使用 HV 贡献权重
         let weights_ref = self.weights.clone();
-        let pe_below =
+        let pe_below = if self.directions.len() > 1 {
+            // MOTPE: 使用超体积贡献权重
+            let mo_weights = Self::calculate_mo_weights(&below, &self.directions);
+            ParzenEstimator::new(&obs_below, search_space, &self.pe_params,
+                                 Some(&mo_weights), Some(&|n| weights_ref(n)))
+        } else {
             ParzenEstimator::new(&obs_below, search_space, &self.pe_params, None,
-                                 Some(&|n| weights_ref(n)));
+                                 Some(&|n| weights_ref(n)))
+        };
         let pe_above =
             ParzenEstimator::new(&obs_above, search_space, &self.pe_params, None,
                                  Some(&|n| weights_ref(n)));
@@ -626,7 +911,7 @@ impl Sampler for TpeSampler {
 ///     .build();
 /// ```
 pub struct TpeSamplerBuilder {
-    direction: StudyDirection,
+    directions: Vec<StudyDirection>,
     seed: Option<u64>,
     n_startup_trials: usize,
     n_ei_candidates: usize,
@@ -647,7 +932,28 @@ impl TpeSamplerBuilder {
     /// Create a new builder with the given optimization direction.
     pub fn new(direction: StudyDirection) -> Self {
         Self {
-            direction,
+            directions: vec![direction],
+            seed: None,
+            n_startup_trials: 10,
+            n_ei_candidates: 24,
+            multivariate: false,
+            consider_magic_clip: true,
+            consider_endpoints: false,
+            prior_weight: 1.0,
+            group: false,
+            constant_liar: false,
+            constraints_func: None,
+            gamma: None,
+            weights: None,
+            categorical_distance_func: None,
+            warn_independent_sampling: true,
+        }
+    }
+
+    /// Create a new builder for multi-objective optimization (MOTPE).
+    pub fn new_multi(directions: Vec<StudyDirection>) -> Self {
+        Self {
+            directions,
             seed: None,
             n_startup_trials: 10,
             n_ei_candidates: 24,
@@ -756,8 +1062,8 @@ impl TpeSamplerBuilder {
 
     /// Build the [`TpeSampler`].
     pub fn build(self) -> TpeSampler {
-        TpeSampler::new(
-            self.direction,
+        TpeSampler::new_multi(
+            self.directions,
             self.seed,
             self.n_startup_trials,
             self.n_ei_candidates,
@@ -1158,5 +1464,175 @@ mod tests {
         );
         // x 应保留
         assert!(search_space.contains_key("x"));
+    }
+
+    // ======== MOTPE multi-objective tests ========
+
+    fn make_mo_trial(number: i64, values: Vec<f64>, params: HashMap<String, ParamValue>) -> FrozenTrial {
+        let now = chrono::Utc::now();
+        let mut distributions = HashMap::new();
+        for (name, val) in &params {
+            match val {
+                ParamValue::Float(_) => {
+                    distributions.insert(
+                        name.clone(),
+                        Distribution::FloatDistribution(
+                            FloatDistribution::new(-10.0, 10.0, false, None).unwrap(),
+                        ),
+                    );
+                }
+                _ => {}
+            }
+        }
+        FrozenTrial {
+            number,
+            state: TrialState::Complete,
+            values: Some(values),
+            datetime_start: Some(now),
+            datetime_complete: Some(now),
+            params,
+            distributions,
+            user_attrs: HashMap::new(),
+            system_attrs: HashMap::new(),
+            intermediate_values: HashMap::new(),
+            trial_id: number,
+        }
+    }
+
+    #[test]
+    fn test_fast_non_domination_rank() {
+        // Three points: A=(1,3) dominates nothing exclusively,
+        // B=(2,2), C=(3,1) -- all are Pareto-optimal
+        let loss_values = vec![
+            vec![1.0, 3.0],
+            vec![2.0, 2.0],
+            vec![3.0, 1.0],
+        ];
+        let ranks = TpeSampler::fast_non_domination_rank(&loss_values);
+        assert_eq!(ranks, vec![0, 0, 0]);
+
+        // A=(1,1) dominates B=(2,2) and C=(3,3)
+        let loss_values2 = vec![
+            vec![1.0, 1.0],
+            vec![2.0, 2.0],
+            vec![3.0, 3.0],
+        ];
+        let ranks2 = TpeSampler::fast_non_domination_rank(&loss_values2);
+        assert_eq!(ranks2[0], 0);
+        assert_eq!(ranks2[1], 1);
+        assert_eq!(ranks2[2], 2);
+    }
+
+    #[test]
+    fn test_dominates_values() {
+        assert!(TpeSampler::dominates_values(&[1.0, 1.0], &[2.0, 2.0]));
+        assert!(TpeSampler::dominates_values(&[1.0, 2.0], &[2.0, 2.0]));
+        assert!(!TpeSampler::dominates_values(&[1.0, 3.0], &[2.0, 2.0]));
+        assert!(!TpeSampler::dominates_values(&[2.0, 2.0], &[2.0, 2.0]));
+    }
+
+    #[test]
+    fn test_get_reference_point() {
+        let losses = vec![
+            vec![1.0, 2.0],
+            vec![3.0, 1.0],
+        ];
+        let rp = TpeSampler::get_reference_point(&losses);
+        assert!((rp[0] - 3.3).abs() < 1e-9); // 1.1 * 3.0
+        assert!((rp[1] - 2.2).abs() < 1e-9); // 1.1 * 2.0
+    }
+
+    #[test]
+    fn test_get_reference_point_negative() {
+        let losses = vec![
+            vec![-3.0, -1.0],
+        ];
+        let rp = TpeSampler::get_reference_point(&losses);
+        // negative * 0.9
+        assert!((rp[0] - (-2.7)).abs() < 1e-9);
+        assert!((rp[1] - (-0.9)).abs() < 1e-9);
+    }
+
+    #[test]
+    fn test_split_trials_multi_objective() {
+        let dirs = vec![StudyDirection::Minimize, StudyDirection::Minimize];
+        let sampler = TpeSampler::new_multi(
+            dirs.clone(), Some(42), 0, 24, false, true, false, 1.0,
+            false, false, None, None, None, None, true,
+        );
+
+        let trials: Vec<FrozenTrial> = (0..10).map(|i| {
+            let x = i as f64;
+            make_mo_trial(
+                i,
+                vec![x, 10.0 - x], // Pareto front: all non-dominated
+                HashMap::from([("x".to_string(), ParamValue::Float(x))]),
+            )
+        }).collect();
+
+        let (below, above) = sampler.split_trials_multi_objective(&trials);
+        // default gamma: n_below = ceil(0.1 * 10) = 1 (for n=10)
+        // All on Pareto front, so HSSP used
+        assert!(!below.is_empty());
+        assert!(!above.is_empty());
+        assert_eq!(below.len() + above.len(), 10);
+    }
+
+    #[test]
+    fn test_calculate_mo_weights_all_pareto() {
+        let dirs = vec![StudyDirection::Minimize, StudyDirection::Minimize];
+        let trials: Vec<FrozenTrial> = vec![
+            make_mo_trial(0, vec![1.0, 3.0], HashMap::new()),
+            make_mo_trial(1, vec![2.0, 2.0], HashMap::new()),
+            make_mo_trial(2, vec![3.0, 1.0], HashMap::new()),
+        ];
+        let trial_refs: Vec<&FrozenTrial> = trials.iter().collect();
+        let weights = TpeSampler::calculate_mo_weights(&trial_refs, &dirs);
+        assert_eq!(weights.len(), 3);
+        // All are Pareto-optimal, so all should have positive weights
+        for w in &weights {
+            assert!(*w > 0.0);
+        }
+        // Max weight should be 1.0 (normalized by max contribution)
+        let max_w = weights.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
+        assert!((max_w - 1.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn test_calculate_mo_weights_dominated() {
+        let dirs = vec![StudyDirection::Minimize, StudyDirection::Minimize];
+        let trials: Vec<FrozenTrial> = vec![
+            make_mo_trial(0, vec![1.0, 1.0], HashMap::new()), // dominates all
+            make_mo_trial(1, vec![2.0, 2.0], HashMap::new()), // dominated
+            make_mo_trial(2, vec![3.0, 3.0], HashMap::new()), // dominated
+        ];
+        let trial_refs: Vec<&FrozenTrial> = trials.iter().collect();
+        let weights = TpeSampler::calculate_mo_weights(&trial_refs, &dirs);
+        // trial 0 is the only Pareto point, should have the largest weight
+        assert!(weights[0] > weights[1]);
+        assert!(weights[0] > weights[2]);
+        // Pareto point weight should be 1.0
+        assert!((weights[0] - 1.0).abs() < 1e-9);
+        // Dominated weights should be EPS-level
+        assert!(weights[1] < 1e-5);
+        assert!(weights[2] < 1e-5);
+    }
+
+    #[test]
+    fn test_motpe_builder_multi() {
+        let sampler = TpeSamplerBuilder::new_multi(vec![
+            StudyDirection::Minimize,
+            StudyDirection::Maximize,
+        ]).build();
+        assert_eq!(sampler.directions.len(), 2);
+        assert_eq!(sampler.directions[0], StudyDirection::Minimize);
+        assert_eq!(sampler.directions[1], StudyDirection::Maximize);
+    }
+
+    #[test]
+    fn test_motpe_builder_single() {
+        let sampler = TpeSamplerBuilder::new(StudyDirection::Minimize).build();
+        assert_eq!(sampler.directions.len(), 1);
+        assert_eq!(sampler.directions[0], StudyDirection::Minimize);
     }
 }

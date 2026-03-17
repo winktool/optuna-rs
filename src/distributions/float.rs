@@ -59,8 +59,15 @@ impl FloatDistribution {
     }
 
     /// Check if `value` (in internal representation) is contained in this distribution.
-    /// 对齐 Python: 严格 low <= value <= high（无容差）
+    /// 对齐 Python `_contains`: `self.low <= value <= self.high`
+    /// 注意: NaN 与任何值比较均为 false（IEEE 754），Python 的链式比较
+    /// `self.low <= NaN <= self.high` 返回 False，此处需显式处理。
     pub fn contains(&self, value: f64) -> bool {
+        // 对齐 Python: NaN 不属于任何分布（NaN < x 和 NaN > x 都是 false，
+        // 但 Rust 的 guard 写法会漏过，必须显式检查）
+        if value.is_nan() {
+            return false;
+        }
         if value < self.low || value > self.high {
             return false;
         }
@@ -399,5 +406,68 @@ mod tests {
             let external = d.to_external_repr(internal);
             assert!((external - v).abs() < 1e-12);
         }
+    }
+
+    // ====================================================================
+    // NaN / Inf 边界测试 — 对齐 Python IEEE 754 行为
+    // ====================================================================
+
+    /// 对齐 Python: contains(NaN) 必须返回 false。
+    /// Python `self.low <= NaN <= self.high` → False（链式比较）。
+    #[test]
+    fn test_contains_nan_returns_false() {
+        let d = FloatDistribution::new(0.0, 1.0, false, None).unwrap();
+        assert!(!d.contains(f64::NAN), "NaN should NOT be contained (no step)");
+
+        let d_step = FloatDistribution::new(0.0, 1.0, false, Some(0.5)).unwrap();
+        assert!(!d_step.contains(f64::NAN), "NaN should NOT be contained (with step)");
+
+        let d_log = FloatDistribution::new(0.01, 1.0, true, None).unwrap();
+        assert!(!d_log.contains(f64::NAN), "NaN should NOT be contained (log)");
+    }
+
+    /// 对齐 Python: contains(Inf) — Inf > high 所以返回 false。
+    #[test]
+    fn test_contains_inf_returns_false() {
+        let d = FloatDistribution::new(0.0, 1.0, false, None).unwrap();
+        assert!(!d.contains(f64::INFINITY), "Inf should NOT be contained");
+        assert!(!d.contains(f64::NEG_INFINITY), "-Inf should NOT be contained");
+    }
+
+    /// 对齐 Python: to_internal_repr(NaN) 报错。
+    #[test]
+    fn test_to_internal_repr_nan_error() {
+        let d = FloatDistribution::new(0.0, 1.0, false, None).unwrap();
+        assert!(d.to_internal_repr(f64::NAN).is_err());
+    }
+
+    /// 对齐 Python: to_internal_repr(Inf) 对 non-log 不报错。
+    #[test]
+    fn test_to_internal_repr_inf_ok_for_non_log() {
+        let d = FloatDistribution::new(0.0, 1.0, false, None).unwrap();
+        assert!(d.to_internal_repr(f64::INFINITY).is_ok());
+    }
+
+    /// 对齐 Python: contains 边界值包含。
+    #[test]
+    fn test_contains_boundary_inclusive() {
+        let d = FloatDistribution::new(0.0, 1.0, false, None).unwrap();
+        assert!(d.contains(0.0), "low boundary should be contained");
+        assert!(d.contains(1.0), "high boundary should be contained");
+        assert!(!d.contains(-0.001), "below low should not be contained");
+        assert!(!d.contains(1.001), "above high should not be contained");
+    }
+
+    /// 对齐 Python: step 分布的精确网格检查。
+    #[test]
+    fn test_contains_step_grid() {
+        let d = FloatDistribution::new(0.0, 1.0, false, Some(0.25)).unwrap();
+        assert!(d.contains(0.0));
+        assert!(d.contains(0.25));
+        assert!(d.contains(0.5));
+        assert!(d.contains(0.75));
+        assert!(d.contains(1.0));
+        assert!(!d.contains(0.1), "不在 0.25 步长网格上");
+        assert!(!d.contains(0.3), "不在 0.25 步长网格上");
     }
 }

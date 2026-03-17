@@ -366,36 +366,98 @@ impl TpeSampler {
         (below, above)
     }
 
-    /// 对齐 Python `_split_complete_trials_multi_objective`:
-    /// 多目标分割 — 非支配排序 + HSSP 平局打断。
+    /// 对齐 Python `_split_complete_trials_multi_objective` + `_split_trials`:
+    /// 多目标分割 — complete 使用非支配排序 + HSSP 平局打断，
+    /// 然后依次填充 pruned 和 infeasible，与单目标逻辑一致。
     fn split_trials_multi_objective<'a>(
         &self,
         trials: &'a [FrozenTrial],
     ) -> (Vec<&'a FrozenTrial>, Vec<&'a FrozenTrial>) {
+        let constraints_enabled = self.constraints_func.is_some();
+
         let mut complete: Vec<&FrozenTrial> = Vec::new();
+        let mut pruned: Vec<&FrozenTrial> = Vec::new();
         let mut running: Vec<&FrozenTrial> = Vec::new();
+        let mut infeasible: Vec<&FrozenTrial> = Vec::new();
 
         for t in trials {
             match t.state {
                 TrialState::Running => running.push(t),
+                _ if constraints_enabled && Self::infeasible_score(t) > 0.0 => {
+                    infeasible.push(t);
+                }
                 TrialState::Complete if t.values.is_some() => complete.push(t),
+                TrialState::Pruned => pruned.push(t),
                 _ => {}
             }
         }
 
-        let n = complete.len();
+        // 对齐 Python: n = complete + pruned + infeasible
+        let n = complete.len() + pruned.len() + infeasible.len();
         if n == 0 {
             return (vec![], running);
         }
 
         let n_below = (self.gamma)(n);
-        if n_below == 0 || n_below >= n {
-            let mut below: Vec<&FrozenTrial> = complete.clone();
-            below.sort_by_key(|t| t.number);
-            let mut above: Vec<&FrozenTrial> = running;
-            above.sort_by_key(|t| t.number);
-            return (below, above);
-        }
+
+        // --- Step 1: split complete trials (multi-objective: NSGA + HSSP) ---
+        let n_below_complete = n_below.min(complete.len());
+        let (below_complete, above_complete) = if complete.is_empty() || n_below_complete == 0 {
+            (vec![], complete)
+        } else if n_below_complete >= complete.len() {
+            (complete.clone(), vec![])
+        } else {
+            self.split_complete_multi_objective(&complete, n_below_complete)
+        };
+
+        // --- Step 2: split pruned trials ---
+        let mut remaining = n_below.saturating_sub(below_complete.len());
+        let remaining_pruned = remaining.min(pruned.len());
+        // 按 pruned_trial_score 排序 — 对齐 Python _split_pruned_trials
+        // 多目标 pruned 排序: Python 使用 study.direction (第一个方向)
+        let first_dir = self.directions[0];
+        pruned.sort_by(|a, b| {
+            let sa = Self::pruned_trial_score(a, first_dir);
+            let sb = Self::pruned_trial_score(b, first_dir);
+            sa.partial_cmp(&sb).unwrap_or(std::cmp::Ordering::Equal)
+        });
+        let below_pruned: Vec<&FrozenTrial> = pruned[..remaining_pruned].to_vec();
+        let above_pruned: Vec<&FrozenTrial> = pruned[remaining_pruned..].to_vec();
+
+        // --- Step 3: split infeasible trials ---
+        remaining = remaining.saturating_sub(below_pruned.len());
+        let remaining_infeasible = remaining.min(infeasible.len());
+        infeasible.sort_by(|a, b| {
+            Self::infeasible_score(a)
+                .partial_cmp(&Self::infeasible_score(b))
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
+        let below_infeasible: Vec<&FrozenTrial> = infeasible[..remaining_infeasible].to_vec();
+        let above_infeasible: Vec<&FrozenTrial> = infeasible[remaining_infeasible..].to_vec();
+
+        // --- Combine ---
+        let mut below = below_complete;
+        below.extend(below_pruned);
+        below.extend(below_infeasible);
+
+        let mut above = above_complete;
+        above.extend(above_pruned);
+        above.extend(above_infeasible);
+        above.extend(running);
+
+        below.sort_by_key(|t| t.number);
+        above.sort_by_key(|t| t.number);
+
+        (below, above)
+    }
+
+    /// 多目标 complete trials 分割内部函数: 非支配排序 + HSSP 平局打断。
+    fn split_complete_multi_objective<'a>(
+        &self,
+        complete: &[&'a FrozenTrial],
+        n_below: usize,
+    ) -> (Vec<&'a FrozenTrial>, Vec<&'a FrozenTrial>) {
+        let n = complete.len();
 
         // 将目标值转为 loss 值（Maximize 方向取负）
         let loss_values: Vec<Vec<f64>> = complete.iter().map(|t| {
@@ -405,13 +467,12 @@ impl TpeSampler {
             }).collect()
         }).collect();
 
-        // 非支配排序 (直接在 loss values 上操作)
+        // 非支配排序
         let ranks = Self::fast_non_domination_rank(&loss_values);
 
         let mut below_indices = Vec::new();
         let mut above_indices = Vec::new();
 
-        // 按 rank 分配到 below
         let max_rank = *ranks.iter().max().unwrap_or(&0);
         for rank in 0..=max_rank {
             let rank_indices: Vec<usize> = ranks.iter().enumerate()
@@ -422,7 +483,6 @@ impl TpeSampler {
             if below_indices.len() + rank_indices.len() <= n_below {
                 below_indices.extend(rank_indices);
             } else {
-                // 需要部分选择 — 用 HSSP 打破平局
                 let remaining = n_below - below_indices.len();
                 if remaining > 0 {
                     let rank_losses: Vec<Vec<f64>> = rank_indices.iter()
@@ -437,13 +497,11 @@ impl TpeSampler {
                         below_indices.push(rank_indices[sel_idx]);
                     }
                 }
-                // 余下放入 above
                 for &idx in &rank_indices {
                     if !below_indices.contains(&idx) {
                         above_indices.push(idx);
                     }
                 }
-                // 后续所有 rank 都放入 above
                 for higher_rank in (rank + 1)..=max_rank {
                     for (i, &r) in ranks.iter().enumerate() {
                         if r == higher_rank {
@@ -455,20 +513,14 @@ impl TpeSampler {
             }
         }
 
-        // 未在 below 也未在 above 中的放入 above
         for i in 0..n {
             if !below_indices.contains(&i) && !above_indices.contains(&i) {
                 above_indices.push(i);
             }
         }
 
-        let mut below: Vec<&FrozenTrial> = below_indices.iter().map(|&i| complete[i]).collect();
-        let mut above: Vec<&FrozenTrial> = above_indices.iter().map(|&i| complete[i]).collect();
-        above.extend(running);
-
-        below.sort_by_key(|t| t.number);
-        above.sort_by_key(|t| t.number);
-
+        let below: Vec<&FrozenTrial> = below_indices.iter().map(|&i| complete[i]).collect();
+        let above: Vec<&FrozenTrial> = above_indices.iter().map(|&i| complete[i]).collect();
         (below, above)
     }
 
@@ -559,43 +611,70 @@ impl TpeSampler {
 
     /// 对齐 Python `_calculate_weights_below_for_multi_objective`:
     /// 基于超体积贡献计算 below 组的权重。
-    fn calculate_mo_weights(below_trials: &[&FrozenTrial], directions: &[StudyDirection]) -> Vec<f64> {
+    /// 不可行试验（约束违反 > 0）权重设为 EPS，不参与 HV 计算。
+    fn calculate_mo_weights(
+        below_trials: &[&FrozenTrial],
+        directions: &[StudyDirection],
+        constraints_enabled: bool,
+    ) -> Vec<f64> {
         let n = below_trials.len();
         if n == 0 {
             return vec![];
         }
 
-        // 转换为 loss values
-        let loss_values: Vec<Vec<f64>> = below_trials.iter().map(|t| {
-            let vals = t.values.as_ref().unwrap();
-            vals.iter().enumerate().map(|(i, &v)| {
-                if directions[i] == StudyDirection::Maximize { -v } else { v }
+        let eps = 1e-10_f64;
+
+        // 对齐 Python: 识别可行/不可行试验
+        let is_feasible: Vec<bool> = below_trials.iter().map(|t| {
+            if !constraints_enabled {
+                true
+            } else {
+                Self::infeasible_score(t) <= 0.0
+            }
+        }).collect();
+
+        // 初始化权重: 可行=1.0, 不可行=EPS
+        let mut weights: Vec<f64> = is_feasible.iter().map(|&f| if f { 1.0 } else { eps }).collect();
+
+        let n_feasible: usize = is_feasible.iter().filter(|&&f| f).count();
+        if n_feasible <= 1 {
+            return weights;
+        }
+
+        // 只在可行试验上计算 HV 贡献
+        let feasible_indices: Vec<usize> = is_feasible.iter().enumerate()
+            .filter(|&(_, f)| *f)
+            .map(|(i, _)| i)
+            .collect();
+
+        let loss_values: Vec<Vec<f64>> = feasible_indices.iter().map(|&i| {
+            let vals = below_trials[i].values.as_ref().unwrap();
+            vals.iter().enumerate().map(|(j, &v)| {
+                if directions[j] == StudyDirection::Maximize { -v } else { v }
             }).collect()
         }).collect();
 
-        // 找 Pareto 前沿
+        let ref_point = Self::get_reference_point(&loss_values);
+
+        // 找 Pareto 前沿 (在可行试验中)
         let ranks = Self::fast_non_domination_rank(&loss_values);
-        let pareto_indices: Vec<usize> = ranks.iter().enumerate()
+        let pareto_local_indices: Vec<usize> = ranks.iter().enumerate()
             .filter(|&(_, &r)| r == 0)
             .map(|(i, _)| i)
             .collect();
 
-        if pareto_indices.is_empty() {
-            return vec![1.0 / n as f64; n];
-        }
-
-        let ref_point = Self::get_reference_point(&loss_values);
-        let pareto_losses: Vec<Vec<f64>> = pareto_indices.iter()
+        let pareto_losses: Vec<Vec<f64>> = pareto_local_indices.iter()
             .map(|&i| loss_values[i].clone())
             .collect();
 
-        // 计算完整 Pareto 前沿的超体积
         let full_hv = crate::multi_objective::hypervolume(&pareto_losses, &ref_point);
+        if full_hv.is_infinite() {
+            return weights;
+        }
 
         // Leave-one-out: 每个 Pareto 点的 HV 贡献
-        let eps = 1e-10_f64;
-        let mut contribs = vec![0.0_f64; n];
-        for (pi, &orig_idx) in pareto_indices.iter().enumerate() {
+        let mut contribs = vec![0.0_f64; n_feasible];
+        for (pi, &local_idx) in pareto_local_indices.iter().enumerate() {
             let without: Vec<Vec<f64>> = pareto_losses.iter().enumerate()
                 .filter(|(i, _)| *i != pi)
                 .map(|(_, v)| v.clone())
@@ -605,13 +684,15 @@ impl TpeSampler {
             } else {
                 crate::multi_objective::hypervolume(&without, &ref_point)
             };
-            contribs[orig_idx] = full_hv - hv_without;
+            contribs[local_idx] = full_hv - hv_without;
         }
 
-        // 对齐 Python: weights = max(contribs / max(max(contribs), EPS), EPS)
+        // 对齐 Python: weights[feasible] = max(contribs / max(max(contribs), EPS), EPS)
         let max_contrib = contribs.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
         let denom = max_contrib.max(eps);
-        let weights: Vec<f64> = contribs.iter().map(|&c| (c / denom).max(eps)).collect();
+        for (fi, &orig_idx) in feasible_indices.iter().enumerate() {
+            weights[orig_idx] = (contribs[fi] / denom).max(eps);
+        }
 
         weights
     }
@@ -680,7 +761,9 @@ impl TpeSampler {
         let weights_ref = self.weights.clone();
         let pe_below = if self.directions.len() > 1 {
             // MOTPE: 使用超体积贡献权重
-            let mo_weights = Self::calculate_mo_weights(&below, &self.directions);
+            let mo_weights = Self::calculate_mo_weights(
+                &below, &self.directions, self.constraints_func.is_some(),
+            );
             ParzenEstimator::new(&obs_below, search_space, &self.pe_params,
                                  Some(&mo_weights), Some(&|n| weights_ref(n)))
         } else {
@@ -1587,7 +1670,7 @@ mod tests {
             make_mo_trial(2, vec![3.0, 1.0], HashMap::new()),
         ];
         let trial_refs: Vec<&FrozenTrial> = trials.iter().collect();
-        let weights = TpeSampler::calculate_mo_weights(&trial_refs, &dirs);
+        let weights = TpeSampler::calculate_mo_weights(&trial_refs, &dirs, false);
         assert_eq!(weights.len(), 3);
         // All are Pareto-optimal, so all should have positive weights
         for w in &weights {
@@ -1607,7 +1690,7 @@ mod tests {
             make_mo_trial(2, vec![3.0, 3.0], HashMap::new()), // dominated
         ];
         let trial_refs: Vec<&FrozenTrial> = trials.iter().collect();
-        let weights = TpeSampler::calculate_mo_weights(&trial_refs, &dirs);
+        let weights = TpeSampler::calculate_mo_weights(&trial_refs, &dirs, false);
         // trial 0 is the only Pareto point, should have the largest weight
         assert!(weights[0] > weights[1]);
         assert!(weights[0] > weights[2]);
@@ -1634,5 +1717,137 @@ mod tests {
         let sampler = TpeSamplerBuilder::new(StudyDirection::Minimize).build();
         assert_eq!(sampler.directions.len(), 1);
         assert_eq!(sampler.directions[0], StudyDirection::Minimize);
+    }
+
+    // ====================================================================
+    // MOTPE 约束处理测试 — 对齐 Python
+    // ====================================================================
+
+    /// 对齐 Python: calculate_mo_weights 无约束时所有试验都参与 HV。
+    #[test]
+    fn test_calculate_mo_weights_no_constraints() {
+        let dirs = vec![StudyDirection::Minimize, StudyDirection::Minimize];
+        let trials: Vec<FrozenTrial> = vec![
+            make_mo_trial(0, vec![1.0, 3.0], HashMap::new()),
+            make_mo_trial(1, vec![2.0, 2.0], HashMap::new()),
+            make_mo_trial(2, vec![3.0, 1.0], HashMap::new()),
+        ];
+        let refs: Vec<&FrozenTrial> = trials.iter().collect();
+        let w = TpeSampler::calculate_mo_weights(&refs, &dirs, false);
+        assert_eq!(w.len(), 3);
+        for wi in &w {
+            assert!(*wi > 0.0);
+        }
+    }
+
+    /// 对齐 Python: calculate_mo_weights 有约束时不可行试验权重 ≈ EPS。
+    #[test]
+    fn test_calculate_mo_weights_with_constraints() {
+        let dirs = vec![StudyDirection::Minimize, StudyDirection::Minimize];
+        let mut t0 = make_mo_trial(0, vec![1.0, 3.0], HashMap::new());
+        let mut t1 = make_mo_trial(1, vec![2.0, 2.0], HashMap::new());
+        let mut t2 = make_mo_trial(2, vec![3.0, 1.0], HashMap::new());
+        // t0, t1 可行 (constraint <= 0)
+        t0.system_attrs.insert(
+            crate::multi_objective::CONSTRAINTS_KEY.to_string(),
+            serde_json::json!([-1.0]),
+        );
+        t1.system_attrs.insert(
+            crate::multi_objective::CONSTRAINTS_KEY.to_string(),
+            serde_json::json!([-0.5]),
+        );
+        // t2 不可行 (constraint > 0)
+        t2.system_attrs.insert(
+            crate::multi_objective::CONSTRAINTS_KEY.to_string(),
+            serde_json::json!([2.0]),
+        );
+
+        let trials = vec![t0, t1, t2];
+        let refs: Vec<&FrozenTrial> = trials.iter().collect();
+        let w = TpeSampler::calculate_mo_weights(&refs, &dirs, true);
+        assert_eq!(w.len(), 3);
+        // t0, t1 should have much larger weights than t2 (infeasible → EPS)
+        assert!(w[0] > w[2] * 100.0, "feasible weight should >> infeasible: {} vs {}", w[0], w[2]);
+        assert!(w[1] > w[2] * 100.0, "feasible weight should >> infeasible: {} vs {}", w[1], w[2]);
+        // t2 weight should be EPS-level
+        assert!(w[2] < 1e-5, "infeasible weight should be EPS-level: {}", w[2]);
+    }
+
+    /// 对齐 Python: split_trials_multi_objective 区分 infeasible 试验。
+    #[test]
+    fn test_split_trials_mo_with_constraints() {
+        let dirs = vec![StudyDirection::Minimize, StudyDirection::Minimize];
+        let sampler = TpeSamplerBuilder::new_multi(dirs)
+            .constraints_func(Arc::new(|_| vec![0.0]))
+            .n_startup_trials(0)
+            .build();
+
+        let mut trials = Vec::new();
+        // 8 complete feasible trials
+        for i in 0..8 {
+            let mut t = make_mo_trial(i, vec![i as f64, (10 - i) as f64], HashMap::new());
+            t.system_attrs.insert(
+                crate::multi_objective::CONSTRAINTS_KEY.to_string(),
+                serde_json::json!([-1.0]),
+            );
+            trials.push(t);
+        }
+        // 2 infeasible trials
+        for i in 8..10 {
+            let mut t = make_mo_trial(i, vec![i as f64, (10 - i) as f64], HashMap::new());
+            t.system_attrs.insert(
+                crate::multi_objective::CONSTRAINTS_KEY.to_string(),
+                serde_json::json!([5.0]),
+            );
+            trials.push(t);
+        }
+
+        let (below, above) = sampler.split_trials_multi_objective(&trials);
+        assert_eq!(below.len() + above.len(), 10);
+        // Infeasible trials should be placed after complete, with lower priority
+        // Check that below doesn't consist entirely of infeasible trials
+        let below_infeasible: Vec<_> = below.iter()
+            .filter(|t| TpeSampler::infeasible_score(t) > 0.0)
+            .collect();
+        // With gamma(10) = ceil(0.1*10) = 1, only 1 trial goes to below
+        // That trial should be feasible (complete trials fill first)
+        assert!(below_infeasible.is_empty() || below.len() > below_infeasible.len(),
+            "feasible trials should be prioritized in below");
+    }
+
+    /// 对齐 Python: split_trials_multi_objective 处理 pruned 试验。
+    #[test]
+    fn test_split_trials_mo_with_pruned() {
+        let dirs = vec![StudyDirection::Minimize, StudyDirection::Minimize];
+        let sampler = TpeSamplerBuilder::new_multi(dirs).n_startup_trials(0).build();
+
+        let now = chrono::Utc::now();
+        let mut trials = Vec::new();
+        // 3 complete trials
+        for i in 0..3 {
+            trials.push(make_mo_trial(i, vec![i as f64, (5 - i) as f64], HashMap::new()));
+        }
+        // 2 pruned trials (no values, but have intermediate values)
+        for i in 3..5 {
+            let mut t = FrozenTrial {
+                number: i,
+                state: TrialState::Pruned,
+                values: None,
+                datetime_start: Some(now),
+                datetime_complete: Some(now),
+                params: HashMap::new(),
+                distributions: HashMap::new(),
+                user_attrs: HashMap::new(),
+                system_attrs: HashMap::new(),
+                intermediate_values: HashMap::from([(0, i as f64)]),
+                trial_id: i,
+            };
+            trials.push(t);
+        }
+
+        let (below, above) = sampler.split_trials_multi_objective(&trials);
+        // n = 3 + 2 = 5, gamma(5) = ceil(0.1*5) = 1
+        assert_eq!(below.len() + above.len(), 5);
+        assert!(!below.is_empty(), "below should not be empty");
     }
 }

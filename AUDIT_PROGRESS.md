@@ -615,3 +615,57 @@
 - ✅ integration — 通用 trait 替代 Python 框架特定集成
 
 唯一剩余: Heartbeat（分布式心跳检测，中优先级）
+
+---
+
+## Session 43 — 深度审计: NaN/Inf 行为 + MOTPE 约束处理 + 终止器对齐
+
+### 🐛 修复的 Bug
+
+1. **FloatDistribution::contains(NaN) 返回 true** (应为 false)
+   - 根因: IEEE 754 NaN 比较 — `NaN < low` 和 `NaN > high` 都为 false → 绕过守卫
+   - 修复: 在 contains() 开头添加 `if value.is_nan() { return false; }`
+
+2. **IntDistribution::contains(NaN) 返回 true** (应为 false)
+   - 根因: Rust `NaN as i64` → 0 (饱和转换)，然后 `(0.0 - NaN).abs()` → NaN，
+     NaN > 1e-8 → false → 通过验证
+   - 修复: 添加 `if value.is_nan() || value.is_infinite() { return false; }`
+
+3. **IntDistribution::to_external_repr(NaN) 静默返回 0** (Python 抛 ValueError)
+   - 根因: `NaN as i64` → 0 (Rust 饱和转换)
+   - 修复: 返回类型改为 `Result<i64>`，添加 NaN 和 Inf 检查
+
+4. **MOTPE calculate_mo_weights 不区分可行/不可行试验**
+   - 根因: 函数签名无约束参数，所有 below 试验同等参与 HV 计算
+   - Python: 不可行试验权重设为 EPS (≈1e-12)，仅在可行试验上计算 HV 贡献
+   - 修复: 添加 `constraints_enabled: bool` 参数，识别不可行试验并赋 EPS 权重
+
+5. **split_trials_multi_objective 缺少 pruned/infeasible 处理**
+   - 根因: 只处理 Complete + Running，忽略 Pruned 和 Infeasible 试验
+   - Python: 多目标分割遵循 complete → pruned → infeasible 优先级（与单目标一致）
+   - 修复: 重写函数，提取 split_complete_multi_objective 内部方法
+
+6. **CrossValidationErrorEvaluator 缺少 CV 分数时静默返回 f64::MAX**
+   - Python: 抛 ValueError 明确告知用户需要调用 report_cross_validation_scores
+   - 修复: 改为 panic! 传达等价语义
+
+### 测试统计
+
+| 指标 | 数值 |
+|------|------|
+| Rust 测试总数 | 812 (807 unit + 5 doc) |
+| Python 交叉验证 | 167 |
+| 本次新增 Rust | +18 |
+| 本次新增 Python | +12 |
+| 修改文件数 | 6 |
+
+### 修改文件清单
+
+| 文件 | 修改内容 |
+|------|---------|
+| src/distributions/float.rs | NaN 守卫 + 8 个边界测试 |
+| src/distributions/int.rs | NaN/Inf 守卫 + to_external_repr → Result + 10 个测试 |
+| src/distributions/mod.rs | 级联 Result 传播 |
+| src/samplers/tpe/sampler.rs | MOTPE 约束权重 + split_trials 重写 + 4 个测试 |
+| src/terminators.rs | CVErrorEvaluator panic + 1 个测试 |
+| tests/test_cross_validation.py | 12 个新 Python 测试 |

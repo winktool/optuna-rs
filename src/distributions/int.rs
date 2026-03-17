@@ -62,7 +62,13 @@ impl IntDistribution {
     }
 
     /// Check if `value` (in internal representation as f64) is contained in this distribution.
+    /// 对齐 Python `_contains`: `self.low <= value <= self.high and (value - self.low) % self.step == 0`
+    /// 注意: NaN as i64 = 0（饱和转换），会导致 NaN 被错误接受。
     pub fn contains(&self, value: f64) -> bool {
+        // 对齐 Python: NaN 不属于任何分布
+        if value.is_nan() || value.is_infinite() {
+            return false;
+        }
         let v = value as i64;
         if (v as f64 - value).abs() > 1e-8 {
             return false;
@@ -85,8 +91,20 @@ impl IntDistribution {
     }
 
     /// Convert an internal representation back to an external value.
-    pub fn to_external_repr(&self, value: f64) -> i64 {
-        value as i64
+    /// 对齐 Python `int(param_value_in_internal_repr)`:
+    /// NaN → panic（Python 抛 ValueError），Inf → 饱和整数边界。
+    pub fn to_external_repr(&self, value: f64) -> Result<i64> {
+        if value.is_nan() {
+            return Err(OptunaError::ValueError(
+                "cannot convert NaN to integer".into(),
+            ));
+        }
+        if value.is_infinite() {
+            return Err(OptunaError::ValueError(
+                "cannot convert infinity to integer".into(),
+            ));
+        }
+        Ok(value as i64)
     }
 
     /// True if this distribution contains exactly one value.
@@ -235,7 +253,7 @@ mod tests {
     #[test]
     fn test_to_external_repr() {
         let d = IntDistribution::new(0, 10, false, 1).unwrap();
-        assert_eq!(d.to_external_repr(5.0), 5);
+        assert_eq!(d.to_external_repr(5.0).unwrap(), 5);
     }
 
     /// to_internal_repr / to_external_repr 往返一致
@@ -244,7 +262,7 @@ mod tests {
         let d = IntDistribution::new(0, 100, false, 1).unwrap();
         for v in [0, 25, 50, 100] {
             let internal = d.to_internal_repr(v).unwrap();
-            let external = d.to_external_repr(internal);
+            let external = d.to_external_repr(internal).unwrap();
             assert_eq!(v, external);
         }
     }
@@ -308,7 +326,7 @@ mod tests {
         let d = IntDistribution::new(0, 100, false, 5).unwrap();
         for v in [0i64, 5, 50, 95, 100] {
             let internal = d.to_internal_repr(v).unwrap();
-            let external = d.to_external_repr(internal);
+            let external = d.to_external_repr(internal).unwrap();
             assert_eq!(external, v, "roundtrip failed for {v}");
         }
     }
@@ -323,5 +341,80 @@ mod tests {
         assert!(d.contains(7.0));
         assert!(d.contains(14.0));
         assert!(!d.contains(20.0));
+    }
+
+    // ====================================================================
+    // NaN / Inf 边界测试 — 对齐 Python IEEE 754 行为
+    // ====================================================================
+
+    /// 对齐 Python: IntDistribution._contains(float('nan')) → False。
+    /// Rust 之前 `NaN as i64` 给出 0（saturating conversion），现已修复。
+    #[test]
+    fn test_contains_nan_returns_false() {
+        let d = IntDistribution::new(0, 10, false, 1).unwrap();
+        assert!(!d.contains(f64::NAN), "NaN must NOT be contained (low=0)");
+
+        let d2 = IntDistribution::new(5, 10, false, 1).unwrap();
+        assert!(!d2.contains(f64::NAN), "NaN must NOT be contained (low=5)");
+
+        let d_step = IntDistribution::new(0, 10, false, 3).unwrap();
+        assert!(!d_step.contains(f64::NAN), "NaN must NOT be contained (step=3)");
+
+        let d_log = IntDistribution::new(1, 100, true, 1).unwrap();
+        assert!(!d_log.contains(f64::NAN), "NaN must NOT be contained (log)");
+    }
+
+    /// 对齐 Python: contains(Inf) → False。
+    #[test]
+    fn test_contains_inf_returns_false() {
+        let d = IntDistribution::new(0, 10, false, 1).unwrap();
+        assert!(!d.contains(f64::INFINITY), "Inf must NOT be contained");
+        assert!(!d.contains(f64::NEG_INFINITY), "-Inf must NOT be contained");
+    }
+
+    /// 对齐 Python: int(float('nan')) → ValueError。
+    /// Rust to_external_repr(NaN) 现在返回 Err。
+    #[test]
+    fn test_to_external_repr_nan_returns_error() {
+        let d = IntDistribution::new(0, 10, false, 1).unwrap();
+        let result = d.to_external_repr(f64::NAN);
+        assert!(result.is_err(), "to_external_repr(NaN) must return Err");
+    }
+
+    /// 对齐 Python: int(float('inf')) → OverflowError。
+    #[test]
+    fn test_to_external_repr_inf_returns_error() {
+        let d = IntDistribution::new(0, 10, false, 1).unwrap();
+        let result = d.to_external_repr(f64::INFINITY);
+        assert!(result.is_err(), "to_external_repr(Inf) must return Err");
+        let result_neg = d.to_external_repr(f64::NEG_INFINITY);
+        assert!(result_neg.is_err(), "to_external_repr(-Inf) must return Err");
+    }
+
+    /// 对齐 Python: to_internal_repr 对 log 负数报错。
+    #[test]
+    fn test_to_internal_repr_log_negative_error() {
+        let d = IntDistribution::new(1, 100, true, 1).unwrap();
+        assert!(d.to_internal_repr(0).is_err());
+        assert!(d.to_internal_repr(-1).is_err());
+        assert!(d.to_internal_repr(1).is_ok());
+    }
+
+    /// 对齐 Python: contains 边界值包含。
+    #[test]
+    fn test_contains_boundary_inclusive() {
+        let d = IntDistribution::new(0, 10, false, 1).unwrap();
+        assert!(d.contains(0.0), "low boundary");
+        assert!(d.contains(10.0), "high boundary");
+        assert!(!d.contains(-1.0), "below low");
+        assert!(!d.contains(11.0), "above high");
+    }
+
+    /// 对齐 Python: 非整数值不应 contain。
+    #[test]
+    fn test_contains_non_integer_returns_false() {
+        let d = IntDistribution::new(0, 10, false, 1).unwrap();
+        assert!(!d.contains(5.5), "5.5 is not an integer");
+        assert!(!d.contains(0.1), "0.1 is not an integer");
     }
 }

@@ -98,7 +98,7 @@ impl Distribution {
     pub fn to_external_repr(&self, value: f64) -> Result<ParamValue> {
         match self {
             Self::FloatDistribution(d) => Ok(ParamValue::Float(d.to_external_repr(value))),
-            Self::IntDistribution(d) => Ok(ParamValue::Int(d.to_external_repr(value))),
+            Self::IntDistribution(d) => Ok(ParamValue::Int(d.to_external_repr(value)?)),
             Self::CategoricalDistribution(d) => {
                 Ok(ParamValue::Categorical(d.to_external_repr(value)?))
             }

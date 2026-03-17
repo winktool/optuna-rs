@@ -238,7 +238,16 @@ impl ErrorEvaluator for CrossValidationErrorEvaluator {
                     .filter_map(|v| v.as_f64())
                     .collect::<Vec<f64>>()
             }
-            _ => return f64::MAX, // 无 CV 分数时返回最大值
+            _ => {
+                // 对齐 Python: 缺少 CV 分数时报错，而非静默返回最大值。
+                // Python 抛 ValueError，Rust 因 trait 签名限制无法返回 Error，
+                // 故通过 panic 传达与 Python 等价的语义。
+                panic!(
+                    "Cross-validation scores have not been reported. Please call \
+                     `report_cross_validation_scores(storage, trial_id, scores)` \
+                     during a trial and pass the list of scores as `scores`."
+                );
+            }
         };
         let k = cv_scores.len();
         if k <= 1 {
@@ -1338,6 +1347,27 @@ mod tests {
         // var = ((0.8-0.9)^2 + (0.9-0.9)^2 + (1.0-0.9)^2) / 3 = 0.02/3
         // std = sqrt(5/6 * 0.02/3)
         assert!(result > 0.0 && result < 1.0, "CV 误差应为正有限值: {result}");
+    }
+
+    /// 对齐 Python: 缺少 CV 分数时应 panic（Python 抛 ValueError）。
+    #[test]
+    #[should_panic(expected = "Cross-validation scores have not been reported")]
+    fn test_cross_validation_error_missing_scores_panics() {
+        let trial = FrozenTrial {
+            number: 0,
+            trial_id: 0,
+            state: TrialState::Complete,
+            values: Some(vec![0.5]),
+            datetime_start: None,
+            datetime_complete: None,
+            params: std::collections::HashMap::new(),
+            distributions: std::collections::HashMap::new(),
+            user_attrs: std::collections::HashMap::new(),
+            system_attrs: std::collections::HashMap::new(), // no CV scores!
+            intermediate_values: std::collections::HashMap::new(),
+        };
+        let eval = CrossValidationErrorEvaluator::new();
+        eval.evaluate(&[trial], StudyDirection::Minimize); // should panic
     }
 
     // ── BestValueStagnationTerminator 便捷包装测试 ──

@@ -2181,6 +2181,168 @@ def test_transform_column_mapping():
     # [0, 1, 1, 1] => 编码列 0→参数0, 列 1/2/3→参数1
     assert list(enc_to_col) == [0, 1, 1, 1], f"got {list(enc_to_col)}"
 
+
+# ═══════════════════════════════════════════════════════════════════════════
+#  Session 43: NaN / Inf 边界行为 + MOTPE 约束交叉验证
+# ═══════════════════════════════════════════════════════════════════════════
+
+def test_float_contains_nan():
+    """对齐 Rust: FloatDistribution.contains(NaN) → False"""
+    from optuna.distributions import FloatDistribution
+    d = FloatDistribution(0.0, 1.0)
+    assert not d._contains(float('nan')), "NaN should not be contained (no step)"
+    d_step = FloatDistribution(0.0, 1.0, step=0.5)
+    assert not d_step._contains(float('nan')), "NaN should not be contained (step)"
+    d_log = FloatDistribution(0.01, 1.0, log=True)
+    assert not d_log._contains(float('nan')), "NaN should not be contained (log)"
+
+
+def test_float_contains_inf():
+    """对齐 Rust: FloatDistribution.contains(Inf) → False"""
+    from optuna.distributions import FloatDistribution
+    d = FloatDistribution(0.0, 1.0)
+    assert not d._contains(float('inf')), "Inf should not be contained"
+    assert not d._contains(float('-inf')), "-Inf should not be contained"
+
+
+def test_int_contains_nan():
+    """对齐 Rust: IntDistribution.contains(NaN) → False"""
+    from optuna.distributions import IntDistribution
+    d = IntDistribution(0, 10)
+    assert not d._contains(float('nan')), "NaN should not be contained (low=0)"
+    d2 = IntDistribution(5, 10)
+    assert not d2._contains(float('nan')), "NaN should not be contained (low=5)"
+    d_step = IntDistribution(0, 10, step=3)
+    assert not d_step._contains(float('nan')), "NaN should not be contained (step=3)"
+    d_log = IntDistribution(1, 100, log=True)
+    assert not d_log._contains(float('nan')), "NaN should not be contained (log)"
+
+
+def test_int_contains_inf():
+    """对齐 Rust: IntDistribution.contains(Inf) → False"""
+    from optuna.distributions import IntDistribution
+    d = IntDistribution(0, 10)
+    assert not d._contains(float('inf')), "Inf should not be contained"
+    assert not d._contains(float('-inf')), "-Inf should not be contained"
+
+
+def test_int_to_external_repr_nan():
+    """对齐 Rust: int(float('nan')) → ValueError"""
+    try:
+        int(float('nan'))
+        assert False, "int(NaN) should raise ValueError"
+    except ValueError:
+        pass  # expected
+
+
+def test_int_to_external_repr_inf():
+    """对齐 Rust: int(float('inf')) → OverflowError"""
+    try:
+        int(float('inf'))
+        assert False, "int(Inf) should raise OverflowError"
+    except OverflowError:
+        pass  # expected
+
+
+def test_float_contains_boundary():
+    """对齐 Rust: Float boundary inclusive"""
+    from optuna.distributions import FloatDistribution
+    d = FloatDistribution(0.0, 1.0)
+    assert d._contains(0.0), "low boundary should be contained"
+    assert d._contains(1.0), "high boundary should be contained"
+    assert not d._contains(-0.001), "below low"
+    assert not d._contains(1.001), "above high"
+
+
+def test_float_contains_step_grid():
+    """对齐 Rust: step 分布精确网格"""
+    from optuna.distributions import FloatDistribution
+    d = FloatDistribution(0.0, 1.0, step=0.25)
+    assert d._contains(0.0)
+    assert d._contains(0.25)
+    assert d._contains(0.5)
+    assert d._contains(0.75)
+    assert d._contains(1.0)
+    assert not d._contains(0.1), "not on 0.25 grid"
+
+
+def test_int_contains_boundary():
+    """对齐 Rust: Int boundary inclusive"""
+    from optuna.distributions import IntDistribution
+    d = IntDistribution(0, 10)
+    assert d._contains(0), "low boundary"
+    assert d._contains(10), "high boundary"
+    assert not d._contains(-1), "below low"
+    assert not d._contains(11), "above high"
+
+
+def test_int_contains_non_integer():
+    """对齐 Rust: 非整数值不 contain"""
+    from optuna.distributions import IntDistribution
+    d = IntDistribution(0, 10)
+    assert not d._contains(5.5), "5.5 not integer"
+    assert not d._contains(0.1), "0.1 not integer"
+
+
+def test_motpe_weights_feasibility():
+    """对齐 Rust: MOTPE calculate_mo_weights 区分可行/不可行试验权重。
+    Python 版本将不可行试验权重设为 EPS。"""
+    import numpy as np
+    from optuna.samplers._tpe.sampler import _calculate_weights_below_for_multi_objective
+    import optuna
+
+    study = optuna.create_study(directions=["minimize", "minimize"])
+
+    # 创建 3 个 below trials: 2 feasible + 1 infeasible
+    trials = []
+    for i, (vals, constraint) in enumerate([
+        ([1.0, 3.0], [-1.0]),   # feasible
+        ([2.0, 2.0], [-0.5]),   # feasible
+        ([3.0, 1.0], [2.0]),    # infeasible
+    ]):
+        trial = optuna.trial.create_trial(
+            values=vals,
+            params={},
+            distributions={},
+        )
+        trials.append(trial)
+
+    # 使用 constraints_func
+    constraint_values = [[-1.0], [-0.5], [2.0]]
+    def constraints_func(trial):
+        idx = trials.index(trial)
+        return constraint_values[idx]
+
+    weights = _calculate_weights_below_for_multi_objective(
+        study, trials, constraints_func
+    )
+
+    # 不可行试验 (index 2) 权重应远小于可行试验
+    assert weights[2] < weights[0] / 100, \
+        f"infeasible weight {weights[2]} should be << feasible {weights[0]}"
+    assert weights[2] < weights[1] / 100, \
+        f"infeasible weight {weights[2]} should be << feasible {weights[1]}"
+
+
+def test_cv_error_evaluator_missing_scores():
+    """对齐 Rust: CrossValidationErrorEvaluator 缺少 CV 分数时 panic/ValueError"""
+    from optuna.terminator import CrossValidationErrorEvaluator
+    from optuna.study import StudyDirection
+    import optuna
+
+    trial = optuna.trial.create_trial(
+        values=[0.5],
+        params={},
+        distributions={},
+    )
+
+    eval = CrossValidationErrorEvaluator()
+    try:
+        eval.evaluate([trial], StudyDirection.MINIMIZE)
+        assert False, "should raise ValueError when CV scores missing"
+    except ValueError as e:
+        assert "Cross-validation scores" in str(e)
+
 # ═══════════════════════════════════════════════════════════════════════════
 #  执行
 # ═══════════════════════════════════════════════════════════════════════════

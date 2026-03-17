@@ -594,6 +594,14 @@ impl Storage for InMemoryStorage {
                     .ok_or_else(|| OptunaError::ValueError(
                         "best trial not found in study trials".into(),
                     ))?;
+                // 对齐 Python: 如果 best trial 的值是 NaN，视为无有效 best trial
+                if let Ok(Some(v)) = trial.value() {
+                    if v.is_nan() {
+                        return Err(OptunaError::ValueError(
+                            "no trials with finite value are completed yet".into(),
+                        ));
+                    }
+                }
                 Ok(trial.clone())
             }
             None => Err(OptunaError::ValueError(

@@ -2343,6 +2343,277 @@ def test_cv_error_evaluator_missing_scores():
     except ValueError as e:
         assert "Cross-validation scores" in str(e)
 
+
+# ═══════════════════════════════════════════════════════════════════════════
+#  Session 44+: 对齐 Rust — Journal Storage / NaN / best_trial 约束
+# ═══════════════════════════════════════════════════════════════════════════
+
+def test_journal_attr_format():
+    """对齐 Rust: JournalStorage user_attr/system_attr 使用 {key: value} dict 格式"""
+    import optuna
+    import json
+    import tempfile, os
+
+    with tempfile.NamedTemporaryFile(suffix=".log", delete=False) as f:
+        path = f.name
+
+    try:
+        storage = optuna.storages.JournalStorage(
+            optuna.storages.JournalFileStorage(path)
+        )
+        study = optuna.create_study(storage=storage, study_name="attr_fmt")
+        study.set_user_attr("sk1", "sv1")
+        study.set_system_attr("ssk1", 123)
+
+        trial = study.ask()
+        trial.set_user_attr("tk1", "tv1")
+        trial.set_system_attr("tsk1", 456)
+        study.tell(trial, 1.0)
+
+        # 验证日志文件格式 — Python 格式是平铺的（op_code 在顶层，无嵌套 data）
+        with open(path, "r") as f:
+            lines = f.readlines()
+        found_user_attr = False
+        found_system_attr = False
+        for line in lines:
+            entry = json.loads(line)
+            op = entry.get("op_code", -1)
+            if op == 2:  # SET_STUDY_USER_ATTR
+                assert "user_attr" in entry, f"study user attr should use 'user_attr' key: {entry}"
+                found_user_attr = True
+            elif op == 3:  # SET_STUDY_SYSTEM_ATTR
+                assert "system_attr" in entry, f"study system attr should use 'system_attr' key: {entry}"
+                found_system_attr = True
+            elif op == 8:  # SET_TRIAL_USER_ATTR
+                assert "user_attr" in entry, f"trial user attr should use 'user_attr' key: {entry}"
+            elif op == 9:  # SET_TRIAL_SYSTEM_ATTR
+                assert "system_attr" in entry, f"trial system attr should use 'system_attr' key: {entry}"
+        assert found_user_attr, "no study user_attr entry found"
+        assert found_system_attr, "no system_attr entry found"
+    finally:
+        os.unlink(path)
+
+
+def test_journal_replay_with_template():
+    """对齐 Rust: JournalStorage replay 应恢复模板 trial 的所有数据"""
+    import optuna
+    import tempfile, os
+
+    with tempfile.NamedTemporaryFile(suffix=".log", delete=False) as f:
+        path = f.name
+
+    try:
+        # 第一次会话: 用 enqueue_trial 创建模板 trial
+        storage = optuna.storages.JournalStorage(
+            optuna.storages.JournalFileStorage(path)
+        )
+        study = optuna.create_study(storage=storage, study_name="tmpl_test")
+        study.enqueue_trial({"x": 0.5})
+
+        trial = study.ask()
+        val = trial.suggest_float("x", 0.0, 1.0)
+        assert val == 0.5, f"enqueued value should be 0.5, got {val}"
+        study.tell(trial, 0.75)
+
+        # 第二次会话: reload
+        storage2 = optuna.storages.JournalStorage(
+            optuna.storages.JournalFileStorage(path)
+        )
+        study2 = optuna.load_study(storage=storage2, study_name="tmpl_test")
+        trials = study2.trials
+        assert len(trials) == 1
+        t = trials[0]
+        assert t.state == optuna.trial.TrialState.COMPLETE
+        assert t.values == [0.75]
+        assert "x" in t.params
+        assert t.params["x"] == 0.5
+    finally:
+        os.unlink(path)
+
+
+def test_journal_replay_timestamps():
+    """对齐 Rust: JournalStorage replay 应保留时间戳"""
+    import optuna
+    import tempfile, os, datetime
+
+    with tempfile.NamedTemporaryFile(suffix=".log", delete=False) as f:
+        path = f.name
+
+    try:
+        now_before = datetime.datetime.now()
+
+        storage = optuna.storages.JournalStorage(
+            optuna.storages.JournalFileStorage(path)
+        )
+        study = optuna.create_study(storage=storage, study_name="ts_test")
+        trial = study.ask()
+        study.tell(trial, 1.0)
+
+        now_after = datetime.datetime.now()
+
+        # Reload and check timestamps
+        storage2 = optuna.storages.JournalStorage(
+            optuna.storages.JournalFileStorage(path)
+        )
+        study2 = optuna.load_study(storage=storage2, study_name="ts_test")
+        t = study2.trials[0]
+        assert t.datetime_start is not None, "datetime_start should be preserved"
+        assert t.datetime_complete is not None, "datetime_complete should be preserved"
+    finally:
+        os.unlink(path)
+
+
+def test_get_best_trial_nan_minimize():
+    """对齐 Rust: get_best_trial 应过滤 NaN 值 (minimize)
+    Python 的 create_trial 不允许 NaN 值，因此用 objective 返回 NaN 来测试。
+    """
+    import optuna
+    import math
+
+    study = optuna.create_study(direction="minimize")
+
+    def obj_normal_3(trial):
+        return 3.0
+
+    def obj_nan(trial):
+        return float('nan')
+
+    def obj_normal_1(trial):
+        return 1.0
+
+    study.optimize(obj_normal_3, n_trials=1)
+    study.optimize(obj_nan, n_trials=1)
+    study.optimize(obj_normal_1, n_trials=1)
+
+    best = study.best_trial
+    assert best.value == 1.0, f"best should be 1.0, got {best.value}"
+
+
+def test_get_best_trial_nan_maximize():
+    """对齐 Rust: get_best_trial 应过滤 NaN 值 (maximize)"""
+    import optuna
+    import math
+
+    study = optuna.create_study(direction="maximize")
+
+    def obj_3(trial):
+        return 3.0
+
+    def obj_nan(trial):
+        return float('nan')
+
+    def obj_5(trial):
+        return 5.0
+
+    study.optimize(obj_3, n_trials=1)
+    study.optimize(obj_nan, n_trials=1)
+    study.optimize(obj_5, n_trials=1)
+
+    best = study.best_trial
+    assert best.value == 5.0, f"best should be 5.0, got {best.value}"
+
+
+def test_best_trial_constraint_two_step():
+    """对齐 Rust: best_trial 约束逻辑 — 两步法"""
+    import optuna
+    import math
+
+    def objective(trial):
+        x = trial.suggest_float("x", 0.0, 10.0)
+        # Trial 0: x=1.0, 值=1.0, 可行
+        # Trial 1: x=5.0, 值=0.1, 不可行 (约束>0)
+        # Trial 2: x=3.0, 值=0.5, 可行
+        return x
+
+    study = optuna.create_study(direction="minimize")
+    # Trial 0: 可行, 值=1.0
+    t0 = optuna.trial.create_trial(
+        values=[1.0], params={"x": 1.0},
+        distributions={"x": optuna.distributions.FloatDistribution(0.0, 10.0)},
+        system_attrs={"constraints": [0.0]},  # 满足约束 (<=0)
+    )
+    study.add_trial(t0)
+
+    # Trial 1: 不可行, 值=0.1 (最好值但不可行)
+    t1 = optuna.trial.create_trial(
+        values=[0.1], params={"x": 5.0},
+        distributions={"x": optuna.distributions.FloatDistribution(0.0, 10.0)},
+        system_attrs={"constraints": [1.0]},  # 违反约束 (>0)
+    )
+    study.add_trial(t1)
+
+    # Trial 2: 可行, 值=0.5
+    t2 = optuna.trial.create_trial(
+        values=[0.5], params={"x": 3.0},
+        distributions={"x": optuna.distributions.FloatDistribution(0.0, 10.0)},
+        system_attrs={"constraints": [-1.0]},  # 满足约束 (<=0)
+    )
+    study.add_trial(t2)
+
+    # Python 两步法: 先找全局最好 (0.1)，发现不可行，回退到可行过滤
+    # 可行试验: t0 (1.0), t2 (0.5), 其中 t2 最好
+    best = study.best_trial
+    assert best.value == 0.5, f"best should be 0.5 (feasible best), got {best.value}"
+
+
+def test_best_trial_no_constraint_is_best():
+    """对齐 Rust: 当全局最好 trial 没有约束键时视为可行"""
+    import optuna
+
+    study = optuna.create_study(direction="minimize")
+    # Trial 0: 没有约束键, 值=0.5 — 全局最好
+    t0 = optuna.trial.create_trial(
+        values=[0.5], params={}, distributions={},
+    )
+    study.add_trial(t0)
+
+    # Trial 1: 有约束, 可行, 值=1.0
+    t1 = optuna.trial.create_trial(
+        values=[1.0], params={}, distributions={},
+        system_attrs={"constraints": [0.0]},
+    )
+    study.add_trial(t1)
+
+    # 两步法: 全局最好是 t0 (0.5)。t0 没有约束键
+    # Python: 没有约束键的 trial，best_trial 视为可行
+    best = study.best_trial
+    assert best.value == 0.5, f"best should be 0.5 (no constraints = feasible), got {best.value}"
+
+
+def test_journal_duplicate_running_rejection():
+    """对齐 Rust: JournalStorage replay 重复 RUNNING 应被静默拒绝"""
+    import optuna
+    import json
+    import tempfile, os
+
+    with tempfile.NamedTemporaryFile(suffix=".log", delete=False) as f:
+        path = f.name
+
+    try:
+        # 手动构造日志文件（Python 格式 — 平铺，无嵌套 data）
+        wid = "test-worker-1"
+        with open(path, "w") as f:
+            # create study
+            f.write(json.dumps({"op_code": 0, "worker_id": wid, "study_name": "dup_run", "directions": [1]}) + "\n")
+            # create trial (默认 Running)
+            now = "2024-01-01T00:00:00.000000"
+            f.write(json.dumps({"op_code": 4, "worker_id": wid, "study_id": 0, "datetime_start": now}) + "\n")
+            # 第一个 worker 设为 Running (已经是 Running, 应被拒绝)
+            f.write(json.dumps({"op_code": 6, "worker_id": wid, "trial_id": 0, "state": 0, "values": None, "datetime_start": "2024-01-01T00:01:00.000000"}) + "\n")
+            # complete
+            f.write(json.dumps({"op_code": 6, "worker_id": wid, "trial_id": 0, "state": 1, "values": [42.0], "datetime_complete": "2024-01-01T00:03:00.000000"}) + "\n")
+
+        storage = optuna.storages.JournalStorage(
+            optuna.storages.JournalFileStorage(path)
+        )
+        study = optuna.load_study(storage=storage, study_name="dup_run")
+        trials = study.trials
+        assert len(trials) == 1
+        assert trials[0].state == optuna.trial.TrialState.COMPLETE
+        assert trials[0].values == [42.0]
+    finally:
+        os.unlink(path)
+
 # ═══════════════════════════════════════════════════════════════════════════
 #  执行
 # ═══════════════════════════════════════════════════════════════════════════

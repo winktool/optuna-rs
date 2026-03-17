@@ -208,8 +208,15 @@ pub trait Storage: Send + Sync {
             ));
         }
         let direction = directions[0];
+        // 对齐 Python: NaN 值的试验不应被选为 best_trial。
+        // Python 使用 min/max 运算符，NaN 比较始终返回 False，
+        // 因此 NaN 永远不会被选中（除非是唯一候选）。
         let best = trials
             .into_iter()
+            .filter(|t| {
+                // 过滤掉值为 NaN 的试验
+                t.value().ok().flatten().map(|v| !v.is_nan()).unwrap_or(false)
+            })
             .min_by(|a, b| {
                 let va = a.value().unwrap().unwrap();
                 let vb = b.value().unwrap().unwrap();
@@ -219,9 +226,13 @@ pub trait Storage: Send + Sync {
                     }
                     StudyDirection::Maximize => vb.total_cmp(&va),
                 }
-            })
-            .unwrap();
-        Ok(best)
+            });
+        match best {
+            Some(t) => Ok(t),
+            None => Err(OptunaError::ValueError(
+                "no trials with finite value are completed yet".into(),
+            )),
+        }
     }
 
     /// Check if a trial is still updatable (not finished).
@@ -399,5 +410,48 @@ mod tests {
         let _ = sid;
         assert_eq!(s.get_trial_number_from_id(tids[0]).unwrap(), 0);
         assert_eq!(s.get_trial_number_from_id(tids[1]).unwrap(), 1);
+    }
+
+    // ── 对齐 Python: get_best_trial NaN 过滤 ─────────────────────
+
+    #[test]
+    fn test_get_best_trial_nan_minimize() {
+        let s = InMemoryStorage::new();
+        let sid = s.create_new_study(&[StudyDirection::Minimize], Some("nan_min")).unwrap();
+        let t1 = s.create_new_trial(sid, None).unwrap();
+        s.set_trial_state_values(t1, TrialState::Complete, Some(&[3.0])).unwrap();
+        let t2 = s.create_new_trial(sid, None).unwrap();
+        s.set_trial_state_values(t2, TrialState::Complete, Some(&[f64::NAN])).unwrap();
+        let t3 = s.create_new_trial(sid, None).unwrap();
+        s.set_trial_state_values(t3, TrialState::Complete, Some(&[1.0])).unwrap();
+
+        let best = s.get_best_trial(sid).unwrap();
+        assert_eq!(best.value().unwrap().unwrap(), 1.0);
+    }
+
+    #[test]
+    fn test_get_best_trial_nan_maximize() {
+        let s = InMemoryStorage::new();
+        let sid = s.create_new_study(&[StudyDirection::Maximize], Some("nan_max")).unwrap();
+        let t1 = s.create_new_trial(sid, None).unwrap();
+        s.set_trial_state_values(t1, TrialState::Complete, Some(&[3.0])).unwrap();
+        let t2 = s.create_new_trial(sid, None).unwrap();
+        s.set_trial_state_values(t2, TrialState::Complete, Some(&[f64::NAN])).unwrap();
+        let t3 = s.create_new_trial(sid, None).unwrap();
+        s.set_trial_state_values(t3, TrialState::Complete, Some(&[5.0])).unwrap();
+
+        let best = s.get_best_trial(sid).unwrap();
+        assert_eq!(best.value().unwrap().unwrap(), 5.0);
+    }
+
+    #[test]
+    fn test_get_best_trial_all_nan() {
+        let s = InMemoryStorage::new();
+        let sid = s.create_new_study(&[StudyDirection::Minimize], Some("all_nan")).unwrap();
+        let t1 = s.create_new_trial(sid, None).unwrap();
+        s.set_trial_state_values(t1, TrialState::Complete, Some(&[f64::NAN])).unwrap();
+
+        // 所有 trial 都是 NaN 时应该报错（没有有效的 best trial）
+        assert!(s.get_best_trial(sid).is_err());
     }
 }

@@ -132,8 +132,10 @@ impl Study {
 
     /// Get the best trial for single-objective studies.
     ///
-    /// 对应 Python `Study.best_trial`。
-    /// 支持约束优化：如果试验带有约束信息，只考虑可行试验。
+    /// 对齐 Python `Study.best_trial` / `_get_best_trial`:
+    /// 1. 先从 storage 获取 best trial（按目标值，忽略约束）
+    /// 2. 如果该试验的约束值存在且有违反（any(x > 0)），才回退到可行解筛选
+    /// 3. 在回退筛选中，无 constraints key 的试验视为不可行
     pub fn best_trial(&self) -> Result<FrozenTrial> {
         let trials = self
             .storage
@@ -143,31 +145,8 @@ impl Study {
         }
         let direction = self.direction()?;
 
-        // 检查是否有约束信息
-        let has_constraints = trials.iter().any(|t| {
-            t.system_attrs.contains_key("constraints")
-        });
-
-        // 筛选可行试验（如果存在约束）
-        // 对齐 Python: 无 constraints key 的试验视为不可行（unwrap_or(false)）
-        let feasible: Vec<&FrozenTrial> = if has_constraints {
-            trials.iter().filter(|t| {
-                t.system_attrs.get("constraints")
-                    .and_then(|v| serde_json::from_value::<Vec<f64>>(v.clone()).ok())
-                    .map(|cs| cs.iter().all(|c| *c <= 0.0))
-                    .unwrap_or(false)
-            }).collect()
-        } else {
-            trials.iter().collect()
-        };
-
-        if feasible.is_empty() {
-            return Err(OptunaError::ValueError(
-                "No feasible trials are completed yet.".into(),
-            ));
-        }
-
-        let best = feasible
+        // Step 1: 找到目标值最优的试验（忽略约束）
+        let best_by_value = trials
             .iter()
             .filter_map(|t| t.value().ok().flatten().map(|v| (t, v)))
             .min_by(|(_, a), (_, b)| {
@@ -177,10 +156,60 @@ impl Study {
                 };
                 a.partial_cmp(&b).unwrap_or(std::cmp::Ordering::Equal)
             })
-            .map(|(t, _)| (*t).clone())
-            .ok_or_else(|| OptunaError::ValueError("No trial with a finite value.".into()))?;
+            .map(|(t, _)| t);
 
-        Ok(best)
+        let Some(best) = best_by_value else {
+            return Err(OptunaError::ValueError("No trial with a finite value.".into()));
+        };
+
+        // Step 2: 对齐 Python — 检查该最优试验是否不可行
+        // Python: constraints = best_trial.system_attrs.get(_CONSTRAINTS_KEY)
+        //         if constraints is not None and any([x > 0.0 for x in constraints]):
+        let is_best_infeasible = best
+            .system_attrs
+            .get("constraints")
+            .and_then(|v| serde_json::from_value::<Vec<f64>>(v.clone()).ok())
+            .map(|cs| cs.iter().any(|&c| c > 0.0))
+            .unwrap_or(false); // 无 constraints key → 视为可行（不回退）
+
+        if !is_best_infeasible {
+            // 最优试验可行或无约束信息 → 直接返回
+            return Ok(best.clone());
+        }
+
+        // Step 3: 回退 — 从所有可行试验中找最优
+        // 对齐 Python _get_feasible_trials: 无 constraints key → 不可行
+        let feasible: Vec<&FrozenTrial> = trials
+            .iter()
+            .filter(|t| {
+                t.system_attrs
+                    .get("constraints")
+                    .and_then(|v| serde_json::from_value::<Vec<f64>>(v.clone()).ok())
+                    .map(|cs| cs.iter().all(|&c| c <= 0.0))
+                    .unwrap_or(false) // 无 key → 不可行
+            })
+            .collect();
+
+        if feasible.is_empty() {
+            return Err(OptunaError::ValueError(
+                "No feasible trials are completed yet.".into(),
+            ));
+        }
+
+        let best_feasible = feasible
+            .iter()
+            .filter_map(|t| t.value().ok().flatten().map(|v| (*t, v)))
+            .min_by(|(_, a), (_, b)| {
+                let (a, b) = match direction {
+                    StudyDirection::Minimize => (*a, *b),
+                    _ => (-*a, -*b),
+                };
+                a.partial_cmp(&b).unwrap_or(std::cmp::Ordering::Equal)
+            })
+            .map(|(t, _)| t.clone())
+            .ok_or_else(|| OptunaError::ValueError("No feasible trial with value.".into()))?;
+
+        Ok(best_feasible)
     }
 
     /// Get the Pareto-optimal trials for multi-objective studies.
@@ -603,20 +632,33 @@ impl Study {
     where
         F: Fn(&mut Trial) -> Result<f64>,
     {
+        // 对齐 Python: 检测嵌套 optimize 调用
+        if self.in_optimize_loop.swap(true, Ordering::SeqCst) {
+            return Err(OptunaError::RuntimeError(
+                "Nested invocation of `Study.optimize` method isn't allowed.".into(),
+            ));
+        }
+
         self.stop_flag.store(false, Ordering::Release);
         SIGINT_RECEIVED.store(false, Ordering::SeqCst);
         install_signal_handler(&self.stop_flag);
         let start = Instant::now();
         let mut i_trial: usize = 0;
+        let mut result = Ok(());
         loop {
             if self.stop_flag.load(Ordering::Acquire) { break; }
             if n_trials.is_some_and(|n| i_trial >= n) { break; }
             if timeout.is_some_and(|t| start.elapsed() >= t) { break; }
-            self.run_trial(&func, callbacks)?;
+            if let Err(e) = self.run_trial(&func, callbacks) {
+                result = Err(e);
+                break;
+            }
             i_trial += 1;
         }
+        // 对齐 Python: 无论成功失败都调用 remove_session (finally 语义)
         self.storage.remove_session();
-        Ok(())
+        self.in_optimize_loop.store(false, Ordering::SeqCst);
+        result
     }
 
     /// 带完整选项的优化循环（对应 Python `optimize` 的所有参数）。
@@ -804,20 +846,33 @@ impl Study {
     where
         F: Fn(&mut Trial) -> Result<Vec<f64>>,
     {
+        // 对齐 Python: 检测嵌套 optimize 调用
+        if self.in_optimize_loop.swap(true, Ordering::SeqCst) {
+            return Err(OptunaError::RuntimeError(
+                "Nested invocation of `Study.optimize` method isn't allowed.".into(),
+            ));
+        }
+
         self.stop_flag.store(false, Ordering::Release);
         SIGINT_RECEIVED.store(false, Ordering::SeqCst);
         install_signal_handler(&self.stop_flag);
         let start = Instant::now();
         let mut i_trial: usize = 0;
+        let mut result = Ok(());
         loop {
             if self.stop_flag.load(Ordering::Acquire) { break; }
             if n_trials.is_some_and(|n| i_trial >= n) { break; }
             if timeout.is_some_and(|t| start.elapsed() >= t) { break; }
-            self.run_trial_multi(&func, callbacks)?;
+            if let Err(e) = self.run_trial_multi(&func, callbacks) {
+                result = Err(e);
+                break;
+            }
             i_trial += 1;
         }
+        // 对齐 Python: finally 语义 — 无论成功失败都清理
         self.storage.remove_session();
-        Ok(())
+        self.in_optimize_loop.store(false, Ordering::SeqCst);
+        result
     }
 
     /// 带完整选项的多目标优化循环。
@@ -976,10 +1031,20 @@ impl Study {
     where
         F: Fn(&mut Trial) -> Result<f64>,
     {
+        // 对齐 Python: 检测嵌套 optimize 调用
+        if self.in_optimize_loop.swap(true, Ordering::SeqCst) {
+            return Err(OptunaError::RuntimeError(
+                "Nested invocation of `Study.optimize` method isn't allowed.".into(),
+            ));
+        }
+
         self.stop_flag.store(false, Ordering::Release);
+        SIGINT_RECEIVED.store(false, Ordering::SeqCst);
+        install_signal_handler(&self.stop_flag);
         let start = Instant::now();
 
         let mut i_trial: usize = 0;
+        let mut result = Ok(());
         loop {
             if self.stop_flag.load(Ordering::Acquire) {
                 break;
@@ -996,12 +1061,17 @@ impl Study {
                 break;
             }
 
-            self.run_trial(&func, callbacks)?;
+            if let Err(e) = self.run_trial(&func, callbacks) {
+                result = Err(e);
+                break;
+            }
             i_trial += 1;
         }
 
+        // 对齐 Python: finally 语义
         self.storage.remove_session();
-        Ok(())
+        self.in_optimize_loop.store(false, Ordering::SeqCst);
+        result
     }
 
     /// Run the multi-objective optimization loop with terminator support.
@@ -1016,12 +1086,20 @@ impl Study {
     where
         F: Fn(&mut Trial) -> Result<Vec<f64>>,
     {
+        // 对齐 Python: 检测嵌套 optimize 调用
+        if self.in_optimize_loop.swap(true, Ordering::SeqCst) {
+            return Err(OptunaError::RuntimeError(
+                "Nested invocation of `Study.optimize` method isn't allowed.".into(),
+            ));
+        }
+
         self.stop_flag.store(false, Ordering::Release);
         SIGINT_RECEIVED.store(false, Ordering::SeqCst);
         install_signal_handler(&self.stop_flag);
         let start = Instant::now();
 
         let mut i_trial: usize = 0;
+        let mut result = Ok(());
         loop {
             if self.stop_flag.load(Ordering::Acquire) {
                 break;
@@ -1038,12 +1116,17 @@ impl Study {
                 break;
             }
 
-            self.run_trial_multi(&func, callbacks)?;
+            if let Err(e) = self.run_trial_multi(&func, callbacks) {
+                result = Err(e);
+                break;
+            }
             i_trial += 1;
         }
 
+        // 对齐 Python: finally 语义
         self.storage.remove_session();
-        Ok(())
+        self.in_optimize_loop.store(false, Ordering::SeqCst);
+        result
     }
 
     /// 执行单次试验（单目标），支持 catch 异常捕获。
@@ -2591,5 +2674,178 @@ mod tests {
         let total = counter.load(Ordering::SeqCst);
         // stop 在第3次调用后触发，最多执行4次（第4次因 stop_flag 退出）
         assert!(total <= 5, "stop 后应很快终止，实际执行 {total} 次");
+    }
+
+    // ====================================================================
+    // Session 44: best_trial 约束语义 + 嵌套检测 + finally 语义测试
+    // ====================================================================
+
+    /// 对齐 Python: best_trial — 全局最优可行时直接返回，不做约束筛选。
+    /// 场景: Trial A (value=1, 无约束) + Trial B (value=5, feasible)
+    /// Python: 返回 Trial A（虽然 A 没有约束 key，但 A 是全局最优且不 infeasible）
+    #[test]
+    fn test_best_trial_no_constraint_on_best() {
+        let study = create_study(
+            None, None, None, None,
+            Some(StudyDirection::Minimize), None, false,
+        ).unwrap();
+
+        // Trial 0: value=1.0, 无约束 key
+        let mut t0 = study.ask(None).unwrap();
+        let _ = t0.suggest_float_default("x", 0.0, 1.0);
+        study.tell(t0.trial_id(), TrialState::Complete, Some(&[1.0])).unwrap();
+
+        // Trial 1: value=5.0, 有约束 key, 可行 — 设置在 RUNNING 状态
+        let mut t1 = study.ask(None).unwrap();
+        let _ = t1.suggest_float_default("x", 0.0, 1.0);
+        study.storage().set_trial_system_attr(
+            t1.trial_id(), "constraints", serde_json::json!([-1.0]),
+        ).unwrap();
+        study.tell(t1.trial_id(), TrialState::Complete, Some(&[5.0])).unwrap();
+
+        let best = study.best_trial().unwrap();
+        // 对齐 Python: 全局最优 (value=1.0) 没有约束 → 直接返回
+        assert_eq!(best.values, Some(vec![1.0]),
+            "should return the best-valued trial when it has no constraints");
+    }
+
+    /// 对齐 Python: best_trial — 全局最优不可行时回退到可行解。
+    #[test]
+    fn test_best_trial_infeasible_best_fallback() {
+        let study = create_study(
+            None, None, None, None,
+            Some(StudyDirection::Minimize), None, false,
+        ).unwrap();
+
+        // Trial 0: value=1.0, 不可行（约束违反）
+        let mut t0 = study.ask(None).unwrap();
+        let _ = t0.suggest_float_default("x", 0.0, 1.0);
+        study.storage().set_trial_system_attr(
+            t0.trial_id(), "constraints", serde_json::json!([5.0]),
+        ).unwrap();
+        study.tell(t0.trial_id(), TrialState::Complete, Some(&[1.0])).unwrap();
+
+        // Trial 1: value=3.0, 可行
+        let mut t1 = study.ask(None).unwrap();
+        let _ = t1.suggest_float_default("x", 0.0, 1.0);
+        study.storage().set_trial_system_attr(
+            t1.trial_id(), "constraints", serde_json::json!([-1.0]),
+        ).unwrap();
+        study.tell(t1.trial_id(), TrialState::Complete, Some(&[3.0])).unwrap();
+
+        let best = study.best_trial().unwrap();
+        assert_eq!(best.values, Some(vec![3.0]),
+            "should fallback to feasible trial when best is infeasible");
+    }
+
+    /// 对齐 Python: best_trial — 所有试验不可行时报错。
+    #[test]
+    fn test_best_trial_all_infeasible() {
+        let study = create_study(
+            None, None, None, None,
+            Some(StudyDirection::Minimize), None, false,
+        ).unwrap();
+
+        let mut t = study.ask(None).unwrap();
+        let _ = t.suggest_float_default("x", 0.0, 1.0);
+        study.storage().set_trial_system_attr(
+            t.trial_id(), "constraints", serde_json::json!([5.0]),
+        ).unwrap();
+        study.tell(t.trial_id(), TrialState::Complete, Some(&[1.0])).unwrap();
+
+        let result = study.best_trial();
+        assert!(result.is_err(), "should error when all trials are infeasible");
+    }
+
+    /// 对齐 Python: 嵌套 optimize 检测 — 所有入口点都检测。
+    #[test]
+    fn test_nested_optimize_detection_all_variants() {
+        let study = create_study(
+            None, None, None, None,
+            Some(StudyDirection::Minimize), None, false,
+        ).unwrap();
+
+        // 手动设置 in_optimize_loop
+        study.in_optimize_loop.store(true, Ordering::SeqCst);
+
+        // optimize() 应检测到嵌套
+        let r = study.optimize(|trial| {
+            let x = trial.suggest_float_default("x", 0.0, 1.0)?;
+            Ok(x)
+        }, Some(1), None, None);
+        assert!(r.is_err());
+
+        // optimize_with_terminators() 应检测到嵌套
+        let r = study.optimize_with_terminators(|trial| {
+            let x = trial.suggest_float_default("x", 0.0, 1.0)?;
+            Ok(x)
+        }, Some(1), None, None, None);
+        assert!(r.is_err());
+
+        // 重置标志
+        study.in_optimize_loop.store(false, Ordering::SeqCst);
+    }
+
+    /// 对齐 Python: optimize 错误后 in_optimize_loop 标志正确重置。
+    #[test]
+    fn test_optimize_error_resets_loop_flag() {
+        let study = create_study(
+            None, None, None, None,
+            Some(StudyDirection::Minimize), None, false,
+        ).unwrap();
+
+        // 第一次 optimize 以错误终止
+        let _ = study.optimize(|_trial| {
+            Err(OptunaError::ValueError("intentional".into()))
+        }, Some(1), None, None);
+
+        // in_optimize_loop 应被重置为 false
+        assert!(!study.in_optimize_loop.load(Ordering::SeqCst),
+            "in_optimize_loop should be false after optimize error");
+
+        // 第二次 optimize 应成功启动（不被嵌套检测阻止）
+        let r = study.optimize(|trial| {
+            let x = trial.suggest_float_default("x", 0.0, 1.0)?;
+            Ok(x)
+        }, Some(1), None, None);
+        assert!(r.is_ok(), "second optimize should work after error");
+    }
+
+    /// 对齐 Python: Maximize 方向的 best_trial 约束回退。
+    #[test]
+    fn test_best_trial_maximize_with_constraints() {
+        let study = create_study(
+            None, None, None, None,
+            Some(StudyDirection::Maximize), None, false,
+        ).unwrap();
+
+        // Trial 0: value=10.0, 不可行
+        let mut t0 = study.ask(None).unwrap();
+        let _ = t0.suggest_float_default("x", 0.0, 1.0);
+        study.storage().set_trial_system_attr(
+            t0.trial_id(), "constraints", serde_json::json!([1.0]),
+        ).unwrap();
+        study.tell(t0.trial_id(), TrialState::Complete, Some(&[10.0])).unwrap();
+
+        // Trial 1: value=5.0, 可行
+        let mut t1 = study.ask(None).unwrap();
+        let _ = t1.suggest_float_default("x", 0.0, 1.0);
+        study.storage().set_trial_system_attr(
+            t1.trial_id(), "constraints", serde_json::json!([-1.0]),
+        ).unwrap();
+        study.tell(t1.trial_id(), TrialState::Complete, Some(&[5.0])).unwrap();
+
+        // Trial 2: value=3.0, 可行
+        let mut t2 = study.ask(None).unwrap();
+        let _ = t2.suggest_float_default("x", 0.0, 1.0);
+        study.storage().set_trial_system_attr(
+            t2.trial_id(), "constraints", serde_json::json!([-0.5]),
+        ).unwrap();
+        study.tell(t2.trial_id(), TrialState::Complete, Some(&[3.0])).unwrap();
+
+        let best = study.best_trial().unwrap();
+        // Maximize: 最优可行试验应为 value=5.0
+        assert_eq!(best.values, Some(vec![5.0]),
+            "Maximize: should return the best feasible trial");
     }
 }

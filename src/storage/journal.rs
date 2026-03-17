@@ -211,7 +211,12 @@ impl JournalState {
     fn replay_set_study_user_attr(&mut self, entry: &JournalLogEntry) -> Result<()> {
         if let Some(sid) = entry.study_id {
             if let Some(study) = self.studies.get_mut(&sid) {
-                if let (Some(key), Some(value)) = (
+                // 对齐 Python: 优先读 "user_attr": {k: v} 格式，回退到旧的 "key"/"value" 格式
+                if let Some(attr_map) = entry.data.get("user_attr").and_then(|v| v.as_object()) {
+                    for (k, v) in attr_map {
+                        study.user_attrs.insert(k.clone(), v.clone());
+                    }
+                } else if let (Some(key), Some(value)) = (
                     entry.data.get("key").and_then(|v| v.as_str()),
                     entry.data.get("value"),
                 ) {
@@ -225,7 +230,12 @@ impl JournalState {
     fn replay_set_study_system_attr(&mut self, entry: &JournalLogEntry) -> Result<()> {
         if let Some(sid) = entry.study_id {
             if let Some(study) = self.studies.get_mut(&sid) {
-                if let (Some(key), Some(value)) = (
+                // 对齐 Python: 优先读 "system_attr": {k: v} 格式，回退到旧的 "key"/"value" 格式
+                if let Some(attr_map) = entry.data.get("system_attr").and_then(|v| v.as_object()) {
+                    for (k, v) in attr_map {
+                        study.system_attrs.insert(k.clone(), v.clone());
+                    }
+                } else if let (Some(key), Some(value)) = (
                     entry.data.get("key").and_then(|v| v.as_str()),
                     entry.data.get("value"),
                 ) {
@@ -238,6 +248,13 @@ impl JournalState {
 
     fn replay_create_trial(&mut self, entry: &JournalLogEntry) -> Result<()> {
         let study_id = entry.study_id.unwrap_or(0);
+
+        // 对齐 Python: 如果 study 不存在则静默跳过
+        if !self.studies.contains_key(&study_id) {
+            self.next_trial_id += 1;
+            return Ok(());
+        }
+
         let trial_id = self.next_trial_id;
         self.next_trial_id += 1;
 
@@ -251,7 +268,7 @@ impl JournalState {
 
         let state_int = entry.data.get("state")
             .and_then(|v| v.as_i64())
-            .unwrap_or(0);
+            .unwrap_or(0); // 默认 RUNNING
         let state = match state_int {
             1 => TrialState::Complete,
             2 => TrialState::Pruned,
@@ -260,19 +277,100 @@ impl JournalState {
             _ => TrialState::Running,
         };
 
+        // 对齐 Python: 从日志条目读取 distributions（JSON 字符串格式）
+        let mut distributions = HashMap::new();
+        if let Some(dist_map) = entry.data.get("distributions").and_then(|v| v.as_object()) {
+            for (name, dist_val) in dist_map {
+                let dist = if let Some(s) = dist_val.as_str() {
+                    crate::distributions::json_to_distribution(s).ok()
+                } else {
+                    serde_json::from_value::<crate::distributions::Distribution>(dist_val.clone()).ok()
+                };
+                if let Some(d) = dist {
+                    distributions.insert(name.clone(), d);
+                }
+            }
+        }
+
+        // 对齐 Python: 从日志条目读取 params（internal_repr float）
+        let mut params = HashMap::new();
+        if let Some(param_map) = entry.data.get("params").and_then(|v| v.as_object()) {
+            for (name, param_val) in param_map {
+                if let Some(internal) = param_val.as_f64() {
+                    if let Some(dist) = distributions.get(name) {
+                        if let Ok(external) = dist.to_external_repr(internal) {
+                            params.insert(name.clone(), external);
+                        }
+                    }
+                }
+            }
+        }
+
+        // 对齐 Python: 从日志条目读取 user_attrs
+        let user_attrs: HashMap<String, serde_json::Value> = entry.data.get("user_attrs")
+            .and_then(|v| serde_json::from_value(v.clone()).ok())
+            .unwrap_or_default();
+
+        // 对齐 Python: 从日志条目读取 system_attrs
+        let system_attrs: HashMap<String, serde_json::Value> = entry.data.get("system_attrs")
+            .and_then(|v| serde_json::from_value(v.clone()).ok())
+            .unwrap_or_default();
+
+        // 对齐 Python: 从日志条目读取 intermediate_values
+        let mut intermediate_values: HashMap<i64, f64> = HashMap::new();
+        if let Some(iv_map) = entry.data.get("intermediate_values").and_then(|v| v.as_object()) {
+            for (step_str, val) in iv_map {
+                if let (Ok(step), Some(v)) = (step_str.parse::<i64>(), val.as_f64()) {
+                    intermediate_values.insert(step, v);
+                }
+            }
+        }
+
+        // 对齐 Python: 从日志条目读取 values
+        let values = if let Some(vals) = entry.data.get("values").and_then(|v| v.as_array()) {
+            let vs: Vec<f64> = vals.iter().filter_map(|v| v.as_f64()).collect();
+            if vs.is_empty() { None } else { Some(vs) }
+        } else if let Some(val) = entry.data.get("value").and_then(|v| v.as_f64()) {
+            // Python 单目标用 "value"（单数）
+            Some(vec![val])
+        } else {
+            None
+        };
+
+        // 对齐 Python: 从日志条目读取 datetime_start
+        let datetime_start = entry.data.get("datetime_start")
+            .and_then(|v| v.as_str())
+            .and_then(|s| {
+                chrono::DateTime::parse_from_rfc3339(s).ok()
+                    .or_else(|| chrono::NaiveDateTime::parse_from_str(s, "%Y-%m-%dT%H:%M:%S%.f").ok()
+                        .map(|ndt| ndt.and_utc().fixed_offset()))
+            })
+            .map(|dt| dt.with_timezone(&Utc))
+            .or_else(|| if state != TrialState::Waiting { Some(Utc::now()) } else { None });
+
+        // 对齐 Python: 从日志条目读取 datetime_complete
+        let datetime_complete = entry.data.get("datetime_complete")
+            .and_then(|v| v.as_str())
+            .and_then(|s| {
+                chrono::DateTime::parse_from_rfc3339(s).ok()
+                    .or_else(|| chrono::NaiveDateTime::parse_from_str(s, "%Y-%m-%dT%H:%M:%S%.f").ok()
+                        .map(|ndt| ndt.and_utc().fixed_offset()))
+            })
+            .map(|dt| dt.with_timezone(&Utc));
+
         self.trials.insert(trial_id, TrialInternalState {
             trial_id,
             study_id,
             number,
             state,
-            values: None,
-            datetime_start: if state != TrialState::Waiting { Some(Utc::now()) } else { None },
-            datetime_complete: None,
-            params: HashMap::new(),
-            distributions: HashMap::new(),
-            user_attrs: HashMap::new(),
-            system_attrs: HashMap::new(),
-            intermediate_values: HashMap::new(),
+            values,
+            datetime_start,
+            datetime_complete,
+            params,
+            distributions,
+            user_attrs,
+            system_attrs,
+            intermediate_values,
         });
 
         Ok(())
@@ -309,7 +407,7 @@ impl JournalState {
         if let Some(tid) = entry.trial_id {
             if let Some(trial) = self.trials.get_mut(&tid) {
                 if let Some(state_int) = entry.data.get("state").and_then(|v| v.as_i64()) {
-                    trial.state = match state_int {
+                    let new_state = match state_int {
                         0 => TrialState::Running,
                         1 => TrialState::Complete,
                         2 => TrialState::Pruned,
@@ -318,12 +416,29 @@ impl JournalState {
                         _ => trial.state,
                     };
 
+                    // 对齐 Python: RUNNING → RUNNING（且当前已经是 RUNNING）时拒绝。
+                    // 用于多 worker 竞争同一 trial 的场景。
+                    if new_state == TrialState::Running && trial.state == TrialState::Running {
+                        return Ok(()); // 静默拒绝，不改变状态
+                    }
+
+                    trial.state = new_state;
+
+                    // 对齐 Python: 从日志条目读取时间戳（如果有）
                     if trial.state == TrialState::Running && trial.datetime_start.is_none() {
-                        trial.datetime_start = Some(Utc::now());
+                        trial.datetime_start = entry.data.get("datetime_start")
+                            .and_then(|v| v.as_str())
+                            .and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok())
+                            .map(|dt| dt.with_timezone(&Utc))
+                            .or_else(|| Some(Utc::now()));
                     }
 
                     if trial.state.is_finished() && trial.datetime_complete.is_none() {
-                        trial.datetime_complete = Some(Utc::now());
+                        trial.datetime_complete = entry.data.get("datetime_complete")
+                            .and_then(|v| v.as_str())
+                            .and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok())
+                            .map(|dt| dt.with_timezone(&Utc))
+                            .or_else(|| Some(Utc::now()));
                     }
                 }
 
@@ -357,7 +472,12 @@ impl JournalState {
     fn replay_set_trial_user_attr(&mut self, entry: &JournalLogEntry) -> Result<()> {
         if let Some(tid) = entry.trial_id {
             if let Some(trial) = self.trials.get_mut(&tid) {
-                if let (Some(key), Some(value)) = (
+                // 对齐 Python: 优先读 "user_attr": {k: v} 格式，回退到旧的 "key"/"value" 格式
+                if let Some(attr_map) = entry.data.get("user_attr").and_then(|v| v.as_object()) {
+                    for (k, v) in attr_map {
+                        trial.user_attrs.insert(k.clone(), v.clone());
+                    }
+                } else if let (Some(key), Some(value)) = (
                     entry.data.get("key").and_then(|v| v.as_str()),
                     entry.data.get("value"),
                 ) {
@@ -371,7 +491,12 @@ impl JournalState {
     fn replay_set_trial_system_attr(&mut self, entry: &JournalLogEntry) -> Result<()> {
         if let Some(tid) = entry.trial_id {
             if let Some(trial) = self.trials.get_mut(&tid) {
-                if let (Some(key), Some(value)) = (
+                // 对齐 Python: 优先读 "system_attr": {k: v} 格式，回退到旧的 "key"/"value" 格式
+                if let Some(attr_map) = entry.data.get("system_attr").and_then(|v| v.as_object()) {
+                    for (k, v) in attr_map {
+                        trial.system_attrs.insert(k.clone(), v.clone());
+                    }
+                } else if let (Some(key), Some(value)) = (
                     entry.data.get("key").and_then(|v| v.as_str()),
                     entry.data.get("value"),
                 ) {
@@ -508,11 +633,14 @@ impl Storage for JournalStorage {
         key: &str,
         value: serde_json::Value,
     ) -> Result<()> {
+        // 对齐 Python: 使用 "user_attr": {key: value} 格式
+        let mut attr = serde_json::Map::new();
+        attr.insert(key.to_string(), value);
         self.write_log(&JournalLogEntry {
             op_code: 2,
             study_id: Some(study_id),
             trial_id: None,
-            data: serde_json::json!({"key": key, "value": value}),
+            data: serde_json::json!({"user_attr": attr}),
         })
     }
 
@@ -522,11 +650,14 @@ impl Storage for JournalStorage {
         key: &str,
         value: serde_json::Value,
     ) -> Result<()> {
+        // 对齐 Python: 使用 "system_attr": {key: value} 格式
+        let mut attr = serde_json::Map::new();
+        attr.insert(key.to_string(), value);
         self.write_log(&JournalLogEntry {
             op_code: 3,
             study_id: Some(study_id),
             trial_id: None,
-            data: serde_json::json!({"key": key, "value": value}),
+            data: serde_json::json!({"system_attr": attr}),
         })
     }
 
@@ -608,19 +739,64 @@ impl Storage for JournalStorage {
     ) -> Result<i64> {
         let next_id = self.state.lock().next_trial_id;
 
-        let data = if let Some(tmpl) = template_trial {
-            serde_json::json!({
-                "state": tmpl.state as i32,
-                "values": tmpl.values,
-                "params": tmpl.params,
-                "distributions": tmpl.distributions,
-                "user_attrs": tmpl.user_attrs,
-                "system_attrs": tmpl.system_attrs,
-                "intermediate_values": tmpl.intermediate_values,
-            })
-        } else {
-            serde_json::json!({})
-        };
+        let mut data = serde_json::json!({
+            "datetime_start": Utc::now().to_rfc3339(),
+        });
+
+        if let Some(tmpl) = template_trial {
+            data["state"] = serde_json::json!(tmpl.state as i32);
+
+            // 对齐 Python: values 序列化 — 单目标用 "value"，多目标用 "values"
+            if let Some(ref vals) = tmpl.values {
+                if vals.len() > 1 {
+                    data["value"] = serde_json::Value::Null;
+                    data["values"] = serde_json::json!(vals);
+                } else {
+                    data["value"] = serde_json::json!(vals.first());
+                    data["values"] = serde_json::Value::Null;
+                }
+            }
+
+            // 对齐 Python: distributions 序列化为 {name: json_string}
+            let mut dist_map = serde_json::Map::new();
+            for (name, dist) in &tmpl.distributions {
+                if let Ok(json_str) = crate::distributions::distribution_to_json(dist) {
+                    dist_map.insert(name.clone(), serde_json::json!(json_str));
+                }
+            }
+            data["distributions"] = serde_json::Value::Object(dist_map);
+
+            // 对齐 Python: params 序列化为 {name: internal_repr_float}
+            let mut param_map = serde_json::Map::new();
+            for (name, param_val) in &tmpl.params {
+                if let Some(dist) = tmpl.distributions.get(name) {
+                    if let Ok(internal) = dist.to_internal_repr(param_val) {
+                        param_map.insert(name.clone(), serde_json::json!(internal));
+                    }
+                }
+            }
+            data["params"] = serde_json::Value::Object(param_map);
+
+            data["user_attrs"] = serde_json::json!(tmpl.user_attrs);
+            data["system_attrs"] = serde_json::json!(tmpl.system_attrs);
+
+            // 对齐 Python: intermediate_values 序列化为 {step_str: value}
+            let mut iv_map = serde_json::Map::new();
+            for (step, val) in &tmpl.intermediate_values {
+                iv_map.insert(step.to_string(), serde_json::json!(val));
+            }
+            data["intermediate_values"] = serde_json::Value::Object(iv_map);
+
+            // 对齐 Python: datetime_start / datetime_complete
+            if let Some(ref dt) = tmpl.datetime_start {
+                data["datetime_start"] = serde_json::json!(dt.to_rfc3339());
+            } else {
+                data["datetime_start"] = serde_json::Value::Null;
+            }
+            if let Some(ref dt) = tmpl.datetime_complete {
+                data["datetime_complete"] = serde_json::json!(dt.to_rfc3339());
+            }
+        }
 
         self.write_log(&JournalLogEntry {
             op_code: 4,
@@ -678,14 +854,23 @@ impl Storage for JournalStorage {
                 )));
             }
         }
+        // 对齐 Python: 写入时间戳到日志条目，以便 replay 时恢复
+        let now = Utc::now().to_rfc3339();
+        let mut data = serde_json::json!({
+            "state": state as i32,
+            "values": values,
+        });
+        if state == TrialState::Running {
+            data["datetime_start"] = serde_json::json!(now);
+        }
+        if state.is_finished() {
+            data["datetime_complete"] = serde_json::json!(now);
+        }
         self.write_log(&JournalLogEntry {
             op_code: 6,
             study_id: None,
             trial_id: Some(trial_id),
-            data: serde_json::json!({
-                "state": state as i32,
-                "values": values,
-            }),
+            data,
         })?;
         Ok(true)
     }
@@ -713,11 +898,14 @@ impl Storage for JournalStorage {
         key: &str,
         value: serde_json::Value,
     ) -> Result<()> {
+        // 对齐 Python: 使用 "user_attr": {key: value} 格式
+        let mut attr = serde_json::Map::new();
+        attr.insert(key.to_string(), value);
         self.write_log(&JournalLogEntry {
             op_code: 8,
             study_id: None,
             trial_id: Some(trial_id),
-            data: serde_json::json!({"key": key, "value": value}),
+            data: serde_json::json!({"user_attr": attr}),
         })
     }
 
@@ -727,11 +915,14 @@ impl Storage for JournalStorage {
         key: &str,
         value: serde_json::Value,
     ) -> Result<()> {
+        // 对齐 Python: 使用 "system_attr": {key: value} 格式
+        let mut attr = serde_json::Map::new();
+        attr.insert(key.to_string(), value);
         self.write_log(&JournalLogEntry {
             op_code: 9,
             study_id: None,
             trial_id: Some(trial_id),
-            data: serde_json::json!({"key": key, "value": value}),
+            data: serde_json::json!({"system_attr": attr}),
         })
     }
 
@@ -976,11 +1167,14 @@ impl Storage for JournalFileStorage {
     fn set_study_user_attr(
         &self, study_id: i64, key: &str, value: serde_json::Value,
     ) -> Result<()> {
+        // 对齐 Python: 使用 "user_attr": {key: value} 格式
+        let mut attr = serde_json::Map::new();
+        attr.insert(key.to_string(), value);
         let entry = JournalLogEntry {
             op_code: 2,
             study_id: Some(study_id),
             trial_id: None,
-            data: serde_json::json!({"key": key, "value": value}),
+            data: serde_json::json!({"user_attr": attr}),
         };
         self.append_log(&entry)
     }
@@ -988,11 +1182,14 @@ impl Storage for JournalFileStorage {
     fn set_study_system_attr(
         &self, study_id: i64, key: &str, value: serde_json::Value,
     ) -> Result<()> {
+        // 对齐 Python: 使用 "system_attr": {key: value} 格式
+        let mut attr = serde_json::Map::new();
+        attr.insert(key.to_string(), value);
         let entry = JournalLogEntry {
             op_code: 3,
             study_id: Some(study_id),
             trial_id: None,
-            data: serde_json::json!({"key": key, "value": value}),
+            data: serde_json::json!({"system_attr": attr}),
         };
         self.append_log(&entry)
     }
@@ -1052,83 +1249,74 @@ impl Storage for JournalFileStorage {
     fn create_new_trial(
         &self, study_id: i64, template_trial: Option<&FrozenTrial>,
     ) -> Result<i64> {
-        let state_int = template_trial.map(|t| t.state as i64).unwrap_or(0);
+        // 对齐 Python: 将所有模板数据写入单条 CREATE_TRIAL 日志条目
+        let mut data = serde_json::json!({
+            "datetime_start": Utc::now().to_rfc3339(),
+        });
+
+        if let Some(tmpl) = template_trial {
+            data["state"] = serde_json::json!(tmpl.state as i32);
+
+            // 对齐 Python: values 序列化
+            if let Some(ref vals) = tmpl.values {
+                if vals.len() > 1 {
+                    data["value"] = serde_json::Value::Null;
+                    data["values"] = serde_json::json!(vals);
+                } else {
+                    data["value"] = serde_json::json!(vals.first());
+                    data["values"] = serde_json::Value::Null;
+                }
+            }
+
+            // 对齐 Python: distributions 序列化为 {name: json_string}
+            let mut dist_map = serde_json::Map::new();
+            for (name, dist) in &tmpl.distributions {
+                if let Ok(json_str) = crate::distributions::distribution_to_json(dist) {
+                    dist_map.insert(name.clone(), serde_json::json!(json_str));
+                }
+            }
+            data["distributions"] = serde_json::Value::Object(dist_map);
+
+            // 对齐 Python: params 序列化为 {name: internal_repr_float}
+            let mut param_map = serde_json::Map::new();
+            for (name, param_val) in &tmpl.params {
+                if let Some(dist) = tmpl.distributions.get(name) {
+                    if let Ok(internal) = dist.to_internal_repr(param_val) {
+                        param_map.insert(name.clone(), serde_json::json!(internal));
+                    }
+                }
+            }
+            data["params"] = serde_json::Value::Object(param_map);
+
+            data["user_attrs"] = serde_json::json!(tmpl.user_attrs);
+            data["system_attrs"] = serde_json::json!(tmpl.system_attrs);
+
+            // 对齐 Python: intermediate_values 序列化为 {step_str: value}
+            let mut iv_map = serde_json::Map::new();
+            for (step, val) in &tmpl.intermediate_values {
+                iv_map.insert(step.to_string(), serde_json::json!(val));
+            }
+            data["intermediate_values"] = serde_json::Value::Object(iv_map);
+
+            if let Some(ref dt) = tmpl.datetime_start {
+                data["datetime_start"] = serde_json::json!(dt.to_rfc3339());
+            } else {
+                data["datetime_start"] = serde_json::Value::Null;
+            }
+            if let Some(ref dt) = tmpl.datetime_complete {
+                data["datetime_complete"] = serde_json::json!(dt.to_rfc3339());
+            }
+        }
 
         let entry = JournalLogEntry {
             op_code: 4,
             study_id: Some(study_id),
             trial_id: None,
-            data: serde_json::json!({"state": state_int}),
+            data,
         };
         self.append_log(&entry)?;
 
         let trial_id = self.state.lock().next_trial_id - 1;
-
-        // 如果有模板，复制参数/属性/值
-        if let Some(tmpl) = template_trial {
-            for (name, val) in &tmpl.params {
-                if let Some(dist) = tmpl.distributions.get(name) {
-                    let internal = dist.to_internal_repr(val)?;
-                    let dist_json = crate::distributions::distribution_to_json(dist)?;
-                    let entry = JournalLogEntry {
-                        op_code: 5,
-                        study_id: Some(study_id),
-                        trial_id: Some(trial_id),
-                        data: serde_json::json!({
-                            "param_name": name,
-                            "param_value_internal": internal,
-                            "distribution": dist_json,
-                        }),
-                    };
-                    self.append_log(&entry)?;
-                }
-            }
-
-            if tmpl.values.is_some() || tmpl.state.is_finished() {
-                let vals: Vec<f64> = tmpl.values.as_deref().unwrap_or(&[]).to_vec();
-                let entry = JournalLogEntry {
-                    op_code: 6,
-                    study_id: Some(study_id),
-                    trial_id: Some(trial_id),
-                    data: serde_json::json!({
-                        "state": tmpl.state as i64,
-                        "values": vals,
-                    }),
-                };
-                self.append_log(&entry)?;
-            }
-
-            for (&step, &v) in &tmpl.intermediate_values {
-                let entry = JournalLogEntry {
-                    op_code: 7,
-                    study_id: Some(study_id),
-                    trial_id: Some(trial_id),
-                    data: serde_json::json!({"step": step, "value": v}),
-                };
-                self.append_log(&entry)?;
-            }
-
-            for (k, v) in &tmpl.user_attrs {
-                let entry = JournalLogEntry {
-                    op_code: 8,
-                    study_id: Some(study_id),
-                    trial_id: Some(trial_id),
-                    data: serde_json::json!({"key": k, "value": v}),
-                };
-                self.append_log(&entry)?;
-            }
-
-            for (k, v) in &tmpl.system_attrs {
-                let entry = JournalLogEntry {
-                    op_code: 9,
-                    study_id: Some(study_id),
-                    trial_id: Some(trial_id),
-                    data: serde_json::json!({"key": k, "value": v}),
-                };
-                self.append_log(&entry)?;
-            }
-        }
-
         Ok(trial_id)
     }
 
@@ -1185,14 +1373,24 @@ impl Storage for JournalFileStorage {
                     format!("trial {} not found", trial_id)))?
         };
 
+        // 对齐 Python: 写入时间戳到日志条目
+        let now = Utc::now().to_rfc3339();
+        let mut data = serde_json::json!({
+            "state": state as i64,
+            "values": values.unwrap_or(&[]),
+        });
+        if state == TrialState::Running {
+            data["datetime_start"] = serde_json::json!(now);
+        }
+        if state.is_finished() {
+            data["datetime_complete"] = serde_json::json!(now);
+        }
+
         let entry = JournalLogEntry {
             op_code: 6,
             study_id: Some(study_id),
             trial_id: Some(trial_id),
-            data: serde_json::json!({
-                "state": state as i64,
-                "values": values.unwrap_or(&[]),
-            }),
+            data,
         };
         self.append_log(&entry)?;
         Ok(true)
@@ -1229,11 +1427,14 @@ impl Storage for JournalFileStorage {
                     format!("trial {} not found", trial_id)))?
         };
 
+        // 对齐 Python: 使用 "user_attr": {key: value} 格式
+        let mut attr = serde_json::Map::new();
+        attr.insert(key.to_string(), value);
         let entry = JournalLogEntry {
             op_code: 8,
             study_id: Some(study_id),
             trial_id: Some(trial_id),
-            data: serde_json::json!({"key": key, "value": value}),
+            data: serde_json::json!({"user_attr": attr}),
         };
         self.append_log(&entry)
     }
@@ -1249,11 +1450,14 @@ impl Storage for JournalFileStorage {
                     format!("trial {} not found", trial_id)))?
         };
 
+        // 对齐 Python: 使用 "system_attr": {key: value} 格式
+        let mut attr = serde_json::Map::new();
+        attr.insert(key.to_string(), value);
         let entry = JournalLogEntry {
             op_code: 9,
             study_id: Some(study_id),
             trial_id: Some(trial_id),
-            data: serde_json::json!({"key": key, "value": value}),
+            data: serde_json::json!({"system_attr": attr}),
         };
         self.append_log(&entry)
     }
@@ -1495,6 +1699,251 @@ mod tests {
             }
             e => panic!("expected ValueError, got {e:?}"),
         }
+        fs::remove_file(&path).ok();
+    }
+
+    // ── 对齐 Python: replay_create_trial 模板数据恢复测试 ────────────
+
+    #[test]
+    fn test_journal_replay_create_trial_with_template() {
+        use crate::distributions::{FloatDistribution, Distribution, ParamValue};
+
+        let path = temp_path();
+        // 第一次会话：用模板创建 trial
+        {
+            let storage = JournalFileStorage::new(&path).unwrap();
+            let sid = storage.create_new_study(&[StudyDirection::Minimize], Some("tmpl")).unwrap();
+
+            let float_dist = Distribution::FloatDistribution(FloatDistribution {
+                low: 0.0, high: 1.0, log: false, step: None,
+            });
+            let mut params = HashMap::new();
+            params.insert("x".to_string(), ParamValue::Float(0.5));
+            let mut distributions = HashMap::new();
+            distributions.insert("x".to_string(), float_dist);
+            let mut user_attrs = HashMap::new();
+            user_attrs.insert("ua_key".to_string(), serde_json::json!("ua_val"));
+            let mut system_attrs = HashMap::new();
+            system_attrs.insert("sa_key".to_string(), serde_json::json!(42));
+            let mut intermediate_values = HashMap::new();
+            intermediate_values.insert(0, 0.1);
+            intermediate_values.insert(1, 0.2);
+
+            let template = FrozenTrial {
+                trial_id: -1,
+                number: -1,
+                state: TrialState::Complete,
+                values: Some(vec![0.75]),
+                datetime_start: None,
+                datetime_complete: None,
+                params,
+                distributions,
+                user_attrs,
+                system_attrs,
+                intermediate_values,
+            };
+            let tid = storage.create_new_trial(sid, Some(&template)).unwrap();
+            assert_eq!(tid, 0);
+        }
+
+        // 第二次会话：从文件 replay 恢复，验证模板数据完整恢复
+        {
+            let storage = JournalFileStorage::new(&path).unwrap();
+            let sid = storage.get_study_id_from_name("tmpl").unwrap();
+            let trials = storage.get_all_trials(sid, None).unwrap();
+            assert_eq!(trials.len(), 1);
+            let t = &trials[0];
+            assert_eq!(t.state, TrialState::Complete);
+            assert_eq!(t.values.as_ref().unwrap(), &[0.75]);
+            assert!(t.params.contains_key("x"));
+            assert!(t.distributions.contains_key("x"));
+            assert_eq!(t.user_attrs["ua_key"], serde_json::json!("ua_val"));
+            assert_eq!(t.system_attrs["sa_key"], serde_json::json!(42));
+            assert_eq!(t.intermediate_values[&0], 0.1);
+            assert_eq!(t.intermediate_values[&1], 0.2);
+        }
+        fs::remove_file(&path).ok();
+    }
+
+    // ── 对齐 Python: user_attr / system_attr 格式正确 ───────────────
+
+    #[test]
+    fn test_journal_attr_format_python_compatible() {
+        let path = temp_path();
+        // 写入 attrs
+        {
+            let storage = JournalFileStorage::new(&path).unwrap();
+            let sid = storage.create_new_study(&[StudyDirection::Minimize], Some("attr_fmt")).unwrap();
+            storage.set_study_user_attr(sid, "sk1", serde_json::json!("sv1")).unwrap();
+            storage.set_study_system_attr(sid, "ssk1", serde_json::json!(123)).unwrap();
+            let tid = storage.create_new_trial(sid, None).unwrap();
+            storage.set_trial_user_attr(tid, "tk1", serde_json::json!("tv1")).unwrap();
+            storage.set_trial_system_attr(tid, "tsk1", serde_json::json!(456)).unwrap();
+        }
+
+        // 重新 replay 恢复
+        {
+            let storage = JournalFileStorage::new(&path).unwrap();
+            let sid = storage.get_study_id_from_name("attr_fmt").unwrap();
+
+            let study_ua = storage.get_study_user_attrs(sid).unwrap();
+            assert_eq!(study_ua["sk1"], serde_json::json!("sv1"));
+
+            let study_sa = storage.get_study_system_attrs(sid).unwrap();
+            assert_eq!(study_sa["ssk1"], serde_json::json!(123));
+
+            let trials = storage.get_all_trials(sid, None).unwrap();
+            assert_eq!(trials[0].user_attrs["tk1"], serde_json::json!("tv1"));
+            assert_eq!(trials[0].system_attrs["tsk1"], serde_json::json!(456));
+        }
+
+        // 验证日志文件中的格式符合 Python 规范（user_attr/{k:v} 而不是 key/value）
+        {
+            let content = fs::read_to_string(&path).unwrap();
+            // study user attr 应该用 "user_attr" 格式
+            assert!(content.contains("\"user_attr\""), "missing user_attr key format");
+            // study system attr 应该用 "system_attr" 格式
+            assert!(content.contains("\"system_attr\""), "missing system_attr key format");
+            // 不应该出现旧的 "key"/"value" 格式
+            // 注意: 只检查 op_code 2,3,8,9 的条目
+        }
+        fs::remove_file(&path).ok();
+    }
+
+    // ── 对齐 Python: 时间戳保留测试 ───────────────────────────────
+
+    #[test]
+    fn test_journal_replay_preserves_timestamps() {
+        let path = temp_path();
+        let now_before = Utc::now();
+
+        {
+            let storage = JournalFileStorage::new(&path).unwrap();
+            let sid = storage.create_new_study(&[StudyDirection::Minimize], Some("ts")).unwrap();
+            let tid = storage.create_new_trial(sid, None).unwrap();
+            storage.set_trial_state_values(tid, TrialState::Complete, Some(&[1.0])).unwrap();
+        }
+
+        let now_after = Utc::now();
+
+        // replay 后验证时间戳存在且在合理范围内
+        {
+            let storage = JournalFileStorage::new(&path).unwrap();
+            let sid = storage.get_study_id_from_name("ts").unwrap();
+            let trials = storage.get_all_trials(sid, None).unwrap();
+            let t = &trials[0];
+            assert!(t.datetime_start.is_some(), "datetime_start should be preserved");
+            assert!(t.datetime_complete.is_some(), "datetime_complete should be preserved");
+            let start = t.datetime_start.unwrap();
+            let complete = t.datetime_complete.unwrap();
+            assert!(start >= now_before && start <= now_after, "datetime_start out of range");
+            assert!(complete >= now_before && complete <= now_after, "datetime_complete out of range");
+        }
+        fs::remove_file(&path).ok();
+    }
+
+    // ── 对齐 Python: replay 重复 RUNNING 拒绝测试 ──────────────────
+
+    #[test]
+    fn test_journal_replay_duplicate_running_rejection() {
+        let path = temp_path();
+
+        // 手动构造日志文件：create study → create trial → Running → Running (重复)
+        {
+            let mut f = File::create(&path).unwrap();
+            // create study
+            writeln!(f, "{{\"op_code\":0,\"study_id\":null,\"trial_id\":null,\"data\":{{\"study_name\":\"dup_run\",\"directions\":[1]}}}}").unwrap();
+            // create trial (默认 Running)
+            writeln!(f, "{{\"op_code\":4,\"study_id\":0,\"trial_id\":null,\"data\":{{\"datetime_start\":\"2024-01-01T00:00:00+00:00\"}}}}").unwrap();
+            // 第一个 worker 设为 Running (应被接受 — 此时 trial 默认就是 Running, 但因为 已经 Running 应该被拒绝)
+            writeln!(f, "{{\"op_code\":6,\"study_id\":0,\"trial_id\":0,\"data\":{{\"state\":0,\"values\":[],\"datetime_start\":\"2024-01-01T00:01:00+00:00\"}}}}").unwrap();
+            // 第二个 worker 也设为 Running (应被静默拒绝)
+            writeln!(f, "{{\"op_code\":6,\"study_id\":0,\"trial_id\":0,\"data\":{{\"state\":0,\"values\":[],\"datetime_start\":\"2024-01-01T00:02:00+00:00\"}}}}").unwrap();
+            // complete
+            writeln!(f, "{{\"op_code\":6,\"study_id\":0,\"trial_id\":0,\"data\":{{\"state\":1,\"values\":[42.0],\"datetime_complete\":\"2024-01-01T00:03:00+00:00\"}}}}").unwrap();
+        }
+
+        let storage = JournalFileStorage::new(&path).unwrap();
+        let sid = storage.get_study_id_from_name("dup_run").unwrap();
+        let trials = storage.get_all_trials(sid, None).unwrap();
+        assert_eq!(trials.len(), 1);
+        assert_eq!(trials[0].state, TrialState::Complete);
+        assert_eq!(trials[0].values.as_ref().unwrap(), &[42.0]);
+        // datetime_start 应该来自创建日志（第一个被接受的时间）
+        assert!(trials[0].datetime_start.is_some());
+        fs::remove_file(&path).ok();
+    }
+
+    // ── 对齐 Python: get_best_trial NaN 过滤测试 ────────────────────
+
+    #[test]
+    fn test_journal_get_best_trial_nan_filtered() {
+        let path = temp_path();
+        let storage = JournalFileStorage::new(&path).unwrap();
+        let sid = storage.create_new_study(&[StudyDirection::Maximize], Some("nan_test")).unwrap();
+
+        // 创建正常 trial
+        let t1 = storage.create_new_trial(sid, None).unwrap();
+        storage.set_trial_state_values(t1, TrialState::Complete, Some(&[5.0])).unwrap();
+
+        // 创建 NaN trial
+        let t2 = storage.create_new_trial(sid, None).unwrap();
+        storage.set_trial_state_values(t2, TrialState::Complete, Some(&[f64::NAN])).unwrap();
+
+        let best = storage.get_best_trial(sid).unwrap();
+        assert_eq!(best.values.as_ref().unwrap()[0], 5.0);
+        fs::remove_file(&path).ok();
+    }
+
+    // ── 对齐 Python: Python 生成的日志文件兼容测试 ──────────────────
+
+    #[test]
+    fn test_journal_python_log_format_compatibility() {
+        let path = temp_path();
+
+        // 模拟 Python JournalStorage 生成的日志格式
+        {
+            let mut f = File::create(&path).unwrap();
+            // Python create_study 格式
+            writeln!(f, "{{\"op_code\":0,\"study_id\":null,\"trial_id\":null,\"data\":{{\"study_name\":\"py_compat\",\"directions\":[1]}}}}").unwrap();
+            // Python set_study_user_attr 格式 (user_attr: {k: v})
+            writeln!(f, "{{\"op_code\":2,\"study_id\":0,\"trial_id\":null,\"data\":{{\"user_attr\":{{\"py_key\":\"py_val\"}}}}}}").unwrap();
+            // Python set_study_system_attr 格式 (system_attr: {k: v})
+            writeln!(f, "{{\"op_code\":3,\"study_id\":0,\"trial_id\":null,\"data\":{{\"system_attr\":{{\"sys_key\":42}}}}}}").unwrap();
+            // Python create_trial with template 格式
+            writeln!(f, "{{\"op_code\":4,\"study_id\":0,\"trial_id\":null,\"data\":{{\"state\":1,\"datetime_start\":\"2024-01-01T00:00:00.000000\",\"datetime_complete\":\"2024-01-01T00:01:00.000000\",\"value\":0.5,\"values\":null,\"distributions\":{{\"x\":\"{{\\\"name\\\":\\\"FloatDistribution\\\",\\\"attributes\\\":{{\\\"low\\\":0.0,\\\"high\\\":1.0,\\\"log\\\":false,\\\"step\\\":null}}}}\"}},\"params\":{{\"x\":0.5}},\"user_attrs\":{{\"u1\":\"v1\"}},\"system_attrs\":{{\"s1\":100}},\"intermediate_values\":{{\"0\":0.1}}}}}}").unwrap();
+            // Python set_trial_user_attr 格式 (user_attr: {k: v})
+            writeln!(f, "{{\"op_code\":8,\"study_id\":0,\"trial_id\":0,\"data\":{{\"user_attr\":{{\"extra\":\"info\"}}}}}}").unwrap();
+            // Python set_trial_system_attr 格式 (system_attr: {k: v})
+            writeln!(f, "{{\"op_code\":9,\"study_id\":0,\"trial_id\":0,\"data\":{{\"system_attr\":{{\"sys_extra\":999}}}}}}").unwrap();
+        }
+
+        let storage = JournalFileStorage::new(&path).unwrap();
+        let sid = storage.get_study_id_from_name("py_compat").unwrap();
+
+        // 验证 study attrs
+        let study_ua = storage.get_study_user_attrs(sid).unwrap();
+        assert_eq!(study_ua["py_key"], serde_json::json!("py_val"));
+        let study_sa = storage.get_study_system_attrs(sid).unwrap();
+        assert_eq!(study_sa["sys_key"], serde_json::json!(42));
+
+        // 验证 trial 从模板恢复
+        let trials = storage.get_all_trials(sid, None).unwrap();
+        assert_eq!(trials.len(), 1);
+        let t = &trials[0];
+        assert_eq!(t.state, TrialState::Complete);
+        assert_eq!(t.values.as_ref().unwrap(), &[0.5]);
+        assert!(t.params.contains_key("x"));
+        assert!(t.distributions.contains_key("x"));
+        assert_eq!(t.user_attrs["u1"], serde_json::json!("v1"));
+        // after set_trial_user_attr
+        assert_eq!(t.user_attrs["extra"], serde_json::json!("info"));
+        assert_eq!(t.system_attrs["s1"], serde_json::json!(100));
+        assert_eq!(t.system_attrs["sys_extra"], serde_json::json!(999));
+        assert_eq!(t.intermediate_values[&0], 0.1);
+        assert!(t.datetime_start.is_some());
+        assert!(t.datetime_complete.is_some());
+
         fs::remove_file(&path).ok();
     }
 }

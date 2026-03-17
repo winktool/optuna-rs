@@ -287,7 +287,11 @@ impl Sampler for NSGAIIISampler {
         &self,
         trials: &[FrozenTrial],
     ) -> IndexMap<String, Distribution> {
+        // 对齐 Python: 过滤掉 single() 分布
         self.search_space.lock().calculate(trials)
+            .into_iter()
+            .filter(|(_, d)| !d.single())
+            .collect()
     }
 
     fn sample_relative(

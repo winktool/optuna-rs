@@ -328,4 +328,87 @@ mod tests {
         assert_eq!(r2.len(), 1);
         assert!(r2.contains_key("x"));
     }
+
+    /// 对齐 Python: 分布冲突后搜索空间永久清空，即使后续 trial 恢复相同分布也不恢复
+    #[test]
+    fn test_space_clears_permanently_after_distribution_conflict() {
+        let dist2 = Distribution::FloatDistribution(
+            FloatDistribution::new(0.0, 10.0, false, None).unwrap(),
+        );
+        let trials = vec![
+            make_trial(0, TrialState::Complete, vec![("x", ParamValue::Float(0.5), float_dist())]),
+            make_trial(1, TrialState::Complete, vec![("x", ParamValue::Float(0.3), dist2)]),
+            make_trial(2, TrialState::Complete, vec![("x", ParamValue::Float(0.4), float_dist())]),
+        ];
+        // 一旦 x 出现分布冲突就清空，即使第三个 trial 恢复原分布也不恢复
+        let result = intersection_search_space(&trials, false);
+        assert!(result.is_empty());
+    }
+
+    /// 对齐 Python: IntersectionSearchSpace 增量计算中分布冲突后也不恢复
+    #[test]
+    fn test_incremental_conflict_permanence() {
+        let mut iss = IntersectionSearchSpace::new(false);
+        let trials1 = vec![
+            make_trial(0, TrialState::Complete, vec![("x", ParamValue::Float(0.5), float_dist())]),
+        ];
+        let r1 = iss.calculate(&trials1);
+        assert_eq!(r1.len(), 1);
+
+        let dist2 = Distribution::FloatDistribution(
+            FloatDistribution::new(0.0, 10.0, false, None).unwrap(),
+        );
+        let trials2 = vec![
+            make_trial(0, TrialState::Complete, vec![("x", ParamValue::Float(0.5), float_dist())]),
+            make_trial(1, TrialState::Complete, vec![("x", ParamValue::Float(0.3), dist2)]),
+        ];
+        let r2 = iss.calculate(&trials2);
+        assert!(r2.is_empty());
+
+        // 即使第三个 trial 恢复原分布也应保持为空
+        let trials3 = vec![
+            make_trial(0, TrialState::Complete, vec![("x", ParamValue::Float(0.5), float_dist())]),
+            make_trial(1, TrialState::Complete, vec![("x", ParamValue::Float(0.3), Distribution::FloatDistribution(
+                FloatDistribution::new(0.0, 10.0, false, None).unwrap(),
+            ))]),
+            make_trial(2, TrialState::Complete, vec![("x", ParamValue::Float(0.4), float_dist())]),
+        ];
+        let r3 = iss.calculate(&trials3);
+        assert!(r3.is_empty());
+    }
+
+    /// 对齐 Python: pruned 但 include_pruned=true 时应包含 pruned 的参数
+    #[test]
+    fn test_include_pruned_true_includes_pruned_params() {
+        let trials = vec![
+            make_trial(0, TrialState::Complete, vec![("x", ParamValue::Float(0.5), float_dist())]),
+            make_trial(1, TrialState::Pruned, vec![("x", ParamValue::Float(0.3), float_dist())]),
+        ];
+        let result = intersection_search_space(&trials, true);
+        assert_eq!(result.len(), 1);
+        assert!(result.contains_key("x"));
+    }
+
+    /// 对齐 Python: 无完成试验时搜索空间为空
+    #[test]
+    fn test_only_running_trials() {
+        let trials = vec![
+            make_trial(0, TrialState::Running, vec![("x", ParamValue::Float(0.5), float_dist())]),
+            make_trial(1, TrialState::Running, vec![("x", ParamValue::Float(0.3), float_dist())]),
+        ];
+        let result = intersection_search_space(&trials, false);
+        assert!(result.is_empty());
+    }
+
+    /// 对齐 Python: failed 试验不影响搜索空间
+    #[test]
+    fn test_failed_trials_ignored() {
+        let trials = vec![
+            make_trial(0, TrialState::Complete, vec![("x", ParamValue::Float(0.5), float_dist())]),
+            make_trial(1, TrialState::Fail, vec![]),
+        ];
+        let result = intersection_search_space(&trials, false);
+        assert_eq!(result.len(), 1);
+        assert!(result.contains_key("x"));
+    }
 }

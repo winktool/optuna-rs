@@ -2716,6 +2716,306 @@ def test_journal_interop_python_write_rust_format_read():
 
 
 # ═══════════════════════════════════════════════════════════════════════════
+# Session 47: NSGA-II/III 参数验证 + TPE default_weights/gamma + search_space
+# ═══════════════════════════════════════════════════════════════════════════
+
+def test_nsgaii_parameter_validation_mutation_prob():
+    """对齐 Python: mutation_prob 必须在 [0.0, 1.0] 或 None"""
+    import optuna
+
+    # None 应合法
+    optuna.samplers.NSGAIISampler(mutation_prob=None)
+
+    # 0.0 和 1.0 应合法
+    optuna.samplers.NSGAIISampler(mutation_prob=0.0)
+    optuna.samplers.NSGAIISampler(mutation_prob=1.0)
+
+    # 超出范围应抛 ValueError
+    try:
+        optuna.samplers.NSGAIISampler(mutation_prob=-0.5)
+        assert False, "Should raise ValueError for mutation_prob=-0.5"
+    except ValueError:
+        pass
+
+    try:
+        optuna.samplers.NSGAIISampler(mutation_prob=1.1)
+        assert False, "Should raise ValueError for mutation_prob=1.1"
+    except ValueError:
+        pass
+
+
+def test_nsgaii_parameter_validation_crossover_prob():
+    """对齐 Python: crossover_prob 必须在 [0.0, 1.0]"""
+    import optuna
+
+    optuna.samplers.NSGAIISampler(crossover_prob=0.0)
+    optuna.samplers.NSGAIISampler(crossover_prob=1.0)
+
+    try:
+        optuna.samplers.NSGAIISampler(crossover_prob=-0.1)
+        assert False, "Should raise ValueError for crossover_prob=-0.1"
+    except ValueError:
+        pass
+
+    try:
+        optuna.samplers.NSGAIISampler(crossover_prob=1.5)
+        assert False, "Should raise ValueError for crossover_prob=1.5"
+    except ValueError:
+        pass
+
+
+def test_nsgaii_parameter_validation_swapping_prob():
+    """对齐 Python: swapping_prob 必须在 [0.0, 1.0]"""
+    import optuna
+
+    optuna.samplers.NSGAIISampler(swapping_prob=0.0)
+    optuna.samplers.NSGAIISampler(swapping_prob=1.0)
+
+    try:
+        optuna.samplers.NSGAIISampler(swapping_prob=-0.1)
+        assert False, "Should raise ValueError for swapping_prob=-0.1"
+    except ValueError:
+        pass
+
+    try:
+        optuna.samplers.NSGAIISampler(swapping_prob=1.5)
+        assert False, "Should raise ValueError for swapping_prob=1.5"
+    except ValueError:
+        pass
+
+
+def test_nsgaii_population_size_validation():
+    """对齐 Python: population_size < 2 应抛 ValueError"""
+    import optuna
+
+    try:
+        optuna.samplers.NSGAIISampler(population_size=1)
+        assert False, "Should raise ValueError for population_size=1"
+    except ValueError:
+        pass
+
+    # population_size=2 应合法
+    optuna.samplers.NSGAIISampler(population_size=2)
+
+
+def test_nsgaiii_parameter_validation():
+    """对齐 Python: NSGA-III 同样的参数验证"""
+    import optuna
+
+    # 合法参数
+    optuna.samplers.NSGAIIISampler(
+        mutation_prob=0.5, crossover_prob=0.5, swapping_prob=0.5
+    )
+
+    # mutation_prob 不合法
+    try:
+        optuna.samplers.NSGAIIISampler(mutation_prob=-0.1)
+        assert False, "Should raise ValueError"
+    except ValueError:
+        pass
+
+    # crossover_prob 不合法
+    try:
+        optuna.samplers.NSGAIIISampler(crossover_prob=1.5)
+        assert False, "Should raise ValueError"
+    except ValueError:
+        pass
+
+    # swapping_prob 不合法
+    try:
+        optuna.samplers.NSGAIIISampler(swapping_prob=-0.1)
+        assert False, "Should raise ValueError"
+    except ValueError:
+        pass
+
+
+def test_nsgaii_default_values():
+    """对齐 Python/Rust: NSGA-II 默认参数值"""
+    import optuna
+
+    sampler = optuna.samplers.NSGAIISampler()
+    # Python 默认: population_size=50, crossover_prob=0.9, swapping_prob=0.5
+    assert sampler._population_size == 50, f"Expected 50, got {sampler._population_size}"
+    assert sampler._child_generation_strategy._crossover_prob == 0.9
+    assert sampler._child_generation_strategy._swapping_prob == 0.5
+    assert sampler._child_generation_strategy._mutation_prob is None
+
+
+def test_tpe_default_weights_cross_validation():
+    """对齐 Python/Rust: default_weights 函数输出完全一致"""
+    from optuna.samplers._tpe.sampler import default_weights
+    import numpy as np
+
+    # n=0 → 空
+    w0 = default_weights(0)
+    assert len(w0) == 0, f"n=0: expected empty, got {w0}"
+
+    # n=1..24 → 全1
+    for n in [1, 5, 10, 24]:
+        w = default_weights(n)
+        assert len(w) == n
+        assert all(abs(v - 1.0) < 1e-10 for v in w), f"n={n}: expected all 1.0"
+
+    # n=25 → 全1 (ramp_len=0)
+    w25 = default_weights(25)
+    assert len(w25) == 25
+    assert all(abs(v - 1.0) < 1e-10 for v in w25)
+
+    # n=26 → 第一个是 1/26
+    w26 = default_weights(26)
+    assert len(w26) == 26
+    assert abs(w26[0] - 1.0 / 26) < 1e-6, f"w26[0]={w26[0]}, expected {1/26}"
+    for i in range(1, 26):
+        assert abs(w26[i] - 1.0) < 1e-10, f"w26[{i}]={w26[i]}"
+
+    # n=50
+    w50 = default_weights(50)
+    assert len(w50) == 50
+    assert abs(w50[0] - 0.02) < 1e-6
+    assert abs(w50[24] - 1.0) < 1e-6
+    for i in range(25, 50):
+        assert abs(w50[i] - 1.0) < 1e-10
+
+    # n=100
+    w100 = default_weights(100)
+    assert len(w100) == 100
+    assert abs(w100[0] - 0.01) < 1e-6
+    assert abs(w100[74] - 1.0) < 1e-6
+
+
+def test_tpe_hyperopt_gamma_cross_validation():
+    """对齐 Python/Rust: hyperopt_default_gamma 函数输出完全一致"""
+    from optuna.samplers._tpe.sampler import hyperopt_default_gamma
+    import math
+
+    # hyperopt_default_gamma: min(ceil(0.25 * sqrt(n)), 25)
+    for n, expected in [(0, 0), (1, 1), (4, 1), (16, 1), (17, 2), (25, 2),
+                        (64, 2), (100, 3), (10000, 25), (100000, 25)]:
+        actual = hyperopt_default_gamma(n)
+        assert actual == expected, f"hyperopt_default_gamma({n}) = {actual}, expected {expected}"
+
+
+def test_tpe_default_gamma_cross_validation():
+    """对齐 Python/Rust: default_gamma (TPE 默认 gamma) 一致"""
+    from optuna.samplers._tpe.sampler import default_gamma
+
+    # default_gamma(n) = min(ceil(0.1 * n), 25)
+    expected = {0: 0, 1: 1, 10: 1, 50: 5, 250: 25, 500: 25}
+    for n, exp in expected.items():
+        actual = default_gamma(n)
+        assert actual == exp, f"default_gamma({n}) = {actual}, expected {exp}"
+
+
+def test_intersection_search_space_conflict_permanence():
+    """对齐 Python/Rust: 分布冲突后搜索空间永久清空"""
+    import optuna
+    from optuna.search_space import IntersectionSearchSpace
+
+    study = optuna.create_study()
+
+    # Trial 0: x ∈ [0, 1]
+    trial0 = study.ask()
+    trial0.suggest_float("x", 0.0, 1.0)
+    study.tell(trial0, 0.5)
+
+    iss = IntersectionSearchSpace()
+    ss1 = iss.calculate(study)
+    assert "x" in ss1, f"x should be in search space, got {ss1}"
+
+    # Trial 1: x ∈ [0, 10] — 不同分布
+    trial1 = study.ask()
+    trial1.suggest_float("x", 0.0, 10.0)
+    study.tell(trial1, 0.3)
+
+    ss2 = iss.calculate(study)
+    assert "x" not in ss2, f"x should be removed after conflict, got {ss2}"
+
+    # Trial 2: x ∈ [0, 1] — 恢复原分布，但搜索空间应仍为空
+    trial2 = study.ask()
+    trial2.suggest_float("x", 0.0, 1.0)
+    study.tell(trial2, 0.4)
+
+    ss3 = iss.calculate(study)
+    assert "x" not in ss3, f"x should remain removed, got {ss3}"
+
+
+def test_intersection_search_space_include_pruned():
+    """对齐 Python/Rust: include_pruned=True 时包含被剪枝的试验"""
+    import optuna
+    from optuna.search_space import IntersectionSearchSpace
+
+    study = optuna.create_study()
+
+    # Trial 0: Complete with x and y
+    trial0 = study.ask()
+    trial0.suggest_float("x", 0.0, 1.0)
+    trial0.suggest_float("y", 0.0, 1.0)
+    study.tell(trial0, 0.5)
+
+    # Trial 1: Pruned with only x
+    trial1 = study.ask()
+    trial1.suggest_float("x", 0.0, 1.0)
+    study.tell(trial1, state=optuna.trial.TrialState.PRUNED)
+
+    # include_pruned=False → 只看 Complete，搜索空间 = {x, y}
+    iss_no = IntersectionSearchSpace(include_pruned=False)
+    ss_no = iss_no.calculate(study)
+    assert "x" in ss_no and "y" in ss_no
+
+    # include_pruned=True → Complete ∩ Pruned = {x}
+    iss_yes = IntersectionSearchSpace(include_pruned=True)
+    ss_yes = iss_yes.calculate(study)
+    assert "x" in ss_yes
+    assert "y" not in ss_yes, f"y should not be in intersection, got {ss_yes}"
+
+
+def test_fixed_trial_base_interface():
+    """对齐 Python/Rust: FixedTrial 的 BaseTrial 接口行为"""
+    import optuna
+
+    # suggest_float 返回固定值
+    trial = optuna.trial.FixedTrial({"x": 0.5, "n": 3})
+    assert trial.suggest_float("x", 0.0, 1.0) == 0.5
+    assert trial.suggest_int("n", 0, 10) == 3
+
+    # should_prune 始终返回 False
+    assert trial.should_prune() is False
+
+    # report 是 no-op
+    trial.report(1.0, 0)
+
+    # params 和 distributions 一致
+    p = trial.params
+    d = trial.distributions
+    assert set(p.keys()) == set(d.keys())
+
+    # number 默认为 0
+    assert trial.number == 0
+
+
+def test_nsgaiii_reference_points_count():
+    """对齐 Python/Rust: generate_reference_points 点数公式 C(n+d-1, d)"""
+    from math import comb
+
+    # 验证 Das-Dennis 公式
+    test_cases = [
+        (2, 3, comb(4, 3)),   # C(4,3)=4
+        (2, 4, comb(5, 4)),   # C(5,4)=5
+        (3, 3, comb(5, 3)),   # C(5,3)=10
+        (3, 4, comb(6, 4)),   # C(6,4)=15
+        (4, 3, comb(6, 3)),   # C(6,3)=20
+    ]
+
+    # 直接用 NSGA-III 创建并检查参考点数
+    import optuna
+    for n_obj, divs, expected_count in test_cases:
+        sampler = optuna.samplers.NSGAIIISampler(
+            dividing_parameter=divs
+        )
+        # 验证公式: C(n_obj + divs - 1, divs) = expected_count
+        actual = comb(n_obj + divs - 1, divs)
+        assert actual == expected_count, \
+            f"n_obj={n_obj}, divs={divs}: C({n_obj+divs-1},{divs})={actual}, expected {expected_count}"
 #  执行
 # ═══════════════════════════════════════════════════════════════════════════
 

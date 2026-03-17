@@ -425,4 +425,83 @@ mod tests {
         // 包含 Pruned → 处理 {x} 和 {x,y} → 分裂为 {x} 和 {y}
         assert_eq!(result.search_spaces().len(), 2);
     }
+
+    /// 对齐 Python: 添加空分布应保持搜索空间不变
+    #[test]
+    fn test_add_empty_distributions() {
+        let mut group = SearchSpaceGroup::new();
+        group.add_distributions(&HashMap::new());
+        assert!(group.search_spaces().is_empty());
+    }
+
+    /// 对齐 Python: 添加空分布到已有组中应保持不变
+    #[test]
+    fn test_add_empty_distributions_to_existing() {
+        let mut group = SearchSpaceGroup::new();
+        let mut d1 = HashMap::new();
+        d1.insert("x".to_string(), float_dist(0.0, 1.0));
+        group.add_distributions(&d1);
+        assert_eq!(group.search_spaces().len(), 1);
+
+        group.add_distributions(&HashMap::new());
+        assert_eq!(group.search_spaces().len(), 1);
+    }
+
+    /// 对齐 Python: 多轮渐进式分裂
+    #[test]
+    fn test_progressive_splitting() {
+        let mut group = SearchSpaceGroup::new();
+
+        // 第1步: {x, y}
+        let mut d1 = HashMap::new();
+        d1.insert("x".into(), float_dist(0.0, 1.0));
+        d1.insert("y".into(), float_dist(0.0, 1.0));
+        group.add_distributions(&d1);
+        assert_eq!(group.search_spaces().len(), 1);
+        assert_eq!(group.search_spaces()[0].len(), 2);
+
+        // 第2步: {x, y} 不变
+        group.add_distributions(&d1);
+        assert_eq!(group.search_spaces().len(), 1);
+        assert_eq!(group.search_spaces()[0].len(), 2);
+
+        // 第3步: {x} 导致分裂为 {x} 和 {y}
+        let mut d2 = HashMap::new();
+        d2.insert("x".into(), float_dist(0.0, 1.0));
+        group.add_distributions(&d2);
+        assert_eq!(group.search_spaces().len(), 2);
+
+        // 第4步: {z} 添加新组
+        let mut d3 = HashMap::new();
+        d3.insert("z".into(), float_dist(0.0, 1.0));
+        group.add_distributions(&d3);
+        assert_eq!(group.search_spaces().len(), 3);
+
+        // 第5步: {x, z} 不合并（只分裂不合并）
+        let mut d4 = HashMap::new();
+        d4.insert("x".into(), float_dist(0.0, 1.0));
+        d4.insert("z".into(), float_dist(0.0, 1.0));
+        group.add_distributions(&d4);
+        // {x} 和 {z} 已分别存在，不应合并
+        assert!(group.search_spaces().len() >= 2);
+    }
+
+    /// 对齐 Python: 不同分布同名参数，应保留第一个分布
+    #[test]
+    fn test_different_distribution_same_param() {
+        let mut group = SearchSpaceGroup::new();
+
+        let mut d1 = HashMap::new();
+        d1.insert("x".into(), float_dist(0.0, 1.0));
+        group.add_distributions(&d1);
+
+        // 用不同范围的分布
+        let mut d2 = HashMap::new();
+        d2.insert("x".into(), float_dist(0.0, 10.0));
+        group.add_distributions(&d2);
+
+        // 应该保留第一个分布
+        let spaces = group.search_spaces();
+        assert_eq!(spaces.len(), 1);
+    }
 }

@@ -556,15 +556,18 @@ impl Storage for InMemoryStorage {
     ) -> Result<i64> {
         let inner = self.inner.lock();
         let study = Self::get_study(&inner, study_id)?;
-        study
-            .trials
-            .get(trial_number as usize)
-            .map(|t| t.trial_id)
-            .ok_or_else(|| {
-                OptunaError::ValueError(format!(
-                    "trial number {trial_number} not found in study {study_id}"
-                ))
-            })
+        // 与 Python 保持一致：按索引获取 trial 并断言 number 匹配
+        let trial = study.trials.get(trial_number as usize).ok_or_else(|| {
+            OptunaError::ValueError(format!(
+                "trial number {trial_number} not found in study {study_id}"
+            ))
+        })?;
+        debug_assert_eq!(
+            trial.number, trial_number,
+            "内部一致性错误: trial[{trial_number}].number = {}",
+            trial.number
+        );
+        Ok(trial.trial_id)
     }
 
     fn get_trial_number_from_id(&self, trial_id: i64) -> Result<i64> {

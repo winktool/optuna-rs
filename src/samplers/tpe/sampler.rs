@@ -1850,4 +1850,117 @@ mod tests {
         assert_eq!(below.len() + above.len(), 5);
         assert!(!below.is_empty(), "below should not be empty");
     }
+
+    // ── default_weights 精确对齐 Python ──
+
+    /// 对齐 Python: default_weights(0) → []
+    #[test]
+    fn test_default_weights_zero() {
+        assert!(default_weights(0).is_empty());
+    }
+
+    /// 对齐 Python: n <= 24 时全为 1.0
+    #[test]
+    fn test_default_weights_under_25() {
+        for n in [1, 5, 10, 24] {
+            let w = default_weights(n);
+            assert_eq!(w.len(), n);
+            assert!(w.iter().all(|&v| (v - 1.0).abs() < 1e-10),
+                "n={n}: all weights should be 1.0");
+        }
+    }
+
+    /// 对齐 Python: n=25 时也全为 1.0 (ramp_len=0)
+    #[test]
+    fn test_default_weights_25() {
+        let w = default_weights(25);
+        assert_eq!(w.len(), 25);
+        assert!(w.iter().all(|&v| (v - 1.0).abs() < 1e-10));
+    }
+
+    /// 对齐 Python: n=26 时第一个是 1/26≈0.038462，最后25个全为 1.0
+    #[test]
+    fn test_default_weights_26() {
+        let w = default_weights(26);
+        assert_eq!(w.len(), 26);
+        assert!((w[0] - 1.0 / 26.0).abs() < 1e-6);
+        for i in 1..26 {
+            assert!((w[i] - 1.0).abs() < 1e-10, "w[{i}] should be 1.0");
+        }
+    }
+
+    /// 对齐 Python: n=50 时 ramp_len=25，linspace(1/50, 1.0, 25) + [1.0]*25
+    #[test]
+    fn test_default_weights_50() {
+        let w = default_weights(50);
+        assert_eq!(w.len(), 50);
+        assert!((w[0] - 1.0 / 50.0).abs() < 1e-6); // 0.02
+        assert!((w[24] - 1.0).abs() < 1e-6);        // ramp 最后一个 = 1.0
+        for i in 25..50 {
+            assert!((w[i] - 1.0).abs() < 1e-10, "w[{i}] should be 1.0");
+        }
+    }
+
+    /// 对齐 Python: n=100 时 ramp_len=75
+    #[test]
+    fn test_default_weights_100() {
+        let w = default_weights(100);
+        assert_eq!(w.len(), 100);
+        assert!((w[0] - 0.01).abs() < 1e-6);
+        assert!((w[74] - 1.0).abs() < 1e-6);
+        for i in 75..100 {
+            assert!((w[i] - 1.0).abs() < 1e-10);
+        }
+    }
+
+    // ── hyperopt_default_gamma 精确对齐 Python ──
+
+    /// 对齐 Python: hyperopt_default_gamma 已知值
+    #[test]
+    fn test_hyperopt_default_gamma_values() {
+        // gamma(n) = min(ceil(0.25 * sqrt(n)), 25)
+        assert_eq!(hyperopt_default_gamma(0), 0);
+        assert_eq!(hyperopt_default_gamma(1), 1);
+        assert_eq!(hyperopt_default_gamma(4), 1);
+        assert_eq!(hyperopt_default_gamma(16), 1);
+        assert_eq!(hyperopt_default_gamma(17), 2); // ceil(0.25*4.123) = 2
+        assert_eq!(hyperopt_default_gamma(25), 2); // ceil(0.25*5) = 2
+        assert_eq!(hyperopt_default_gamma(64), 2); // ceil(0.25*8) = 2
+        assert_eq!(hyperopt_default_gamma(100), 3); // ceil(0.25*10) = 3
+        assert_eq!(hyperopt_default_gamma(10000), 25); // ceil(0.25*100) = 25
+        assert_eq!(hyperopt_default_gamma(100000), 25); // min(ceil(79.06), 25) = 25
+    }
+
+    /// 对齐 Python: gamma 上界为 25
+    #[test]
+    fn test_hyperopt_default_gamma_capped_at_25() {
+        assert_eq!(hyperopt_default_gamma(1_000_000), 25);
+    }
+
+    // ── TpeSampler 构建参数 ──
+
+    /// 对齐 Python: TPESampler 默认参数值
+    #[test]
+    fn test_tpe_default_parameters() {
+        let sampler = TpeSampler::with_defaults(StudyDirection::Minimize, Some(42));
+        assert_eq!(sampler.n_startup_trials, 10);
+        assert_eq!(sampler.n_ei_candidates, 24);
+        assert!(!sampler.multivariate);
+        assert!(!sampler.group);
+        assert!(!sampler.constant_liar);
+    }
+
+    /// 对齐 Python: TpeSamplerBuilder 参数设置
+    #[test]
+    fn test_tpe_builder_custom_parameters() {
+        let sampler = TpeSamplerBuilder::new(StudyDirection::Minimize)
+            .n_startup_trials(20)
+            .n_ei_candidates(48)
+            .multivariate(true)
+            .seed(42)
+            .build();
+        assert_eq!(sampler.n_startup_trials, 20);
+        assert_eq!(sampler.n_ei_candidates, 48);
+        assert!(sampler.multivariate);
+    }
 }

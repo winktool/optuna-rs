@@ -111,6 +111,27 @@ impl NSGAIISampler {
             pop_size,
             crossover_box.n_parents()
         );
+        // 对齐 Python: mutation_prob 必须为 None 或 [0.0, 1.0]
+        if let Some(mp) = mutation_prob {
+            assert!(
+                (0.0..=1.0).contains(&mp),
+                "`mutation_prob` must be None or a float value within the range [0.0, 1.0]."
+            );
+        }
+        // 对齐 Python: crossover_prob 必须在 [0.0, 1.0]
+        if let Some(cp) = crossover_prob {
+            assert!(
+                (0.0..=1.0).contains(&cp),
+                "`crossover_prob` must be a float value within the range [0.0, 1.0]."
+            );
+        }
+        // 对齐 Python: swapping_prob 必须在 [0.0, 1.0]
+        if let Some(sp) = swapping_prob {
+            assert!(
+                (0.0..=1.0).contains(&sp),
+                "`swapping_prob` must be a float value within the range [0.0, 1.0]."
+            );
+        }
         Self {
             directions,
             population_size: pop_size,
@@ -602,6 +623,7 @@ impl NSGAIISamplerBuilder {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use super::super::crossover::SPXCrossover;
     use std::sync::Arc;
     use crate::study::{create_study, StudyDirection};
 
@@ -726,5 +748,111 @@ mod tests {
             vec![StudyDirection::Minimize, StudyDirection::Minimize],
             Some(1), None, None, None, None, None, None, None, None, None,
         );
+    }
+
+    /// 对齐 Python: population_size < crossover.n_parents 应 panic
+    #[test]
+    #[should_panic(expected = "n_parents")]
+    fn test_population_size_less_than_crossover_n_parents() {
+        NSGAIISampler::new(
+            vec![StudyDirection::Minimize, StudyDirection::Minimize],
+            Some(2),
+            Some(Box::new(SPXCrossover::new(None))), // n_parents=3
+            None, None, None, None, None, None, None, None,
+        );
+    }
+
+    /// 对齐 Python: mutation_prob 超出 [0.0, 1.0] 应 panic
+    #[test]
+    #[should_panic(expected = "mutation_prob")]
+    fn test_mutation_prob_negative() {
+        NSGAIISampler::new(
+            vec![StudyDirection::Minimize],
+            None, None, None, None, Some(-0.5), None, None, None, None, None,
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "mutation_prob")]
+    fn test_mutation_prob_too_large() {
+        NSGAIISampler::new(
+            vec![StudyDirection::Minimize],
+            None, None, None, None, Some(1.1), None, None, None, None, None,
+        );
+    }
+
+    /// 对齐 Python: crossover_prob 超出 [0.0, 1.0] 应 panic
+    #[test]
+    #[should_panic(expected = "crossover_prob")]
+    fn test_crossover_prob_negative() {
+        NSGAIISampler::new(
+            vec![StudyDirection::Minimize],
+            None, None, Some(-0.1), None, None, None, None, None, None, None,
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "crossover_prob")]
+    fn test_crossover_prob_too_large() {
+        NSGAIISampler::new(
+            vec![StudyDirection::Minimize],
+            None, None, Some(1.5), None, None, None, None, None, None, None,
+        );
+    }
+
+    /// 对齐 Python: swapping_prob 超出 [0.0, 1.0] 应 panic
+    #[test]
+    #[should_panic(expected = "swapping_prob")]
+    fn test_swapping_prob_negative() {
+        NSGAIISampler::new(
+            vec![StudyDirection::Minimize],
+            None, None, None, Some(-0.1), None, None, None, None, None, None,
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "swapping_prob")]
+    fn test_swapping_prob_too_large() {
+        NSGAIISampler::new(
+            vec![StudyDirection::Minimize],
+            None, None, None, Some(1.5), None, None, None, None, None, None,
+        );
+    }
+
+    /// 对齐 Python: mutation_prob=None 是合法的（默认行为）
+    #[test]
+    fn test_mutation_prob_none_is_valid() {
+        let sampler = NSGAIISampler::new(
+            vec![StudyDirection::Minimize],
+            None, None, None, None, None, None, None, None, None, None,
+        );
+        assert!(sampler.mutation_prob.is_none());
+    }
+
+    /// 对齐 Python: 边界值应合法
+    #[test]
+    fn test_prob_boundary_values() {
+        // mutation_prob=0.0 和 1.0 都应合法
+        let _ = NSGAIISampler::new(
+            vec![StudyDirection::Minimize],
+            None, None, Some(0.0), Some(0.0), Some(0.0), None, None, None, None, None,
+        );
+        let _ = NSGAIISampler::new(
+            vec![StudyDirection::Minimize],
+            None, None, Some(1.0), Some(1.0), Some(1.0), None, None, None, None, None,
+        );
+    }
+
+    /// 对齐 Python: 默认参数值
+    #[test]
+    fn test_default_parameter_values() {
+        let sampler = NSGAIISampler::new(
+            vec![StudyDirection::Minimize, StudyDirection::Minimize],
+            None, None, None, None, None, Some(42), None, None, None, None,
+        );
+        assert_eq!(sampler.population_size, 50);
+        assert!((sampler.crossover_prob - 0.9).abs() < 1e-10);
+        assert!((sampler.swapping_prob - 0.5).abs() < 1e-10);
+        assert!(sampler.mutation_prob.is_none());
     }
 }

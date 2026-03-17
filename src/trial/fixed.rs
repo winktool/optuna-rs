@@ -338,6 +338,7 @@ impl crate::trial::BaseTrial for FixedTrial {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::trial::BaseTrial;
 
     #[test]
     fn test_suggest_float() {
@@ -602,5 +603,87 @@ mod tests {
         let mut trial = FixedTrial::new(params, 0);
         let result = trial.suggest_float("missing", 0.0, 1.0, false, None);
         assert!(result.is_err());
+    }
+
+    // ── BaseTrial trait 接口测试 ──
+
+    /// 对齐 Python: 通过 BaseTrial trait object 调用 suggest_float
+    #[test]
+    fn test_base_trial_trait_object_float() {
+        let mut params = HashMap::new();
+        params.insert("x".to_string(), ParamValue::Float(0.5));
+        let mut trial = FixedTrial::new(params, 0);
+        let t: &mut dyn BaseTrial = &mut trial;
+        let v = t.suggest_float("x", 0.0, 1.0, None, false).unwrap();
+        assert!((v - 0.5).abs() < 1e-10);
+    }
+
+    /// 对齐 Python: 通过 BaseTrial trait object 调用 suggest_int
+    #[test]
+    fn test_base_trial_trait_object_int() {
+        let mut params = HashMap::new();
+        params.insert("y".to_string(), ParamValue::Int(5));
+        let mut trial = FixedTrial::new(params, 1);
+        let t: &mut dyn BaseTrial = &mut trial;
+        let v = t.suggest_int("y", 0, 10, 1, false).unwrap();
+        assert_eq!(v, 5);
+    }
+
+    /// 对齐 Python: 通过 BaseTrial trait object 调用 suggest_categorical
+    #[test]
+    fn test_base_trial_trait_object_categorical() {
+        let mut params = HashMap::new();
+        params.insert("c".to_string(), ParamValue::Categorical(CategoricalChoice::Str("a".into())));
+        let mut trial = FixedTrial::new(params, 2);
+        let t: &mut dyn BaseTrial = &mut trial;
+        let v = t.suggest_categorical("c", vec![
+            CategoricalChoice::Str("a".into()),
+            CategoricalChoice::Str("b".into()),
+        ]).unwrap();
+        assert_eq!(v, CategoricalChoice::Str("a".into()));
+    }
+
+    /// 对齐 Python: FixedTrial.should_prune() 始终返回 false
+    #[test]
+    fn test_fixed_trial_should_prune_always_false() {
+        let trial = FixedTrial::new(HashMap::new(), 0);
+        let t: &dyn BaseTrial = &trial;
+        assert!(!t.should_prune().unwrap());
+    }
+
+    /// 对齐 Python: FixedTrial.report() 是 no-op
+    #[test]
+    fn test_fixed_trial_report_is_noop() {
+        let mut trial = FixedTrial::new(HashMap::new(), 0);
+        let t: &mut dyn BaseTrial = &mut trial;
+        assert!(t.report(1.0, 0).is_ok());
+        assert!(t.report(2.0, 1).is_ok());
+    }
+
+    /// 对齐 Python: params() 和 distributions() 一致性
+    #[test]
+    fn test_base_trial_params_distributions_consistency() {
+        let mut params = HashMap::new();
+        params.insert("x".to_string(), ParamValue::Float(0.5));
+        params.insert("n".to_string(), ParamValue::Int(3));
+        let mut trial = FixedTrial::new(params, 0);
+
+        let _ = trial.suggest_float("x", 0.0, 1.0, false, None).unwrap();
+        let _ = trial.suggest_int("n", 0, 10, false, 1).unwrap();
+
+        let p = trial.params();
+        let d = trial.distributions();
+        assert_eq!(p.len(), d.len());
+        for key in p.keys() {
+            assert!(d.contains_key(key), "分布中应包含参数 {key}");
+        }
+    }
+
+    /// 对齐 Python: number() 返回构造时的值
+    #[test]
+    fn test_base_trial_number() {
+        let trial = FixedTrial::new(HashMap::new(), 42);
+        let t: &dyn BaseTrial = &trial;
+        assert_eq!(t.number(), 42);
     }
 }

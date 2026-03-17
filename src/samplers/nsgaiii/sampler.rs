@@ -148,6 +148,27 @@ impl NSGAIIISampler {
             pop_size,
             crossover_box.n_parents()
         );
+        // 对齐 Python: mutation_prob 必须为 None 或 [0.0, 1.0]
+        if let Some(mp) = mutation_prob {
+            assert!(
+                (0.0..=1.0).contains(&mp),
+                "`mutation_prob` must be None or a float value within the range [0.0, 1.0]."
+            );
+        }
+        // 对齐 Python: crossover_prob 必须在 [0.0, 1.0]
+        if let Some(cp) = crossover_prob {
+            assert!(
+                (0.0..=1.0).contains(&cp),
+                "`crossover_prob` must be a float value within the range [0.0, 1.0]."
+            );
+        }
+        // 对齐 Python: swapping_prob 必须在 [0.0, 1.0]
+        if let Some(sp) = swapping_prob {
+            assert!(
+                (0.0..=1.0).contains(&sp),
+                "`swapping_prob` must be a float value within the range [0.0, 1.0]."
+            );
+        }
 
         Self {
             directions,
@@ -698,6 +719,7 @@ impl NSGAIIISamplerBuilder {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::samplers::nsgaii::crossover::SPXCrossover;
     use std::sync::Arc;
     use crate::study::{create_study, StudyDirection};
 
@@ -775,5 +797,137 @@ mod tests {
 
         let trials = study.trials().unwrap();
         assert_eq!(trials.len(), 25);
+    }
+
+    /// 对齐 Python: population_size < 2 应 panic
+    #[test]
+    #[should_panic(expected = "population_size")]
+    fn test_nsgaiii_population_size_too_small() {
+        NSGAIIISampler::new(
+            vec![StudyDirection::Minimize, StudyDirection::Minimize],
+            Some(1), None, None, None, None, None, None, None, None, None, None, None,
+        );
+    }
+
+    /// 对齐 Python: population_size < crossover.n_parents 应 panic
+    #[test]
+    #[should_panic(expected = "n_parents")]
+    fn test_nsgaiii_population_size_less_than_crossover_n_parents() {
+        NSGAIIISampler::new(
+            vec![StudyDirection::Minimize, StudyDirection::Minimize],
+            Some(2),
+            Some(Box::new(SPXCrossover::new(None))), // n_parents=3
+            None, None, None, None, None, None, None, None, None, None,
+        );
+    }
+
+    /// 对齐 Python: mutation_prob 超出 [0.0, 1.0] 应 panic
+    #[test]
+    #[should_panic(expected = "mutation_prob")]
+    fn test_nsgaiii_mutation_prob_negative() {
+        NSGAIIISampler::new(
+            vec![StudyDirection::Minimize],
+            None, None, None, None, Some(-0.5), None, None, None, None, None, None, None,
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "mutation_prob")]
+    fn test_nsgaiii_mutation_prob_too_large() {
+        NSGAIIISampler::new(
+            vec![StudyDirection::Minimize],
+            None, None, None, None, Some(1.1), None, None, None, None, None, None, None,
+        );
+    }
+
+    /// 对齐 Python: crossover_prob 超出 [0.0, 1.0] 应 panic
+    #[test]
+    #[should_panic(expected = "crossover_prob")]
+    fn test_nsgaiii_crossover_prob_negative() {
+        NSGAIIISampler::new(
+            vec![StudyDirection::Minimize],
+            None, None, Some(-0.1), None, None, None, None, None, None, None, None, None,
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "crossover_prob")]
+    fn test_nsgaiii_crossover_prob_too_large() {
+        NSGAIIISampler::new(
+            vec![StudyDirection::Minimize],
+            None, None, Some(1.5), None, None, None, None, None, None, None, None, None,
+        );
+    }
+
+    /// 对齐 Python: swapping_prob 超出 [0.0, 1.0] 应 panic
+    #[test]
+    #[should_panic(expected = "swapping_prob")]
+    fn test_nsgaiii_swapping_prob_negative() {
+        NSGAIIISampler::new(
+            vec![StudyDirection::Minimize],
+            None, None, None, Some(-0.1), None, None, None, None, None, None, None, None,
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "swapping_prob")]
+    fn test_nsgaiii_swapping_prob_too_large() {
+        NSGAIIISampler::new(
+            vec![StudyDirection::Minimize],
+            None, None, None, Some(1.5), None, None, None, None, None, None, None, None,
+        );
+    }
+
+    /// 对齐 Python: 边界值应合法
+    #[test]
+    fn test_nsgaiii_prob_boundary_values() {
+        let _ = NSGAIIISampler::new(
+            vec![StudyDirection::Minimize],
+            None, None, Some(0.0), Some(0.0), Some(0.0), None, None, None, None, None, None, None,
+        );
+        let _ = NSGAIIISampler::new(
+            vec![StudyDirection::Minimize],
+            None, None, Some(1.0), Some(1.0), Some(1.0), None, None, None, None, None, None, None,
+        );
+    }
+
+    /// 对齐 Python: 默认参数值
+    #[test]
+    fn test_nsgaiii_default_parameter_values() {
+        let sampler = NSGAIIISampler::new(
+            vec![StudyDirection::Minimize, StudyDirection::Minimize],
+            None, None, None, None, None, None, None, Some(42), None, None, None, None,
+        );
+        // n_obj=2, divs=3 → 4 参考点 → pop_size = max(4, 10) = 10
+        assert_eq!(sampler.population_size, 10);
+        assert!((sampler.crossover_prob - 0.9).abs() < 1e-10);
+        assert!((sampler.swapping_prob - 0.5).abs() < 1e-10);
+        assert!(sampler.mutation_prob.is_none());
+    }
+
+    /// 对齐 Python: generate_reference_points 点数公式 C(n+d-1, d)
+    #[test]
+    fn test_reference_points_count_formula() {
+        // C(n_obj + divs - 1, divs)
+        assert_eq!(generate_reference_points(2, 3).len(), 4);  // C(4,3)=4
+        assert_eq!(generate_reference_points(2, 4).len(), 5);  // C(5,4)=5
+        assert_eq!(generate_reference_points(3, 3).len(), 10); // C(5,3)=10
+        assert_eq!(generate_reference_points(3, 4).len(), 15); // C(6,4)=15
+        assert_eq!(generate_reference_points(4, 3).len(), 20); // C(6,3)=20
+    }
+
+    /// 对齐 Python: 垂直距离计算正确性
+    #[test]
+    fn test_perpendicular_distance_on_axis() {
+        // 点在方向向量上时距离为 0
+        let dist = perpendicular_distance(&[5.0, 0.0], &[1.0, 0.0]);
+        assert!(dist.abs() < 1e-10);
+    }
+
+    #[test]
+    fn test_perpendicular_distance_orthogonal() {
+        // 点与方向正交时距离等于点到原点的距离在正交方向上的分量
+        let dist = perpendicular_distance(&[0.0, 3.0], &[1.0, 0.0]);
+        assert!((dist - 3.0).abs() < 1e-10);
     }
 }

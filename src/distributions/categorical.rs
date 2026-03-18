@@ -77,6 +77,10 @@ impl CategoricalDistribution {
     /// 然后检查 `0 <= index < len(choices)`。
     /// 注意: Python 的 `int()` 是向零截断，0.9 → 0，-0.1 → 0。
     pub fn contains(&self, value: f64) -> bool {
+        // 对齐 Python: int(NaN) 抛 ValueError，因此 NaN 不包含在分布内
+        if value.is_nan() || value.is_infinite() {
+            return false;
+        }
         let index = value as i64; // 对齐 Python int() 截断语义
         index >= 0 && (index as usize) < self.choices.len()
     }
@@ -301,5 +305,30 @@ mod tests {
     fn test_python_cross_categorical_one() {
         let d = CategoricalDistribution::new(vec![CategoricalChoice::Int(42)]).unwrap();
         assert!(d.single(), "Python: single=true");
+    }
+
+    /// 对齐 Python: contains(NaN) 应返回 false
+    /// Python: int(float('nan')) 抛出 ValueError，因此 NaN 不在分布范围内
+    #[test]
+    fn test_contains_nan_returns_false() {
+        let d = CategoricalDistribution::new(vec![
+            CategoricalChoice::Str("a".into()),
+            CategoricalChoice::Str("b".into()),
+        ]).unwrap();
+        assert!(!d.contains(f64::NAN), "NaN 不应被 contains 接受");
+        assert!(!d.contains(f64::INFINITY), "Inf 不应被 contains 接受");
+        assert!(!d.contains(f64::NEG_INFINITY), "-Inf 不应被 contains 接受");
+    }
+
+    /// 对齐 Python: to_external_repr 对 NaN/Inf/负数的处理
+    #[test]
+    fn test_to_external_repr_edge_cases() {
+        let d = CategoricalDistribution::new(vec![
+            CategoricalChoice::Str("a".into()),
+            CategoricalChoice::Str("b".into()),
+        ]).unwrap();
+        assert!(d.to_external_repr(f64::NAN).is_err(), "NaN → Err");
+        assert!(d.to_external_repr(f64::INFINITY).is_err(), "Inf → Err");
+        assert!(d.to_external_repr(-1.0).is_err(), "negative → Err");
     }
 }

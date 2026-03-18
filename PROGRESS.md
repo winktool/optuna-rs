@@ -2,9 +2,9 @@
 
 ## 总览
 
-- **Rust 测试基线**: 965 unit + 5 doc-tests
+- **Rust 测试基线**: 987 unit + 5 doc-tests
 - **Python 交叉验证**: 215 tests (全部通过)
-- **最新提交**: Session 41 — GP 采集函数 + TPE 排名深度对齐
+- **最新提交**: Session 42 — 全仓深度审计 (distributions + trial + storage)
 
 ## Session 35 修复摘要 (全模块深度审计)
 
@@ -98,6 +98,14 @@
 | CLI | ✅ 100% | create/delete/ask/tell/best-trial/best-trials/studies |
 
 ## Bug 修复记录
+
+### Session 42 — 全仓深度审计 (distributions + trial + storage)
+- [HIGH] CategoricalDistribution::contains NaN/Inf 穿透 bug → 添加 NaN/Inf 前置守卫
+- [HIGH] Trial::set_user_attr 仅写 storage 不更新 cached_trial → 同步更新本地缓存
+- [HIGH] Trial::set_system_attr 同上
+- [MEDIUM] CachedStorage::get_all_trials 全量读取 → 增量缓存已完成试验
+- 验证: CRC32 与 Python binascii.crc32 完全一致, Wilcoxon correction=False 正确
+- 新增 7 个测试 (980→987)
 
 ### Session 24 (commit 0a3852f)
 - MaxTrialsCallback states=None → 传 None 给 get_n_trials

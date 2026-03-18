@@ -418,12 +418,17 @@ mod tests {
     /// 对齐 Python: CRC32 与 Python binascii.crc32 一致
     #[test]
     fn test_crc32_cross_python() {
-        // Python: binascii.crc32(b"test_study_0") = 某个特定值
-        // 只要 Rust 的 CRC32 实现与标准一致即可
-        let h1 = crc32_hash(b"test_study_0");
-        let h2 = crc32_hash(b"test_study_1");
-        assert_ne!(h1, h2, "不同输入应产生不同哈希");
-        // 验证标准 CRC32 值
+        // Python 交叉验证:
+        // binascii.crc32(b"my_study_0") = 2668288816
+        // binascii.crc32(b"my_study_1") = 3893226406
+        // binascii.crc32(b"test_5") = 826366991
+        // binascii.crc32(b"study_name_42") = 3374298732
+        assert_eq!(crc32_hash(b"my_study_0"), 2668288816);
+        assert_eq!(crc32_hash(b"my_study_1"), 3893226406);
+        assert_eq!(crc32_hash(b"test_5"), 826366991);
+        assert_eq!(crc32_hash(b"study_name_42"), 3374298732);
+        // 标准 CRC32 测试向量
+        assert_eq!(crc32_hash(b"123456789"), 0xCBF43926);
         assert_eq!(crc32_hash(b"test"), 0xD87F7E0C);
     }
 }

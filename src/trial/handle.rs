@@ -355,14 +355,22 @@ impl Trial {
     }
 
     /// Set a user attribute on the trial.
-    pub fn set_user_attr(&self, key: &str, value: serde_json::Value) -> Result<()> {
-        self.storage.set_trial_user_attr(self.trial_id, key, value)
+    /// 对齐 Python `Trial.set_user_attr`: 写入 storage 并更新本地缓存。
+    pub fn set_user_attr(&mut self, key: &str, value: serde_json::Value) -> Result<()> {
+        self.storage.set_trial_user_attr(self.trial_id, key, value.clone())?;
+        // 对齐 Python: 同步更新 _cached_frozen_trial.user_attrs
+        self.cached_trial.user_attrs.insert(key.to_string(), value);
+        Ok(())
     }
 
     /// Set a system attribute on the trial.
-    pub fn set_system_attr(&self, key: &str, value: serde_json::Value) -> Result<()> {
+    /// 对齐 Python `Trial.set_system_attr`: 写入 storage 并更新本地缓存。
+    pub fn set_system_attr(&mut self, key: &str, value: serde_json::Value) -> Result<()> {
         self.storage
-            .set_trial_system_attr(self.trial_id, key, value)
+            .set_trial_system_attr(self.trial_id, key, value.clone())?;
+        // 对齐 Python: 同步更新 _cached_frozen_trial.system_attrs
+        self.cached_trial.system_attrs.insert(key.to_string(), value);
+        Ok(())
     }
 
     // ── 属性访问器 (对应 Python Trial 的 property) ──
@@ -817,7 +825,7 @@ mod tests {
             None, None, None, None,
             Some(StudyDirection::Minimize), None, false,
         ).unwrap();
-        let trial = study.ask(None).unwrap();
+        let mut trial = study.ask(None).unwrap();
         trial.set_user_attr("key1", serde_json::json!("value1")).unwrap();
         let attrs = trial.user_attrs().unwrap();
         assert_eq!(attrs.get("key1").unwrap(), &serde_json::json!("value1"));
@@ -983,5 +991,82 @@ mod tests {
         let mut trial = study.ask(None).unwrap();
         let err = trial.report(1.0, -1);
         assert!(err.is_err());
+    }
+
+    /// 对齐 Python: set_user_attr 应同步更新本地缓存
+    /// Python: trial.set_user_attr(key, value) 后立刻 trial.user_attrs[key] == value
+    #[test]
+    fn test_set_user_attr_updates_cache() {
+        let study = create_study(
+            None, None, None, None,
+            Some(StudyDirection::Minimize), None, false,
+        ).unwrap();
+        let mut trial = study.ask(None).unwrap();
+        trial.set_user_attr("k1", serde_json::json!("v1")).unwrap();
+        trial.set_user_attr("k2", serde_json::json!(42)).unwrap();
+
+        // 从 cached_trial 直接读（不经过 storage），验证缓存已更新
+        let cached_attrs = &trial.cached_trial.user_attrs;
+        assert_eq!(cached_attrs.get("k1"), Some(&serde_json::json!("v1")));
+        assert_eq!(cached_attrs.get("k2"), Some(&serde_json::json!(42)));
+
+        // 也验证 storage 已写入
+        let from_storage = trial.user_attrs().unwrap();
+        assert_eq!(from_storage.get("k1"), Some(&serde_json::json!("v1")));
+    }
+
+    /// 对齐 Python: set_system_attr 应同步更新本地缓存
+    #[test]
+    fn test_set_system_attr_updates_cache() {
+        let study = create_study(
+            None, None, None, None,
+            Some(StudyDirection::Minimize), None, false,
+        ).unwrap();
+        let mut trial = study.ask(None).unwrap();
+        trial.set_system_attr("sys_k", serde_json::json!("sys_v")).unwrap();
+
+        let cached_attrs = &trial.cached_trial.system_attrs;
+        assert_eq!(cached_attrs.get("sys_k"), Some(&serde_json::json!("sys_v")));
+    }
+
+    /// 对齐 Python: suggest_float 对同一参数重复调用应返回缓存值
+    #[test]
+    fn test_suggest_same_param_uses_cache() {
+        let study = create_study(
+            None, None, None, None,
+            Some(StudyDirection::Minimize), None, false,
+        ).unwrap();
+        let mut trial = study.ask(None).unwrap();
+        let v1 = trial.suggest_float("x", 0.0, 1.0, false, None).unwrap();
+        let v2 = trial.suggest_float("x", 0.0, 1.0, false, None).unwrap();
+        assert_eq!(v1, v2, "重复 suggest 相同参数应返回缓存值");
+    }
+
+    /// 对齐 Python: suggest_float 不同分布兼容时发出警告但不报错
+    #[test]
+    fn test_suggest_compatible_distribution_warning() {
+        let study = create_study(
+            None, None, None, None,
+            Some(StudyDirection::Minimize), None, false,
+        ).unwrap();
+        let mut trial = study.ask(None).unwrap();
+        let v1 = trial.suggest_float("x", 0.0, 1.0, false, None).unwrap();
+        // 同类型不同范围 → 应兼容（返回缓存值，发出警告）
+        let v2 = trial.suggest_float("x", 0.0, 2.0, false, None).unwrap();
+        assert_eq!(v1, v2, "兼容分布应返回缓存的第一次值");
+    }
+
+    /// 对齐 Python: suggest_float 不同类型分布应报错
+    #[test]
+    fn test_suggest_incompatible_distribution_error() {
+        let study = create_study(
+            None, None, None, None,
+            Some(StudyDirection::Minimize), None, false,
+        ).unwrap();
+        let mut trial = study.ask(None).unwrap();
+        let _ = trial.suggest_float("x", 0.0, 1.0, false, None).unwrap();
+        // 尝试用 log=true 的分布（不兼容）
+        let err = trial.suggest_float("x", 0.0, 1.0, true, None);
+        assert!(err.is_err(), "log 不同的分布应报错");
     }
 }

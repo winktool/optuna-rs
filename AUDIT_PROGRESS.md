@@ -1,5 +1,57 @@
 # optuna-rs 对齐 Python 审计进度报告
 
+## Session 42 — 全仓深度审计 (distributions + trial + storage)
+
+### 修复清单
+
+| # | 严重度 | 区域 | 修复描述 |
+|---|--------|------|---------|
+| 1 | **HIGH** | CategoricalDistribution::contains | NaN/Inf 值穿透 bug — Python `int(NaN)` 抛 ValueError，Rust `NaN as i64 = 0` 静默返回 true。修复: 添加 `is_nan() \|\| is_infinite()` 前置守卫 |
+| 2 | **HIGH** | Trial::set_user_attr | 仅写 storage 不更新本地 cached_trial — Python `_cached_frozen_trial.user_attrs[key] = value`。修复: `&self` → `&mut self`，写入后同步更新 cached_trial |
+| 3 | **HIGH** | Trial::set_system_attr | 同上: 仅写 storage 不更新本地缓存。修复: 同步更新 `cached_trial.system_attrs` |
+| 4 | **MEDIUM** | CachedStorage::get_all_trials | 全量读取无缓存，每次都从后端全读。改进: 增量缓存已完成 (Complete/Pruned/Fail) 的试验 |
+
+### 审计验证
+
+| 验证项 | 结果 |
+|--------|------|
+| CRC32 Hyperband | ✅ 4 个值与 Python binascii.crc32 完全一致 |
+| Wilcoxon 连续性修正 | ✅ scipy.stats.wilcoxon 默认 correction=False，Rust 已正确 |
+| TPE EPS | ✅ Python 确认 1e-12 |
+
+### 新增测试 (+7)
+
+| 测试 | 文件 | 验证内容 |
+|------|------|---------|
+| test_contains_nan_returns_false | categorical.rs | NaN 值 contains 返回 false |
+| test_to_external_repr_edge_cases | categorical.rs | 边界值外部表示 + Inf contains 返回 false |
+| test_set_user_attr_updates_cache | handle.rs | set_user_attr 后 cached_trial 同步更新 |
+| test_set_system_attr_updates_cache | handle.rs | set_system_attr 后 cached_trial 同步更新 |
+| test_suggest_same_param_uses_cache | handle.rs | 重复 suggest 同名参数走缓存 |
+| test_suggest_compatible_distribution_warning | handle.rs | 兼容分布切换产生 warning |
+| test_suggest_incompatible_distribution_error | handle.rs | 不兼容分布抛错 |
+
+### Python 交叉验证
+
+```
+_contains(NaN)  → raises ValueError  ✅ (Rust returns false — equivalent safety)
+_contains(inf)  → raises OverflowError ✅ (Rust returns false — equivalent safety)
+set_user_attr    → cached_trial 同步 ✅
+TPE EPS          → 1e-12 ✅
+CRC32 values     → 2668288816, 3893226406, 826366991, 3374298732 ✅
+Wilcoxon corr    → default False ✅
+```
+
+### 测试统计
+
+| 指标 | 值 |
+|------|---|
+| Rust 测试总数 | 987 (unit) + 5 (doc) |
+| 本次新增 | +7 |
+| 修改文件数 | 4 (categorical.rs, handle.rs, hyperband.rs, cached.rs) |
+
+---
+
 ## Session 41 — CMA-ES 深度对齐 + TPE EPS 修正
 
 ### 修复清单

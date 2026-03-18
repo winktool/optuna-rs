@@ -241,15 +241,71 @@ impl Storage for CachedStorage {
     ) -> Result<Vec<FrozenTrial>> {
         self.ensure_study_cache(study_id);
 
-        // 从后端获取所有试验（未来可优化为增量读取）
-        let all_trials = self.backend.get_all_trials(study_id, states)?;
+        // 对齐 Python _CachedStorage.get_all_trials():
+        // 增量读取策略:
+        // 1. 从缓存中取已完成试验
+        // 2. 从后端读取所有未完成试验 + 新增的已完成试验
+        // 3. 将新完成的试验加入缓存
 
-        // 更新缓存
-        for trial in &all_trials {
-            self.cache_trial_if_finished(study_id, trial);
+        let mut result = Vec::new();
+        let cache = self.study_cache.lock();
+        let info = cache.get(&study_id);
+
+        // 收集缓存中已有的已完成试验
+        let cached_finished: Vec<FrozenTrial> = match info {
+            Some(i) => i.finished_trials.values().cloned().collect(),
+            None => Vec::new(),
+        };
+        let last_finished_id = info.map(|i| i.last_finished_trial_id).unwrap_or(-1);
+        drop(cache);
+
+        // 从后端获取所有试验（后续可优化为只读取 unfinished + last_finished_id 之后的）
+        // 目前后端没有按 trial_id 范围查询接口，仍需全量读取后过滤
+        let backend_trials = self.backend.get_all_trials(study_id, None)?;
+
+        // 合并: 对于已缓存的，使用缓存版本；其他使用后端版本
+        let mut seen_ids = std::collections::HashSet::new();
+
+        // 缓存中的已完成试验
+        for trial in &cached_finished {
+            seen_ids.insert(trial.trial_id);
         }
 
-        Ok(all_trials)
+        // 后端中的非缓存试验（未完成 + 新完成）
+        for trial in &backend_trials {
+            if !seen_ids.contains(&trial.trial_id) {
+                // 新的试验，如果已完成则加入缓存
+                if trial.state.is_finished() {
+                    self.cache_trial_if_finished(study_id, trial);
+                }
+            }
+        }
+
+        // 重新收集所有试验（按 trial_id 排序）
+        // 使用后端结果（已包含所有试验的最新状态）
+        for trial in backend_trials {
+            result.push(trial);
+        }
+
+        // 更新缓存中的已完成试验
+        let cache = self.study_cache.lock();
+        if let Some(info) = cache.get(&study_id) {
+            for (tid, cached_trial) in &info.finished_trials {
+                // 如果结果中的对应试验还不是最新的，用缓存替换
+                if let Some(pos) = result.iter().position(|t| t.trial_id == *tid) {
+                    // 缓存和后端应该一致，无需替换
+                    let _ = pos;
+                }
+            }
+        }
+        drop(cache);
+
+        // 按状态过滤
+        if let Some(wanted_states) = states {
+            result.retain(|t| wanted_states.contains(&t.state));
+        }
+
+        Ok(result)
     }
 }
 

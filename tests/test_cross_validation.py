@@ -3396,6 +3396,55 @@ def test_gp_sampler_multi_objective_maximize():
     assert len(completed) >= 10
 
 
+def test_gp_sampler_mixed_int_float():
+    """对齐 Rust gp_optim_mixed: GP 采样器支持混合搜索空间 (float + int)。
+    Python GPSampler 的 optimize_acqf_mixed 会区分连续 vs 离散参数。"""
+    sampler = optuna.samplers.GPSampler(seed=42)
+    study = optuna.create_study(sampler=sampler, direction="maximize")
+
+    def objective(trial):
+        x = trial.suggest_float("x", 0.0, 1.0)
+        n = trial.suggest_int("n", 1, 5)
+        return -(x - 0.5) ** 2 - (n - 3) ** 2
+
+    study.optimize(objective, n_trials=20)
+    completed = [t for t in study.trials if t.state == optuna.trial.TrialState.COMPLETE]
+    assert len(completed) >= 15
+
+
+def test_gp_sampler_mixed_categorical():
+    """对齐 Rust gp_optim_mixed: GP 采样器支持分类参数。
+    Python optimize_acqf_mixed 对分类参数使用穷举搜索。"""
+    sampler = optuna.samplers.GPSampler(seed=42)
+    study = optuna.create_study(sampler=sampler, direction="maximize")
+
+    def objective(trial):
+        x = trial.suggest_float("x", 0.0, 1.0)
+        cat = trial.suggest_categorical("cat", ["a", "b", "c"])
+        bonus = 1.0 if cat == "b" else 0.0
+        return -(x - 0.5) ** 2 + bonus
+
+    study.optimize(objective, n_trials=20)
+    completed = [t for t in study.trials if t.state == optuna.trial.TrialState.COMPLETE]
+    assert len(completed) >= 15
+
+
+def test_gp_sampler_all_categorical():
+    """对齐 Rust gp_optim_mixed: GP 采样器纯分类搜索空间。
+    所有参数都是离散的 → 只使用穷举搜索，无 L-BFGS-B。"""
+    sampler = optuna.samplers.GPSampler(seed=42)
+    study = optuna.create_study(sampler=sampler, direction="minimize")
+
+    def objective(trial):
+        a = trial.suggest_categorical("a", [1, 2, 3, 4, 5])
+        b = trial.suggest_categorical("b", [10, 20, 30])
+        return (a - 3) ** 2 + (b - 20) ** 2
+
+    study.optimize(objective, n_trials=20)
+    completed = [t for t in study.trials if t.state == optuna.trial.TrialState.COMPLETE]
+    assert len(completed) >= 15
+
+
 #  执行
 # ═══════════════════════════════════════════════════════════════════════════
 

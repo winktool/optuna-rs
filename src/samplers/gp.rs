@@ -1007,8 +1007,11 @@ impl GpSampler {
             vec![true; completed_trials.len()]
         };
 
-        // ═══ 构建采集函数 ═══
+        // ═══ 构建采集函数 + optimize_acqf_mixed ═══
         let mut rng = self.rng.lock();
+
+        // 构建搜索空间信息（连续/离散分类）
+        let ss_info = super::gp_optim_mixed::build_search_space_info(search_space, &param_names);
 
         if n_objectives == 1 {
             // ── 单目标: logEI ──
@@ -1030,41 +1033,31 @@ impl GpSampler {
                 acqf
             };
 
-            let mut best_acqf = f64::NEG_INFINITY;
-            let mut best_params = vec![0.5; n_params];
-
-            // 1. 最佳可行点作为初始候选
-            if let Some(best_idx) = standardized_by_obj[0].iter().enumerate()
+            // 热启动: 最佳可行训练点
+            let warmstart: Vec<Vec<f64>> = standardized_by_obj[0].iter().enumerate()
                 .zip(is_feasible.iter())
                 .filter(|(_, feas)| **feas)
-                .map(|((i, y), _)| (i, y))
-                .max_by(|a, b| a.1.partial_cmp(b.1).unwrap()).map(|(i, _)| i) {
-                let acqf = eval_acqf(&x_train[best_idx]);
-                if acqf > best_acqf {
-                    best_acqf = acqf;
-                    best_params = x_train[best_idx].clone();
-                }
-            }
+                .map(|((i, y), _)| (i, *y))
+                .max_by(|a, b| a.1.partial_cmp(&b.1).unwrap())
+                .map(|(i, _)| vec![x_train[i].clone()])
+                .unwrap_or_default();
 
-            // 2. 随机候选点
-            for _ in 0..self.n_preliminary_samples {
-                let candidate = self.random_candidate(n_params, &is_categorical, search_space, &param_names, &mut rng);
-                let acqf = eval_acqf(&candidate);
-                if acqf > best_acqf {
-                    best_acqf = acqf;
-                    best_params = candidate;
-                }
-            }
+            // 提取 GP lengthscales 用于预条件
+            let lengthscales: Vec<f64> = gpr.inverse_squared_lengthscales.iter()
+                .map(|&isl| 1.0 / isl.sqrt().max(1e-6))
+                .collect();
 
-            // 3. 局部搜索
-            for _ in 0..self.n_local_search {
-                let perturbed = self.perturb_candidate(&best_params, &is_categorical, &mut rng);
-                let acqf = eval_acqf(&perturbed);
-                if acqf > best_acqf {
-                    best_acqf = acqf;
-                    best_params = perturbed;
-                }
-            }
+            let best_params = super::gp_optim_mixed::optimize_acqf_mixed(
+                &eval_acqf,
+                &ss_info,
+                &warmstart,
+                n_params,
+                self.n_preliminary_samples,
+                self.n_local_search,
+                &lengthscales,
+                &mut rng,
+                seed,
+            );
 
             self.unnormalize_result(&best_params, &param_names, search_space)
         } else {
@@ -1137,90 +1130,44 @@ impl GpSampler {
                 acqf
             };
 
-            let mut best_acqf = f64::NEG_INFINITY;
-            let mut best_params = vec![0.5; n_params];
-
-            // 4. 对齐 Python _get_best_params_for_multi_objective:
-            //    从 Pareto 前沿（score 空间）随机选若干点作为热启动
+            // 4. 热启动: Pareto 前沿点
             let pareto_indices: Vec<usize> = pareto_mask.iter().enumerate()
                 .filter(|(_, on)| **on)
                 .map(|(i, _)| i)
                 .collect();
 
-            if !pareto_indices.is_empty() {
-                let n_warmstart = (self.n_local_search / 2).min(pareto_indices.len());
-                // 简单选前 n_warmstart 个 Pareto 点（确定性）
-                for &idx in &pareto_indices[..n_warmstart] {
-                    let acqf = eval_acqf(&x_train[idx]);
-                    if acqf > best_acqf {
-                        best_acqf = acqf;
-                        best_params = x_train[idx].clone();
-                    }
-                }
-            }
+            let warmstart: Vec<Vec<f64>> = if !pareto_indices.is_empty() {
+                let n_ws = (self.n_local_search / 2).min(pareto_indices.len());
+                pareto_indices[..n_ws].iter()
+                    .map(|&idx| x_train[idx].clone())
+                    .collect()
+            } else {
+                Vec::new()
+            };
 
-            // 5. 随机候选点
-            for _ in 0..self.n_preliminary_samples {
-                let candidate = self.random_candidate(n_params, &is_categorical, search_space, &param_names, &mut rng);
-                let acqf = eval_acqf(&candidate);
-                if acqf > best_acqf {
-                    best_acqf = acqf;
-                    best_params = candidate;
-                }
-            }
+            // 提取 GP lengthscales (取各目标的平均)
+            let lengthscales: Vec<f64> = (0..n_params).map(|d| {
+                let avg_isl: f64 = gprs_list.iter()
+                    .map(|gpr| gpr.inverse_squared_lengthscales[d])
+                    .sum::<f64>() / n_objectives as f64;
+                1.0 / avg_isl.sqrt().max(1e-6)
+            }).collect();
 
-            // 6. 局部搜索
-            for _ in 0..self.n_local_search {
-                let perturbed = self.perturb_candidate(&best_params, &is_categorical, &mut rng);
-                let acqf = eval_acqf(&perturbed);
-                if acqf > best_acqf {
-                    best_acqf = acqf;
-                    best_params = perturbed;
-                }
-            }
+            // 5. 使用 optimize_acqf_mixed 优化
+            let best_params = super::gp_optim_mixed::optimize_acqf_mixed(
+                &eval_acqf,
+                &ss_info,
+                &warmstart,
+                n_params,
+                self.n_preliminary_samples,
+                self.n_local_search,
+                &lengthscales,
+                &mut rng,
+                seed,
+            );
 
             self.unnormalize_result(&best_params, &param_names, search_space)
         }
-    }
-
-    /// 生成随机候选点（归一化空间）
-    fn random_candidate(
-        &self,
-        n_params: usize,
-        is_categorical: &[bool],
-        search_space: &IndexMap<String, Distribution>,
-        param_names: &[String],
-        rng: &mut ChaCha8Rng,
-    ) -> Vec<f64> {
-        (0..n_params).map(|d| {
-            if is_categorical[d] {
-                match &search_space[&param_names[d]] {
-                    Distribution::CategoricalDistribution(c) => {
-                        (rng.random_range(0.0..1.0) * c.choices.len() as f64).floor()
-                    }
-                    _ => rng.random_range(0.0..1.0),
-                }
-            } else {
-                rng.random_range(0.0..1.0)
-            }
-        }).collect()
-    }
-
-    /// 在最佳点附近微调（连续参数加噪声，分类参数不变）
-    fn perturb_candidate(
-        &self,
-        best: &[f64],
-        is_categorical: &[bool],
-        rng: &mut ChaCha8Rng,
-    ) -> Vec<f64> {
-        best.iter().enumerate().map(|(d, &v)| {
-            if is_categorical[d] {
-                v
-            } else {
-                let noise = (rng.random_range(0.0..1.0) - 0.5) * 0.1;
-                (v + noise).clamp(0.0, 1.0)
-            }
-        }).collect()
     }
 
     /// 将归一化参数转回内部表示
@@ -1755,5 +1702,61 @@ mod tests {
             let list = cache.as_ref().unwrap();
             assert_eq!(list.len(), 2, "双目标应有 2 个缓存条目");
         }
+    }
+
+    #[test]
+    fn test_gp_sampler_with_int_params() {
+        // 混合搜索空间: 1 个连续 + 1 个整数参数
+        // f(x, n) = -(x - 0.5)^2 - (n - 3)^2
+        let sampler: Arc<dyn Sampler> = Arc::new(GpSampler::new(
+            Some(42), None, Some(5), false, None, None,
+        ));
+        let study = crate::study::create_study(
+            None, Some(sampler), None, None, None, None, false,
+        ).unwrap();
+
+        study.optimize(|trial| {
+            let x = trial.suggest_float("x", 0.0, 1.0, false, None)?;
+            let n = trial.suggest_int_default("n", 1, 5)?;
+            Ok(-(x - 0.5).powi(2) - (n as f64 - 3.0).powi(2))
+        }, Some(20), None, None).unwrap();
+
+        let trials = study.trials().unwrap();
+        let completed: Vec<_> = trials.iter().filter(|t| t.state == TrialState::Complete).collect();
+        assert!(completed.len() >= 15, "Got {} completed", completed.len());
+
+        // 应该有扫描到最优附近的点
+        let near_opt = completed.iter().any(|t| {
+            if let Some(vals) = &t.values {
+                vals[0] > -0.5 // 至少不比随机差太多
+            } else { false }
+        });
+        assert!(near_opt, "Should find some good solutions");
+    }
+
+    #[test]
+    fn test_gp_sampler_with_categorical() {
+        // 混合搜索空间: 1 个连续 + 1 个分类参数
+        let sampler: Arc<dyn Sampler> = Arc::new(GpSampler::new(
+            Some(42), None, Some(5), false, None, None,
+        ));
+        let study = crate::study::create_study(
+            None, Some(sampler), None, None, None, None, false,
+        ).unwrap();
+
+        study.optimize(|trial| {
+            let x = trial.suggest_float("x", 0.0, 1.0, false, None)?;
+            let cat = trial.suggest_categorical("cat", vec![
+                crate::distributions::CategoricalChoice::Str("a".into()),
+                crate::distributions::CategoricalChoice::Str("b".into()),
+                crate::distributions::CategoricalChoice::Str("c".into()),
+            ])?;
+            let bonus = if cat == crate::distributions::CategoricalChoice::Str("b".into()) { 1.0 } else { 0.0 };
+            Ok(-(x - 0.5).powi(2) + bonus)
+        }, Some(20), None, None).unwrap();
+
+        let trials = study.trials().unwrap();
+        let completed: Vec<_> = trials.iter().filter(|t| t.state == TrialState::Complete).collect();
+        assert!(completed.len() >= 15, "Got {} completed", completed.len());
     }
 }

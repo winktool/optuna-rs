@@ -821,3 +821,95 @@
 | src/samplers/gp.rs | 多目标重构 + LogEHVI + erfinv + QMC + 6 测试 |
 | src/samplers/qmc.rs | sobol_point_pub() 公开接口 |
 | tests/test_cross_validation.py | 3 个新 Python 交叉验证测试 |
+
+---
+
+## Session 53/54 — GP 采集函数优化 (L-BFGS-B + QMC) + _filter_study 确认
+
+### 审计发现
+
+| 待修复项 | 状态 | 说明 |
+|----------|------|------|
+| GP 采集函数优化简化（无 L-BFGS-B + QMC） | 🔧 本次修复 | 完整实现 optimize_acqf_mixed |
+| _filter_study 缺失 | ✅ 已实现 | 已通过 `filter_trials` trait 方法实现 (pruners/mod.rs) |
+
+### 已修复项
+
+#### GP 采集函数优化: optimize_acqf_mixed
+
+**根因**: Rust GP 采集函数优化使用纯随机采样 + 简单扰动，Python 使用完整的混合优化流程：QMC Sobol 初始候选 → 轮盘赌选择 → 交替连续/离散局部搜索（L-BFGS-B + 穷举/线搜索）。
+
+**修复内容** (新文件 `src/samplers/gp_optim_mixed.rs`):
+
+1. **SearchSpaceInfo 结构体**
+   - 区分连续参数 (`continuous_indices`) 和离散参数 (`discrete_indices`)
+   - 为每个离散维计算归一化选择值和搜索容差
+
+2. **QMC Sobol 初始候选采样** (`sample_normalized_sobol`)
+   - 替代纯随机采样，使用 Sobol 序列的低差异性质
+   - 分类参数: `floor(val * n_choices)` snap
+   - 离散数值: snap 到最近网格点
+
+3. **轮盘赌选择** (`roulette_select`)
+   - 对齐 Python: `probs = exp(fvals - max_fval)`, 排除最优, 归一化后无放回采样
+   - 选出 `n_local_search - 1 - n_warmstart` 个额外起点
+
+4. **预条件 L-BFGS-B 梯度上升** (`gradient_ascent_continuous`)
+   - 对齐 Python: 变量变换 `z = x / lengthscale` 做预条件
+   - L-BFGS 两环递归 (m=10) + 有限差分梯度
+   - Armijo 回溯线搜索 + bound 投影
+   - 投影梯度范数收敛判据
+
+5. **离散参数搜索**
+   - 穷举搜索 (`exhaustive_search`): 分类参数或选择数 ≤ 16
+   - 离散线搜索 (`discrete_line_search`): 大离散空间，邻域 + 等间隔采样
+
+6. **交替优化循环** (`local_search_mixed`)
+   - 对齐 Python: 连续梯度上升 → 逐离散维搜索 → 收敛判断
+   - `last_changed_dims` 收敛追踪，max_iter=100
+
+7. **sample_relative_impl 重写**
+   - 删除 `random_candidate()` 和 `perturb_candidate()`
+   - 单目标: 最佳可行点作为 warmstart → `optimize_acqf_mixed`
+   - 多目标: Pareto 前沿点作为 warmstart → `optimize_acqf_mixed`
+   - 从 GP 核参数提取 lengthscales 用于预条件
+
+#### _filter_study 确认
+
+**状态**: ✅ 已完整实现。
+
+Rust 中以 `filter_trials` trait 方法实现于 `pruners/mod.rs`，被 `study/core.rs` (before_trial, after_trial) 和 `trial/handle.rs` (sample_relative) 调用。HyperbandPruner 覆写此方法实现 bracket 过滤。与 Python `_filter_study` 功能完全等价。
+
+### 新增测试
+
+#### Rust 单元测试 (+9)
+- gp_optim_mixed: `test_snap_to_nearest`, `test_find_nearest_index`
+- gp_optim_mixed: `test_exhaustive_search_finds_best`, `test_gradient_ascent_quadratic`
+- gp_optim_mixed: `test_roulette_select_basic`
+- gp_optim_mixed: `test_optimize_acqf_mixed_1d_continuous`, `test_optimize_acqf_mixed_with_categorical`
+- gp.rs: `test_gp_sampler_with_int_params`, `test_gp_sampler_with_categorical`
+
+#### Python 交叉验证测试 (+3)
+- `test_gp_sampler_mixed_int_float` — float + int 混合
+- `test_gp_sampler_mixed_categorical` — float + categorical 混合
+- `test_gp_sampler_all_categorical` — 纯分类搜索空间
+
+### 测试统计
+
+| 指标 | 数值 |
+|------|------|
+| Rust 测试总数 | 957 (unit) + 5 (doc) |
+| Python 交叉验证 | 215 |
+| 本次新增 Rust | +9 |
+| 本次新增 Python | +3 |
+| 新增文件数 | 1 |
+| 修改文件数 | 3 |
+
+### 修改文件清单
+
+| 文件 | 修改内容 |
+|------|---------|
+| src/samplers/gp_optim_mixed.rs | **新文件**: 完整 optimize_acqf_mixed 实现 + 7 测试 |
+| src/samplers/gp.rs | 集成 optimize_acqf_mixed, 删除 random/perturb + 2 测试 |
+| src/samplers/mod.rs | 注册 gp_optim_mixed 模块 |
+| tests/test_cross_validation.py | 3 个新 Python 交叉验证测试 |

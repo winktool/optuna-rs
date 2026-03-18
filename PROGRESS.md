@@ -2,9 +2,9 @@
 
 ## 总览
 
-- **Rust 测试基线**: 987 unit + 5 doc-tests
+- **Rust 测试基线**: 999 unit + 5 doc-tests
 - **Python 交叉验证**: 215 tests (全部通过)
-- **最新提交**: Session 42 — 全仓深度审计 (distributions + trial + storage)
+- **最新提交**: Session 43 — 全仓深度审计 (distributions shorthand + transform + cached storage)
 
 ## Session 35 修复摘要 (全模块深度审计)
 
@@ -98,6 +98,13 @@
 | CLI | ✅ 100% | create/delete/ask/tell/best-trial/best-trials/studies |
 
 ## Bug 修复记录
+
+### Session 43 — 全仓深度审计 (distributions shorthand + transform + cached storage)
+- [HIGH] SearchSpaceTransform categorical 无效值回退 index 0 → panic 对齐 Python ValueError
+- [HIGH] json_to_distribution 缺失 shorthand 缩写格式 → 完整实现 float/int/categorical
+- [MEDIUM] CachedStorage get_all_trials 缓存未生效 → 合并策略使用缓存版本
+- 全仓三模块深度审计: 排除 5 个误报
+- 新增 12 个测试 (987→999)
 
 ### Session 42 — 全仓深度审计 (distributions + trial + storage)
 - [HIGH] CategoricalDistribution::contains NaN/Inf 穿透 bug → 添加 NaN/Inf 前置守卫

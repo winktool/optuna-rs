@@ -169,9 +169,53 @@ pub fn json_to_distribution(json: &str) -> Result<Distribution> {
             let step = attrs.get("step").and_then(|v| v.as_i64()).unwrap_or(1);
             Ok(Distribution::IntDistribution(IntDistribution::new(low, high, true, step)?))
         }
-        _ => Err(OptunaError::StorageInternalError(format!(
-            "Unknown distribution type: '{name}'"
-        ))),
+        _ => {
+            // 对齐 Python: 尝试 shorthand 缩写格式 {"type": "float/int/categorical", ...}
+            let dtype = v.get("type").and_then(|t| t.as_str()).unwrap_or("");
+            match dtype {
+                "float" => {
+                    let low = v.get("low").and_then(|v| v.as_f64()).unwrap_or(0.0);
+                    let high = v.get("high").and_then(|v| v.as_f64()).unwrap_or(1.0);
+                    let log = v.get("log").and_then(|v| v.as_bool()).unwrap_or(false);
+                    let step = v.get("step").and_then(|v| v.as_f64());
+                    Ok(Distribution::FloatDistribution(FloatDistribution::new(low, high, log, step)?))
+                }
+                "int" => {
+                    let low = v.get("low").and_then(|v| v.as_i64()).unwrap_or(0);
+                    let high = v.get("high").and_then(|v| v.as_i64()).unwrap_or(10);
+                    let log = v.get("log").and_then(|v| v.as_bool()).unwrap_or(false);
+                    let step = v.get("step").and_then(|v| v.as_i64()).unwrap_or(1);
+                    Ok(Distribution::IntDistribution(IntDistribution::new(low, high, log, step)?))
+                }
+                "categorical" => {
+                    let choices_val = v.get("choices").cloned().unwrap_or(serde_json::Value::Array(vec![]));
+                    let choices: Vec<CategoricalChoice> = match choices_val {
+                        serde_json::Value::Array(arr) => {
+                            arr.into_iter().map(|v| match v {
+                                serde_json::Value::String(s) => CategoricalChoice::Str(s),
+                                serde_json::Value::Number(n) => {
+                                    if let Some(i) = n.as_i64() {
+                                        CategoricalChoice::Int(i)
+                                    } else if let Some(f) = n.as_f64() {
+                                        CategoricalChoice::Float(f)
+                                    } else {
+                                        CategoricalChoice::Str(n.to_string())
+                                    }
+                                }
+                                serde_json::Value::Bool(b) => CategoricalChoice::Str(b.to_string()),
+                                serde_json::Value::Null => CategoricalChoice::Str("None".to_string()),
+                                other => CategoricalChoice::Str(other.to_string()),
+                            }).collect()
+                        }
+                        _ => vec![],
+                    };
+                    Ok(Distribution::CategoricalDistribution(CategoricalDistribution::new(choices)?))
+                }
+                _ => Err(OptunaError::StorageInternalError(format!(
+                    "Unknown distribution type: '{}'", if name.is_empty() { dtype } else { name }
+                ))),
+            }
+        }
     }
 }
 
@@ -572,6 +616,128 @@ mod tests {
     #[test]
     fn test_json_to_distribution_unknown_name() {
         let json = r#"{"name":"BogusDistribution","attributes":{"low":0.0,"high":1.0}}"#;
+        assert!(json_to_distribution(json).is_err());
+    }
+
+    // ========== 对齐 Python: shorthand 缩写格式 JSON 反序列化测试 ==========
+    // Python json_to_distribution 支持 {"type": "float/int/categorical", ...}
+
+    /// 对齐 Python: shorthand float 格式
+    /// Python: json_to_distribution('{"type":"float","low":0.0,"high":1.0}')
+    ///   → FloatDistribution(low=0.0, high=1.0)
+    #[test]
+    fn test_json_shorthand_float() {
+        let json = r#"{"type":"float","low":0.0,"high":1.0}"#;
+        let dist = json_to_distribution(json).unwrap();
+        match dist {
+            Distribution::FloatDistribution(d) => {
+                assert_eq!(d.low, 0.0);
+                assert_eq!(d.high, 1.0);
+                assert!(!d.log);
+                assert!(d.step.is_none());
+            }
+            _ => panic!("expected FloatDistribution"),
+        }
+    }
+
+    /// 对齐 Python: shorthand float with log + step
+    #[test]
+    fn test_json_shorthand_float_log_step() {
+        let json = r#"{"type":"float","low":0.01,"high":10.0,"log":true}"#;
+        let dist = json_to_distribution(json).unwrap();
+        match dist {
+            Distribution::FloatDistribution(d) => {
+                assert!((d.low - 0.01).abs() < 1e-10);
+                assert_eq!(d.high, 10.0);
+                assert!(d.log);
+                assert!(d.step.is_none());
+            }
+            _ => panic!("expected FloatDistribution"),
+        }
+
+        let json2 = r#"{"type":"float","low":0.0,"high":10.0,"step":2.5}"#;
+        let dist2 = json_to_distribution(json2).unwrap();
+        match dist2 {
+            Distribution::FloatDistribution(d) => {
+                assert_eq!(d.low, 0.0);
+                assert_eq!(d.high, 10.0);
+                assert_eq!(d.step, Some(2.5));
+            }
+            _ => panic!("expected FloatDistribution"),
+        }
+    }
+
+    /// 对齐 Python: shorthand int 格式
+    /// Python: json_to_distribution('{"type":"int","low":1,"high":10}')
+    ///   → IntDistribution(low=1, high=10, step=1)
+    #[test]
+    fn test_json_shorthand_int() {
+        let json = r#"{"type":"int","low":1,"high":10}"#;
+        let dist = json_to_distribution(json).unwrap();
+        match dist {
+            Distribution::IntDistribution(d) => {
+                assert_eq!(d.low, 1);
+                assert_eq!(d.high, 10);
+                assert!(!d.log);
+                assert_eq!(d.step, 1);
+            }
+            _ => panic!("expected IntDistribution"),
+        }
+    }
+
+    /// 对齐 Python: shorthand int with log
+    #[test]
+    fn test_json_shorthand_int_log() {
+        let json = r#"{"type":"int","low":1,"high":100,"log":true}"#;
+        let dist = json_to_distribution(json).unwrap();
+        match dist {
+            Distribution::IntDistribution(d) => {
+                assert_eq!(d.low, 1);
+                assert_eq!(d.high, 100);
+                assert!(d.log);
+            }
+            _ => panic!("expected IntDistribution"),
+        }
+    }
+
+    /// 对齐 Python: shorthand categorical 格式
+    /// Python: json_to_distribution('{"type":"categorical","choices":["a","b","c"]}')
+    ///   → CategoricalDistribution(choices=("a","b","c"))
+    #[test]
+    fn test_json_shorthand_categorical() {
+        let json = r#"{"type":"categorical","choices":["a","b","c"]}"#;
+        let dist = json_to_distribution(json).unwrap();
+        match dist {
+            Distribution::CategoricalDistribution(d) => {
+                assert_eq!(d.choices.len(), 3);
+                assert_eq!(d.choices[0], CategoricalChoice::Str("a".into()));
+                assert_eq!(d.choices[1], CategoricalChoice::Str("b".into()));
+                assert_eq!(d.choices[2], CategoricalChoice::Str("c".into()));
+            }
+            _ => panic!("expected CategoricalDistribution"),
+        }
+    }
+
+    /// 对齐 Python: shorthand categorical with mixed types
+    #[test]
+    fn test_json_shorthand_categorical_mixed() {
+        let json = r#"{"type":"categorical","choices":["red",1,3.14]}"#;
+        let dist = json_to_distribution(json).unwrap();
+        match dist {
+            Distribution::CategoricalDistribution(d) => {
+                assert_eq!(d.choices.len(), 3);
+                assert_eq!(d.choices[0], CategoricalChoice::Str("red".into()));
+                assert_eq!(d.choices[1], CategoricalChoice::Int(1));
+                assert_eq!(d.choices[2], CategoricalChoice::Float(3.14));
+            }
+            _ => panic!("expected CategoricalDistribution"),
+        }
+    }
+
+    /// 对齐 Python: shorthand 未知类型返回错误
+    #[test]
+    fn test_json_shorthand_unknown_type() {
+        let json = r#"{"type":"bogus","low":0.0,"high":1.0}"#;
         assert!(json_to_distribution(json).is_err());
     }
 }

@@ -1,5 +1,77 @@
 # optuna-rs 对齐 Python 审计进度报告
 
+## Session 43 — 全仓深度审计 (distributions shorthand + transform + cached storage)
+
+### 修复清单
+
+| # | 严重度 | 区域 | 修复描述 |
+|---|--------|------|----------|
+| 1 | **HIGH** | SearchSpaceTransform | categorical 无效值静默回退 index 0 → 现 panic 对齐 Python ValueError |
+| 2 | **HIGH** | json_to_distribution | 缺失 shorthand 缩写格式 `{"type":"float/int/categorical", ...}` → 完整实现 |
+| 3 | **MEDIUM** | CachedStorage | get_all_trials 缓存无效 (构建缓存但从不使用) → 修复合并策略使用缓存版本 |
+
+### 审计范围
+
+| 模块 | 审计方法 | 发现数 |
+|------|---------|-------|
+| samplers (TPE/CMA-ES/GP/NSGA/Grid/QMC) | 逐文件对比 Python | 13 findings (4 architectural) |
+| study + trial + importance | 逐方法对比 | 10 findings (4 critical) |
+| distributions + storage + pruners | 逐行对比 | 16 findings |
+
+### 审计验证 (排除误报)
+
+| 疑似 Bug | 验证结果 |
+|----------|----------|
+| FloatDistribution 缺失 high adjustment | ✅ 已有 adjust_discrete_uniform_high |
+| IntDistribution 缺失 high adjustment | ✅ 已有 adjust_int_uniform_high |
+| InMemoryStorage set_trial_system_attr 缺失验证 | ✅ 已有 check_updatable |
+| FrozenTrial suggest 返回 internal 而非 external | ✅ 正确返回 external |
+| Trial relative param 无回退 | ✅ 已有 sample_independent 回退 |
+
+### 新增测试 (+12)
+
+| 测试 | 文件 | 验证内容 |
+|------|------|----------|
+| test_json_shorthand_float | mod.rs | shorthand float 格式反序列化 |
+| test_json_shorthand_float_log_step | mod.rs | shorthand float log+step |
+| test_json_shorthand_int | mod.rs | shorthand int 格式 |
+| test_json_shorthand_int_log | mod.rs | shorthand int log |
+| test_json_shorthand_categorical | mod.rs | shorthand categorical |
+| test_json_shorthand_categorical_mixed | mod.rs | shorthand categorical 混合类型 |
+| test_json_shorthand_unknown_type | mod.rs | shorthand 未知类型报错 |
+| test_transform_invalid_categorical_panics | transform.rs | 无效分类值 panic |
+| test_transform_valid_categorical_encoding | transform.rs | 有效分类值 one-hot 编码 |
+| test_cached_storage_get_trial_uses_cache_for_finished | cached.rs | 已完成试验走缓存 |
+| test_cached_storage_state_filter | cached.rs | 状态过滤 |
+| test_cached_storage_incremental_cache_update | cached.rs | 增量缓存更新 |
+
+### Python 交叉验证
+
+```
+json_to_distribution shorthand float      → low=0.0, high=1.0 ✅
+json_to_distribution shorthand float log   → log=True ✅
+json_to_distribution shorthand float step  → step=2.5 ✅
+json_to_distribution shorthand int         → low=1, high=10 ✅
+json_to_distribution shorthand int log     → log=True ✅
+json_to_distribution shorthand categorical → ('a','b','c') ✅
+json_to_distribution shorthand mixed       → ('red',1,3.14) ✅
+json_to_distribution unknown type          → ValueError ✅
+SearchSpaceTransform valid categorical     → [0, 1, 0] ✅
+SearchSpaceTransform invalid categorical   → ValueError ✅
+adjust_discrete_uniform_high(0,10,3)       → 9.0 ✅
+adjust_int_uniform_high(0,10,3)            → 9 ✅
+```
+
+### 测试统计
+
+| 指标 | 值 |
+|------|---|
+| Rust 测试总数 | 999 (unit) + 5 (doc) |
+| 本次新增 | +12 |
+| 修改文件数 | 3 (mod.rs, transform.rs, cached.rs) |
+
+---
+
 ## Session 42 — 全仓深度审计 (distributions + trial + storage)
 
 ### 修复清单

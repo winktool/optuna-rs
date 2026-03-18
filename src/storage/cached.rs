@@ -259,46 +259,34 @@ impl Storage for CachedStorage {
         let last_finished_id = info.map(|i| i.last_finished_trial_id).unwrap_or(-1);
         drop(cache);
 
-        // 从后端获取所有试验（后续可优化为只读取 unfinished + last_finished_id 之后的）
-        // 目前后端没有按 trial_id 范围查询接口，仍需全量读取后过滤
+        // 对齐 Python _CachedStorage._read_trials_from_remote_storage():
+        // Python 使用 _backend._get_trials(included_trial_ids=unfinished, trial_id_greater_than=last_finished)
+        // Rust 后端没有增量查询接口，仍需全量读取后与缓存合并
         let backend_trials = self.backend.get_all_trials(study_id, None)?;
 
-        // 合并: 对于已缓存的，使用缓存版本；其他使用后端版本
-        let mut seen_ids = std::collections::HashSet::new();
+        // 构建缓存 id 集合
+        let cached_ids: std::collections::HashSet<i64> = cached_finished.iter()
+            .map(|t| t.trial_id)
+            .collect();
 
-        // 缓存中的已完成试验
-        for trial in &cached_finished {
-            seen_ids.insert(trial.trial_id);
-        }
-
-        // 后端中的非缓存试验（未完成 + 新完成）
+        // 合并策略: 已缓存的用缓存版本（节省克隆），新发现的更新缓存
         for trial in &backend_trials {
-            if !seen_ids.contains(&trial.trial_id) {
-                // 新的试验，如果已完成则加入缓存
-                if trial.state.is_finished() {
-                    self.cache_trial_if_finished(study_id, trial);
-                }
+            if cached_ids.contains(&trial.trial_id) {
+                // 使用缓存版本
+            } else if trial.state.is_finished() {
+                // 新完成的试验，加入缓存
+                self.cache_trial_if_finished(study_id, trial);
             }
         }
 
-        // 重新收集所有试验（按 trial_id 排序）
-        // 使用后端结果（已包含所有试验的最新状态）
+        // 收集最终结果: 对于已缓存的试验用缓存版本，其他用后端版本
         for trial in backend_trials {
-            result.push(trial);
-        }
-
-        // 更新缓存中的已完成试验
-        let cache = self.study_cache.lock();
-        if let Some(info) = cache.get(&study_id) {
-            for (tid, cached_trial) in &info.finished_trials {
-                // 如果结果中的对应试验还不是最新的，用缓存替换
-                if let Some(pos) = result.iter().position(|t| t.trial_id == *tid) {
-                    // 缓存和后端应该一致，无需替换
-                    let _ = pos;
-                }
+            if let Some(cached) = cached_finished.iter().find(|c| c.trial_id == trial.trial_id) {
+                result.push(cached.clone());
+            } else {
+                result.push(trial);
             }
         }
-        drop(cache);
 
         // 按状态过滤
         if let Some(wanted_states) = states {
@@ -446,5 +434,94 @@ mod tests {
         cached.set_study_user_attr(study_id, "key1", serde_json::json!("val1")).unwrap();
         let attrs = cached.get_study_user_attrs(study_id).unwrap();
         assert_eq!(attrs.get("key1").unwrap(), &serde_json::json!("val1"));
+    }
+
+    /// 对齐 Python: 已完成试验缓存后 get_trial 命中缓存不走后端
+    #[test]
+    fn test_cached_storage_get_trial_uses_cache_for_finished() {
+        let backend = Arc::new(InMemoryStorage::new());
+        let cached = CachedStorage::new(backend);
+        let dirs = vec![StudyDirection::Minimize];
+        let study_id = cached.create_new_study(&dirs, Some("test")).unwrap();
+
+        // 创建并完成 3 个试验
+        for i in 0..3 {
+            let tid = cached.create_new_trial(study_id, None).unwrap();
+            cached.set_trial_state_values(tid, TrialState::Complete, Some(&[i as f64])).unwrap();
+        }
+
+        // 第一次 get_all_trials 填充缓存
+        let trials1 = cached.get_all_trials(study_id, None).unwrap();
+        assert_eq!(trials1.len(), 3);
+
+        // get_trial 应从缓存获取已完成试验
+        let t0 = cached.get_trial(trials1[0].trial_id).unwrap();
+        assert_eq!(t0.state, TrialState::Complete);
+        assert_eq!(t0.values.as_ref().unwrap()[0], 0.0);
+
+        let t2 = cached.get_trial(trials1[2].trial_id).unwrap();
+        assert_eq!(t2.values.as_ref().unwrap()[0], 2.0);
+    }
+
+    /// 对齐 Python: get_all_trials 状态过滤正确
+    #[test]
+    fn test_cached_storage_state_filter() {
+        let backend = Arc::new(InMemoryStorage::new());
+        let cached = CachedStorage::new(backend);
+        let dirs = vec![StudyDirection::Minimize];
+        let study_id = cached.create_new_study(&dirs, Some("test")).unwrap();
+
+        // 1 Complete, 1 Running, 1 Pruned
+        let tid1 = cached.create_new_trial(study_id, None).unwrap();
+        cached.set_trial_state_values(tid1, TrialState::Complete, Some(&[1.0])).unwrap();
+
+        let _tid2 = cached.create_new_trial(study_id, None).unwrap();
+        // tid2 stays Running
+
+        let tid3 = cached.create_new_trial(study_id, None).unwrap();
+        cached.set_trial_state_values(tid3, TrialState::Pruned, None).unwrap();
+
+        // 仅 Complete
+        let complete = cached.get_all_trials(study_id, Some(&[TrialState::Complete])).unwrap();
+        assert_eq!(complete.len(), 1);
+        assert_eq!(complete[0].state, TrialState::Complete);
+
+        // 仅 Running
+        let running = cached.get_all_trials(study_id, Some(&[TrialState::Running])).unwrap();
+        assert_eq!(running.len(), 1);
+        assert_eq!(running[0].state, TrialState::Running);
+
+        // Complete + Pruned
+        let finished = cached.get_all_trials(
+            study_id,
+            Some(&[TrialState::Complete, TrialState::Pruned]),
+        ).unwrap();
+        assert_eq!(finished.len(), 2);
+    }
+
+    /// 对齐 Python: 新完成的试验在下次 get_all_trials 时自动缓存
+    #[test]
+    fn test_cached_storage_incremental_cache_update() {
+        let backend = Arc::new(InMemoryStorage::new());
+        let cached = CachedStorage::new(backend);
+        let dirs = vec![StudyDirection::Minimize];
+        let study_id = cached.create_new_study(&dirs, Some("test")).unwrap();
+
+        // 完成第一个试验并触发缓存
+        let tid1 = cached.create_new_trial(study_id, None).unwrap();
+        cached.set_trial_state_values(tid1, TrialState::Complete, Some(&[1.0])).unwrap();
+        let _ = cached.get_all_trials(study_id, None).unwrap();
+
+        // 创建并完成第二个试验
+        let tid2 = cached.create_new_trial(study_id, None).unwrap();
+        cached.set_trial_state_values(tid2, TrialState::Complete, Some(&[2.0])).unwrap();
+
+        // 再次获取应包含两个试验，且第二个已被缓存
+        let trials = cached.get_all_trials(study_id, None).unwrap();
+        assert_eq!(trials.len(), 2);
+
+        // get_trial 应命中缓存
+        let t2 = cached.get_trial(tid2).unwrap();
+        assert_eq!(t2.values.as_ref().unwrap()[0], 2.0);
     }
 }

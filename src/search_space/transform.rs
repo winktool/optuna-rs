@@ -131,17 +131,13 @@ impl SearchSpaceTransform {
             match (dist, value) {
                 (Distribution::CategoricalDistribution(d), ParamValue::Categorical(choice)) => {
                     // 对齐 Python: 分类参数必须在 choices 中，否则为配置错误。
-                    // Python 使用 to_internal_repr 会抛 ValueError；这里回退到 index 0 并警告。
-                    let idx = match d.choices.iter().position(|c| c == choice) {
-                        Some(i) => i,
-                        None => {
-                            crate::optuna_warn!(
-                                "Categorical value {:?} not found in choices {:?}, defaulting to index 0.",
-                                choice, d.choices
-                            );
-                            0
-                        }
-                    };
+                    // Python 使用 to_internal_repr 会抛 ValueError。
+                    let idx = d.choices.iter().position(|c| c == choice)
+                        .expect(&format!(
+                            "Categorical value {:?} not found in choices {:?}. \
+                             This is a configuration error.",
+                            choice, d.choices
+                        ));
                     encoded[range.start + idx] = 1.0;
                 }
                 (Distribution::FloatDistribution(d), ParamValue::Float(v)) => {
@@ -894,5 +890,59 @@ mod tests {
         assert_eq!(col_ranges[1], 1..2);
         assert_eq!(t.n_encoded(), 2);
         assert_eq!(t.encoded_column_to_column(), &[0, 1]);
+    }
+
+    /// 对齐 Python: transform 传入无效分类值时 panic（Python 抛 ValueError）。
+    #[test]
+    #[should_panic(expected = "not found in choices")]
+    fn test_transform_invalid_categorical_panics() {
+        let mut space = IndexMap::new();
+        space.insert(
+            "color".into(),
+            Distribution::CategoricalDistribution(
+                CategoricalDistribution::new(vec![
+                    CategoricalChoice::Str("red".into()),
+                    CategoricalChoice::Str("green".into()),
+                    CategoricalChoice::Str("blue".into()),
+                ]).unwrap(),
+            ),
+        );
+
+        let t = SearchSpaceTransform::with_defaults(space);
+        let mut params = IndexMap::new();
+        params.insert(
+            "color".into(),
+            ParamValue::Categorical(CategoricalChoice::Str("yellow".into())),
+        );
+
+        // Python: distribution.to_internal_repr("yellow") 抛 ValueError
+        // Rust: 现在也 panic 而非静默回退到 index 0
+        let _ = t.transform(&params);
+    }
+
+    /// 对齐 Python: transform 有效分类值正常编码。
+    #[test]
+    fn test_transform_valid_categorical_encoding() {
+        let mut space = IndexMap::new();
+        space.insert(
+            "color".into(),
+            Distribution::CategoricalDistribution(
+                CategoricalDistribution::new(vec![
+                    CategoricalChoice::Str("red".into()),
+                    CategoricalChoice::Str("green".into()),
+                    CategoricalChoice::Str("blue".into()),
+                ]).unwrap(),
+            ),
+        );
+
+        let t = SearchSpaceTransform::with_defaults(space);
+        let mut params = IndexMap::new();
+        // green = index 1 → one-hot = [0, 1, 0]
+        params.insert(
+            "color".into(),
+            ParamValue::Categorical(CategoricalChoice::Str("green".into())),
+        );
+        let enc = t.transform(&params);
+        assert_eq!(enc, vec![0.0, 1.0, 0.0]);
     }
 }

@@ -2,9 +2,9 @@
 
 ## 总览
 
-- **Rust 测试基线**: 999 unit + 5 doc-tests
-- **Python 交叉验证**: 215 tests (全部通过)
-- **最新提交**: Session 43 — 全仓深度审计 (distributions shorthand + transform + cached storage)
+- **Rust 测试基线**: 1011 unit + 5 doc-tests
+- **Python 交叉验证**: 全部通过
+- **最新提交**: Session 44 — TPE/交叉算子/HeartbeatThread/BaseTrial 深度审计 (10 bug fix + 12 new tests)
 
 ## Session 35 修复摘要 (全模块深度审计)
 

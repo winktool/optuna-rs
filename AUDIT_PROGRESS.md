@@ -1,5 +1,32 @@
 # optuna-rs 对齐 Python 审计进度报告
 
+## Session 44 — 深度交叉审计 (TPE/交叉算子/NSGA-III/HeartbeatThread/BaseTrial)
+
+### 修复清单
+
+| # | 严重度 | 区域 | 修复描述 |
+|---|--------|------|----------|
+| 1 | **CRITICAL** | SPX Crossover | r_s 指数错误: 常量 `1/(n-2)` → 正确 `1/(k+1)` 逐元素递增 |
+| 2 | **CRITICAL** | UNDX Crossover | sigma 传递错误: `normal()*sigma` → `normal()*sigma*sigma` 对齐 Python `rng.normal(0, sigma**2)` |
+| 3 | **HIGH** | TPE Parzen Estimator | log-discrete 采样边界恢复: `(low+step/2).exp()` → `low.exp()+step/2` |
+| 4 | **HIGH** | VSBX Crossover | u1/u2 逐维度 → 全局标量对齐 Python |
+| 5 | **HIGH** | HeartbeatThread | stop() 死锁: MutexGuard 未在 join() 前释放 |
+| 6 | **HIGH** | BaseTrial trait | 缺失 system_attrs()/set_system_attr() |
+| 7 | **MEDIUM** | MOTPE HSSP | 参考点范围: 全部 loss → 当前 rank 的 loss |
+| 8 | **MEDIUM** | NSGA-III | 默认 population_size: → 50 对齐 Python |
+| 9 | **MEDIUM** | Trial handle | user_attrs/system_attrs 读 storage → 读缓存 |
+| 10 | **MEDIUM** | Study.enqueue_trial | 空 params skip_if_exists 跳过 → 正确匹配 |
+
+### 新增测试 (12 个) → 总计 1011 unit + 5 doc
+
+### 已知待改进 (架构级,不影响基本正确性)
+
+- CMA-ES SepCMA/CMAwM/lr_adapt 使用简化近似
+- SBX 使用简化公式
+- CachedStorage 每次全量读取
+
+---
+
 ## Session 43 — 全仓深度审计 (distributions shorthand + transform + cached storage)
 
 ### 修复清单

@@ -488,7 +488,8 @@ impl TpeSampler {
                     let rank_losses: Vec<Vec<f64>> = rank_indices.iter()
                         .map(|&i| loss_values[i].clone())
                         .collect();
-                    let ref_point = Self::get_reference_point(&loss_values);
+                    // 对齐 Python: 参考点仅从当前 rank 的 loss 值计算
+                    let ref_point = Self::get_reference_point(&rank_losses);
                     let hssp_indices: Vec<usize> = (0..rank_losses.len()).collect();
                     let selected = crate::multi_objective::solve_hssp(
                         &rank_losses, &hssp_indices, remaining, &ref_point,

@@ -391,17 +391,15 @@ impl Trial {
     }
 
     /// 返回用户属性字典。
-    /// 对应 Python `Trial.user_attrs`.
+    /// 对齐 Python `Trial.user_attrs`: 使用本地缓存而非重新读取 storage。
     pub fn user_attrs(&self) -> Result<HashMap<String, serde_json::Value>> {
-        let ft = self.storage.get_trial(self.trial_id)?;
-        Ok(ft.user_attrs)
+        Ok(self.cached_trial.user_attrs.clone())
     }
 
     /// 返回系统属性字典。
-    /// 对应 Python `Trial.system_attrs` (deprecated in Python 3.1.0).
+    /// 对齐 Python `Trial.system_attrs`: 使用本地缓存 (deprecated in Python 3.1.0).
     pub fn system_attrs(&self) -> Result<HashMap<String, serde_json::Value>> {
-        let ft = self.storage.get_trial(self.trial_id)?;
-        Ok(ft.system_attrs)
+        Ok(self.cached_trial.system_attrs.clone())
     }
 
     /// 返回试验开始时间。
@@ -463,6 +461,14 @@ impl crate::trial::BaseTrial for Trial {
 
     fn user_attrs(&self) -> Result<HashMap<String, serde_json::Value>> {
         self.user_attrs()
+    }
+
+    fn system_attrs(&self) -> Result<HashMap<String, serde_json::Value>> {
+        self.system_attrs()
+    }
+
+    fn set_system_attr(&mut self, key: &str, value: serde_json::Value) -> Result<()> {
+        Trial::set_system_attr(self, key, value)
     }
 
     fn datetime_start(&self) -> Option<chrono::DateTime<chrono::Utc>> {
@@ -1068,5 +1074,56 @@ mod tests {
         // 尝试用 log=true 的分布（不兼容）
         let err = trial.suggest_float("x", 0.0, 1.0, true, None);
         assert!(err.is_err(), "log 不同的分布应报错");
+    }
+
+    /// 对齐 Python: Trial.user_attrs() 应从 cached_trial 读取，不重新查询 storage。
+    /// Python: `return copy.deepcopy(self._cached_frozen_trial.user_attrs)`
+    #[test]
+    fn test_user_attrs_reads_from_cache_not_storage() {
+        let study = create_study(
+            None, None, None, None,
+            Some(StudyDirection::Minimize), None, false,
+        ).unwrap();
+        let mut trial = study.ask(None).unwrap();
+
+        // 设置属性后，user_attrs() 应返回一致的缓存值
+        trial.set_user_attr("key1", serde_json::json!("value1")).unwrap();
+        let attrs = trial.user_attrs().unwrap();
+        assert_eq!(attrs.get("key1"), Some(&serde_json::json!("value1")));
+
+        // 再次调用应返回相同结果（来自缓存）
+        let attrs2 = trial.user_attrs().unwrap();
+        assert_eq!(attrs, attrs2);
+    }
+
+    /// 对齐 Python: Trial.system_attrs() 应从 cached_trial 读取。
+    #[test]
+    fn test_system_attrs_reads_from_cache() {
+        let study = create_study(
+            None, None, None, None,
+            Some(StudyDirection::Minimize), None, false,
+        ).unwrap();
+        let mut trial = study.ask(None).unwrap();
+
+        trial.set_system_attr("sys_key", serde_json::json!(123)).unwrap();
+        let attrs = trial.system_attrs().unwrap();
+        assert_eq!(attrs.get("sys_key"), Some(&serde_json::json!(123)));
+    }
+
+    /// 对齐 Python: BaseTrial trait 实现包含 system_attrs 和 set_system_attr
+    #[test]
+    fn test_trial_base_trait_system_attrs() {
+        let study = create_study(
+            None, None, None, None,
+            Some(StudyDirection::Minimize), None, false,
+        ).unwrap();
+        let mut trial = study.ask(None).unwrap();
+
+        // 通过 BaseTrial trait 调用
+        use crate::trial::BaseTrial;
+        let t: &mut dyn BaseTrial = &mut trial;
+        t.set_system_attr("trait_key", serde_json::json!("trait_val")).unwrap();
+        let attrs = t.system_attrs().unwrap();
+        assert_eq!(attrs.get("trait_key"), Some(&serde_json::json!("trait_val")));
     }
 }

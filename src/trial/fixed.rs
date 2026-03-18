@@ -330,6 +330,15 @@ impl crate::trial::BaseTrial for FixedTrial {
         Ok(FixedTrial::user_attrs(self).clone())
     }
 
+    fn system_attrs(&self) -> crate::error::Result<HashMap<String, serde_json::Value>> {
+        Ok(FixedTrial::system_attrs(self).clone())
+    }
+
+    fn set_system_attr(&mut self, key: &str, value: serde_json::Value) -> crate::error::Result<()> {
+        FixedTrial::set_system_attr(self, key.to_string(), value);
+        Ok(())
+    }
+
     fn datetime_start(&self) -> Option<DateTime<Utc>> {
         FixedTrial::datetime_start(self)
     }
@@ -685,5 +694,31 @@ mod tests {
         let trial = FixedTrial::new(HashMap::new(), 42);
         let t: &dyn BaseTrial = &trial;
         assert_eq!(t.number(), 42);
+    }
+
+    /// 对齐 Python: BaseTrial.system_attrs 返回系统属性
+    #[test]
+    fn test_base_trial_system_attrs() {
+        let mut trial = FixedTrial::new(HashMap::new(), 0);
+        let t: &dyn BaseTrial = &trial;
+        assert!(t.system_attrs().unwrap().is_empty());
+
+        // 通过 set_system_attr 设置后应可读取
+        let t: &mut dyn BaseTrial = &mut trial;
+        t.set_system_attr("test_key", serde_json::json!("test_val")).unwrap();
+        let attrs = t.system_attrs().unwrap();
+        assert_eq!(attrs.get("test_key"), Some(&serde_json::json!("test_val")));
+    }
+
+    /// 对齐 Python: BaseTrial.set_system_attr 设置系统属性
+    #[test]
+    fn test_base_trial_set_system_attr_multiple() {
+        let mut trial = FixedTrial::new(HashMap::new(), 0);
+        trial.set_system_attr("k1".to_string(), serde_json::json!(1));
+        trial.set_system_attr("k2".to_string(), serde_json::json!("v2"));
+        let attrs = trial.system_attrs();
+        assert_eq!(attrs.len(), 2);
+        assert_eq!(attrs.get("k1"), Some(&serde_json::json!(1)));
+        assert_eq!(attrs.get("k2"), Some(&serde_json::json!("v2")));
     }
 }

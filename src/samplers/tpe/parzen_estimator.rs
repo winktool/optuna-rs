@@ -488,13 +488,16 @@ impl ParzenEstimator {
                     // Round discrete.
                     if let Some(st) = step {
                         // Recover original low/high before step extension.
+                        // non-log: low was extended to (orig - step/2), so orig = low + step/2
+                        // log: low was extended then log'd: low = ln(orig - step/2),
+                        //      so orig = exp(low) + step/2
                         let orig_low = if *log {
-                            (low + st / 2.0).exp()
+                            low.exp() + st / 2.0
                         } else {
                             low + st / 2.0
                         };
                         let orig_high = if *log {
-                            (high - st / 2.0).exp()
+                            high.exp() - st / 2.0
                         } else {
                             high - st / 2.0
                         };
@@ -965,5 +968,41 @@ mod tests {
         let params = ParzenEstimatorParameters::default();
         // 2 observations but 3 weights
         let _pe = ParzenEstimator::new(&obs, &ss, &params, Some(&[1.0, 1.0, 1.0]), None);
+    }
+
+    /// 对齐 Python: 离散 log-scale 采样后 rounding 使用正确的原始 bounds。
+    /// Bug: 旧代码使用 (low + step/2).exp() 恢复原始 low，
+    /// 正确应为 low.exp() + step/2 = exp(ln(orig-step/2)) + step/2 = orig
+    #[test]
+    fn test_log_discrete_sample_bounds_recovery() {
+        use crate::distributions::IntDistribution;
+        let mut ss = IndexMap::new();
+        ss.insert(
+            "x".to_string(),
+            Distribution::IntDistribution(
+                IntDistribution::new(1, 100, true, 1).unwrap(),
+            ),
+        );
+        let mut obs = HashMap::new();
+        obs.insert("x".to_string(), vec![10.0, 20.0, 50.0]);
+
+        let pe = ParzenEstimator::new(
+            &obs, &ss, &ParzenEstimatorParameters::default(), None, None,
+        );
+
+        // 采样 1000 次，所有值应在 [1, 100] 范围内且为整数
+        let mut rng = rand_chacha::ChaCha8Rng::seed_from_u64(42);
+        let samples = pe.sample(&mut rng, 1000);
+        let x_samples = &samples["x"];
+        for &v in x_samples {
+            assert!(
+                v >= 1.0 && v <= 100.0,
+                "log-discrete sample {v} 超出 [1, 100] 范围"
+            );
+            assert!(
+                (v - v.round()).abs() < 1e-10,
+                "log-discrete sample {v} 不是整数"
+            );
+        }
     }
 }

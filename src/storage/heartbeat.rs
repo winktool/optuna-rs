@@ -7,7 +7,7 @@
 //! 优化循环中会自动启动/停止心跳线程。
 
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Condvar, Mutex};
 use std::thread;
 use std::time::Duration;
 
@@ -52,6 +52,8 @@ pub trait Heartbeat: Storage {
 /// 在后台定期调用 `record_heartbeat()` 直到被 drop 或显式停止。
 pub struct HeartbeatThread {
     stop_flag: Arc<AtomicBool>,
+    /// 对齐 Python stop_event.wait(timeout=interval): 使用 Condvar 实现即时唤醒。
+    condvar: Arc<(Mutex<bool>, Condvar)>,
     handle: Option<thread::JoinHandle<()>>,
 }
 
@@ -68,7 +70,9 @@ impl HeartbeatThread {
         interval: u64,
     ) -> Self {
         let stop_flag = Arc::new(AtomicBool::new(false));
+        let condvar = Arc::new((Mutex::new(false), Condvar::new()));
         let flag = stop_flag.clone();
+        let cv = condvar.clone();
 
         let handle = thread::spawn(move || {
             let interval_dur = Duration::from_secs(interval);
@@ -76,21 +80,21 @@ impl HeartbeatThread {
                 // 先记录一次心跳
                 let _ = storage.record_heartbeat(trial_id);
 
-                // 分段等待以快速响应停止信号
-                let mut waited = Duration::ZERO;
-                let step = Duration::from_millis(500);
-                while waited < interval_dur {
-                    if flag.load(Ordering::Relaxed) {
-                        return;
-                    }
-                    thread::sleep(step.min(interval_dur - waited));
-                    waited += step;
+                // 对齐 Python: stop_event.wait(timeout=heartbeat_interval)
+                // Condvar::wait_timeout 在收到 notify 时立即返回，无 500ms 延迟
+                let (lock, cvar) = &*cv;
+                let guard = lock.lock().unwrap();
+                let result = cvar.wait_timeout(guard, interval_dur).unwrap();
+                // 如果是因为 notify（停止信号）而唤醒，或超时后检查停止标志
+                if *result.0 || flag.load(Ordering::Relaxed) {
+                    return;
                 }
             }
         });
 
         Self {
             stop_flag,
+            condvar,
             handle: Some(handle),
         }
     }
@@ -98,6 +102,15 @@ impl HeartbeatThread {
     /// 停止心跳线程并等待其退出。
     pub fn stop(&mut self) {
         self.stop_flag.store(true, Ordering::Relaxed);
+        // 通知 Condvar 立即唤醒等待线程（对齐 Python stop_event.set()）
+        {
+            let (lock, cvar) = &*self.condvar;
+            let mut stopped = lock.lock().unwrap();
+            *stopped = true;
+            cvar.notify_all();
+            // MutexGuard 必须在 join 之前释放，否则线程的 wait_timeout
+            // 无法重新获取锁，导致死锁。
+        }
         if let Some(handle) = self.handle.take() {
             let _ = handle.join();
         }
@@ -306,5 +319,71 @@ mod tests {
         // 但 study.optimize 中的心跳机制会正确跳过
         let trials = study.trials().unwrap();
         assert!(trials.is_empty()); // 无试验时无 stale
+    }
+
+    /// 对齐 Python: HeartbeatThread.stop() 应立即响应（使用 Condvar 而非轮询）。
+    /// Python: stop_event.wait(timeout=interval) 在 stop_event.set() 时立即返回。
+    #[test]
+    fn test_heartbeat_stop_instant_response() {
+        use std::time::Instant;
+        use std::sync::atomic::AtomicI32;
+
+        // 模拟心跳存储
+        struct MockHeartbeat {
+            count: AtomicI32,
+        }
+        impl MockHeartbeat {
+            fn new() -> Self { Self { count: AtomicI32::new(0) } }
+        }
+        impl Heartbeat for MockHeartbeat {
+            fn record_heartbeat(&self, _trial_id: i64) -> crate::error::Result<()> {
+                self.count.fetch_add(1, Ordering::Relaxed);
+                Ok(())
+            }
+            fn get_stale_trial_ids(&self, _study_id: i64) -> crate::error::Result<Vec<i64>> { Ok(vec![]) }
+            fn get_heartbeat_interval(&self) -> Option<u64> { Some(60) }
+            fn get_failed_trial_callback(&self) -> Option<Arc<dyn Fn(&crate::study::Study, &crate::trial::FrozenTrial) + Send + Sync>> { None }
+        }
+        impl crate::storage::Storage for MockHeartbeat {
+            fn create_new_study(&self, _d: &[crate::study::StudyDirection], _n: Option<&str>) -> crate::error::Result<i64> { Ok(0) }
+            fn delete_study(&self, _id: i64) -> crate::error::Result<()> { Ok(()) }
+            fn set_study_user_attr(&self, _: i64, _: &str, _: serde_json::Value) -> crate::error::Result<()> { Ok(()) }
+            fn set_study_system_attr(&self, _: i64, _: &str, _: serde_json::Value) -> crate::error::Result<()> { Ok(()) }
+            fn get_study_id_from_name(&self, _: &str) -> crate::error::Result<i64> { Ok(0) }
+            fn get_study_name_from_id(&self, _: i64) -> crate::error::Result<String> { Ok(String::new()) }
+            fn get_study_directions(&self, _: i64) -> crate::error::Result<Vec<crate::study::StudyDirection>> { Ok(vec![]) }
+            fn get_study_user_attrs(&self, _: i64) -> crate::error::Result<std::collections::HashMap<String, serde_json::Value>> { Ok(std::collections::HashMap::new()) }
+            fn get_study_system_attrs(&self, _: i64) -> crate::error::Result<std::collections::HashMap<String, serde_json::Value>> { Ok(std::collections::HashMap::new()) }
+            fn get_all_studies(&self) -> crate::error::Result<Vec<crate::study::FrozenStudy>> { Ok(vec![]) }
+            fn create_new_trial(&self, _: i64, _: Option<&crate::trial::FrozenTrial>) -> crate::error::Result<i64> { Ok(0) }
+            fn set_trial_param(&self, _: i64, _: &str, _: f64, _: &crate::distributions::Distribution) -> crate::error::Result<()> { Ok(()) }
+            fn set_trial_state_values(&self, _: i64, _: crate::trial::TrialState, _: Option<&[f64]>) -> crate::error::Result<bool> { Ok(true) }
+            fn set_trial_intermediate_value(&self, _: i64, _: i64, _: f64) -> crate::error::Result<()> { Ok(()) }
+            fn set_trial_user_attr(&self, _: i64, _: &str, _: serde_json::Value) -> crate::error::Result<()> { Ok(()) }
+            fn set_trial_system_attr(&self, _: i64, _: &str, _: serde_json::Value) -> crate::error::Result<()> { Ok(()) }
+            fn get_trial(&self, _: i64) -> crate::error::Result<crate::trial::FrozenTrial> { Err(crate::error::OptunaError::ValueError("mock".into())) }
+            fn get_all_trials(&self, _: i64, _: Option<&[crate::trial::TrialState]>) -> crate::error::Result<Vec<crate::trial::FrozenTrial>> { Ok(vec![]) }
+            fn get_n_trials(&self, _: i64, _: Option<&[crate::trial::TrialState]>) -> crate::error::Result<usize> { Ok(0) }
+            fn get_best_trial(&self, _: i64) -> crate::error::Result<crate::trial::FrozenTrial> { Err(crate::error::OptunaError::ValueError("mock".into())) }
+        }
+
+        let storage = Arc::new(MockHeartbeat::new());
+        // 60 秒间隔 — 如果用旧的轮询方式 stop 至少需要 500ms
+        let mut hb = HeartbeatThread::start(0, storage.clone(), 60);
+
+        // 等待一点时间确保线程已启动并在等待
+        thread::sleep(Duration::from_millis(50));
+
+        // 停止并计时 — Condvar 方式应在 50ms 内完成
+        let start = Instant::now();
+        hb.stop();
+        let elapsed = start.elapsed();
+
+        // 对齐 Python: stop 应立即响应（<100ms），而非旧的 500ms 延迟
+        assert!(elapsed < Duration::from_millis(100),
+            "HeartbeatThread.stop() 应立即响应，实际耗时 {:?}", elapsed);
+
+        // 至少记录了一次心跳
+        assert!(storage.count.load(Ordering::Relaxed) >= 1);
     }
 }

@@ -465,6 +465,15 @@ impl crate::trial::BaseTrial for FrozenTrial {
         Ok(self.user_attrs.clone())
     }
 
+    fn system_attrs(&self) -> crate::error::Result<std::collections::HashMap<String, serde_json::Value>> {
+        Ok(self.system_attrs.clone())
+    }
+
+    fn set_system_attr(&mut self, key: &str, value: serde_json::Value) -> crate::error::Result<()> {
+        FrozenTrial::set_system_attr(self, key.to_string(), value);
+        Ok(())
+    }
+
     fn datetime_start(&self) -> Option<chrono::DateTime<chrono::Utc>> {
         self.datetime_start
     }

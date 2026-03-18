@@ -1384,11 +1384,8 @@ impl Study {
                     t.system_attrs.get("fixed_params")
                         .and_then(|fp| serde_json::from_value(fp.clone()).ok())
                         .or_else(|| {
-                            if t.params.is_empty() {
-                                None
-                            } else {
-                                Some(t.params.clone())
-                            }
+                            // 对齐 Python: trial.params 始终作为回退（包括空 dict）
+                            Some(t.params.clone())
                         });
                 if let Some(existing) = trial_params {
                     if existing == params {
@@ -2954,5 +2951,51 @@ mod tests {
         assert!(study.check_values_feasible(&[1.0, f64::NAN]).is_some());
         // Inf
         assert!(study.check_values_feasible(&[f64::NEG_INFINITY, 1.0]).is_some());
+    }
+
+    /// 对齐 Python: enqueue_trial skip_if_exists 对空参数也应匹配。
+    /// Python: trial.params == {} 时，enqueue_trial({}, skip_if_exists=True) 应跳过。
+    #[test]
+    fn test_enqueue_trial_skip_if_exists_empty_params() {
+        let study = create_study(
+            None, None, None, None,
+            Some(StudyDirection::Minimize), None, false,
+        ).unwrap();
+
+        // 第一次 enqueue 空参数
+        let params = std::collections::HashMap::new();
+        study.enqueue_trial(params.clone(), None, false).unwrap();
+
+        // 第二次 enqueue 同样空参数 + skip_if_exists=true
+        study.enqueue_trial(params.clone(), None, true).unwrap();
+
+        // 应只有 1 个 WAITING 试验（第二个被跳过）
+        let trials = study.storage.get_all_trials(study.study_id, Some(&[TrialState::Waiting])).unwrap();
+        assert_eq!(trials.len(), 1, "空参数 skip_if_exists 应匹配已有试验");
+    }
+
+    /// 对齐 Python: enqueue_trial skip_if_exists 对非空参数正常工作。
+    #[test]
+    fn test_enqueue_trial_skip_if_exists_nonempty_params() {
+        let study = create_study(
+            None, None, None, None,
+            Some(StudyDirection::Minimize), None, false,
+        ).unwrap();
+
+        let mut params = std::collections::HashMap::new();
+        params.insert("x".to_string(), crate::distributions::ParamValue::Float(0.5));
+
+        study.enqueue_trial(params.clone(), None, false).unwrap();
+        // 重复 enqueue 相同参数
+        study.enqueue_trial(params.clone(), None, true).unwrap();
+        let trials = study.storage.get_all_trials(study.study_id, Some(&[TrialState::Waiting])).unwrap();
+        assert_eq!(trials.len(), 1, "非空参数 skip_if_exists 应匹配已有试验");
+
+        // 不同参数应被创建
+        let mut params2 = std::collections::HashMap::new();
+        params2.insert("x".to_string(), crate::distributions::ParamValue::Float(0.9));
+        study.enqueue_trial(params2, None, true).unwrap();
+        let trials2 = study.storage.get_all_trials(study.study_id, Some(&[TrialState::Waiting])).unwrap();
+        assert_eq!(trials2.len(), 2, "不同参数应创建新试验");
     }
 }

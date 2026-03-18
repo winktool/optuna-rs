@@ -582,7 +582,7 @@ impl Storage for InMemoryStorage {
         let inner = self.inner.lock();
         let study = Self::get_study(&inner, study_id)?;
 
-        // 对齐 Python: 多目标时抛 RuntimeError (Rust 用 OptunaError::RuntimeError)
+        // 对齐 Python: 多目标时抛 RuntimeError
         if study.directions.len() > 1 {
             return Err(OptunaError::RuntimeError(
                 "best trial can be obtained only for single-objective optimization".into(),

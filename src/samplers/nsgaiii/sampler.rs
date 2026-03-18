@@ -125,7 +125,7 @@ impl NSGAIIISampler {
         let n_obj = directions.len();
         let divs = dividing_parameter.unwrap_or(3);
         let ref_pts = reference_points.unwrap_or_else(|| generate_reference_points(n_obj, divs));
-        let pop_size = population_size.unwrap_or_else(|| ref_pts.len().max(10));
+        let pop_size = population_size.unwrap_or(50);
         // 对齐 Python: population_size >= 2
         assert!(
             pop_size >= 2,
@@ -898,8 +898,8 @@ mod tests {
             vec![StudyDirection::Minimize, StudyDirection::Minimize],
             None, None, None, None, None, None, None, Some(42), None, None, None, None,
         );
-        // n_obj=2, divs=3 → 4 参考点 → pop_size = max(4, 10) = 10
-        assert_eq!(sampler.population_size, 10);
+        // 对齐 Python: population_size 默认 50
+        assert_eq!(sampler.population_size, 50);
         assert!((sampler.crossover_prob - 0.9).abs() < 1e-10);
         assert!((sampler.swapping_prob - 0.5).abs() < 1e-10);
         assert!(sampler.mutation_prob.is_none());

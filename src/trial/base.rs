@@ -57,6 +57,14 @@ pub trait BaseTrial {
     /// 用户属性。
     fn user_attrs(&self) -> Result<HashMap<String, serde_json::Value>>;
 
+    /// 系统属性。
+    /// 对应 Python `BaseTrial.system_attrs` (deprecated in Python 3.1.0)。
+    fn system_attrs(&self) -> Result<HashMap<String, serde_json::Value>>;
+
+    /// 设置系统属性。
+    /// 对应 Python `BaseTrial.set_system_attr()` (deprecated in Python 3.1.0)。
+    fn set_system_attr(&mut self, key: &str, value: serde_json::Value) -> Result<()>;
+
     /// 试验开始时间。
     fn datetime_start(&self) -> Option<chrono::DateTime<chrono::Utc>>;
 }

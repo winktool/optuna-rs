@@ -2,9 +2,9 @@
 
 ## 总览
 
-- **Rust 测试基线**: 771 all-features (含 2 ignored)
-- **Python 交叉验证**: 125 tests (全部通过)
-- **最新提交**: Session 35 on gitlab/main
+- **Rust 测试基线**: 965 unit + 5 doc-tests
+- **Python 交叉验证**: 215 tests (全部通过)
+- **最新提交**: Session 41 — GP 采集函数 + TPE 排名深度对齐
 
 ## Session 35 修复摘要 (全模块深度审计)
 

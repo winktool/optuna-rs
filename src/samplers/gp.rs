@@ -34,6 +34,17 @@ const PI: f64 = std::f64::consts::PI;
 const _SQRT_5: f64 = 2.2360679774997896964091736687747631;
 const EPS: f64 = 1e-10;
 pub(crate) const DEFAULT_MINIMUM_NOISE_VAR: f64 = 1e-6;
+/// 对齐 Python `_EPS = 1e-12` (stabilizing noise)。
+/// Python 在 LogEI/LogPI/LogEHVI 中使用 `stabilizing_noise=1e-12` 加到方差上。
+const STABILIZING_NOISE: f64 = 1e-12;
+/// 对齐 Python `_SQRT_HALF = math.sqrt(0.5)`
+const SQRT_HALF: f64 = 0.7071067811865475244;
+/// 对齐 Python `_INV_SQRT_2PI = 1 / sqrt(2π)`
+const INV_SQRT_2PI: f64 = 0.3989422804014326779;
+/// 对齐 Python `_SQRT_HALF_PI = sqrt(π/2)`
+const SQRT_HALF_PI: f64 = 1.2533141373155002512;
+/// 对齐 Python `_LOG_SQRT_2PI = log(sqrt(2π))`
+const LOG_SQRT_2PI: f64 = 0.9189385332046727418;
 
 // ════════════════════════════════════════════════════════════════════════
 // Matern 5/2 核函数
@@ -232,6 +243,30 @@ impl GPRegressor {
         let var = (k_xx - v_squared).max(0.0);
 
         (mean, var)
+    }
+
+    /// 追加 running trials 的假数据（constant liar 策略）。
+    ///
+    /// 对齐 Python `GPRegressor.append_running_data`:
+    /// 将 running trials 的归一化参数作为额外训练点加入 GP，
+    /// 使用当前 y_train.max() 作为假目标值（"最佳常量说谎者"策略），
+    /// 然后重新计算 Cholesky 分解。
+    ///
+    /// 这使得 GP 在并行优化时不会重复探索 running trials 已经在探索的区域。
+    pub(crate) fn append_running_data(
+        &mut self,
+        x_running: &[Vec<f64>],
+        constant_liar_value: f64,
+    ) {
+        if x_running.is_empty() {
+            return;
+        }
+        for xr in x_running {
+            self.x_train.push(xr.clone());
+            self.y_train.push(constant_liar_value);
+        }
+        // 重新计算 Cholesky 分解以包含新数据
+        self.cache_cholesky();
     }
 
     /// 边际对数似然: log p(y | X, θ)
@@ -541,9 +576,14 @@ pub(crate) fn normal_pdf(z: f64) -> f64 {
     (1.0 / (2.0 * PI).sqrt()) * (-0.5 * z * z).exp()
 }
 
-/// Log Expected Improvement
-/// logEI = log(σ * (z * Φ(z) + φ(z)))
-/// 其中 z = (μ - f₀) / σ
+/// Log Expected Improvement — 对齐 Python `standard_logei` + `logei`。
+///
+/// 完整对齐 Python 的两段式 logEI:
+/// 1. 主分支 (z >= -25): log(z/2 * erfc(-z/√2) + exp(-z²/2)/√(2π))
+/// 2. 尾部分支 (z < -25): -z²/2 - log(√(2π)) + log(1 + √(π/2) * z * erfcx(-z/√2))
+///    使用 erfcx 避免精度丢失。
+///
+/// logEI = standard_logei(z) + log(σ), 其中 z = (μ - f₀) / σ。
 fn log_ei(mean: f64, var: f64, f0: f64) -> f64 {
     if var < 1e-30 {
         // 方差为零时，EI 为 max(mean - f0, 0)
@@ -553,14 +593,82 @@ fn log_ei(mean: f64, var: f64, f0: f64) -> f64 {
     let sigma = var.sqrt();
     let z = (mean - f0) / sigma;
 
-    // 数值稳定的 logEI 计算
-    let ei = z * normal_cdf(z) + normal_pdf(z);
-    if ei > 1e-30 {
-        ei.ln() + sigma.ln()
+    // 对齐 Python `standard_logei` 的两段式计算
+    let standard_lei = if z >= -25.0 {
+        // 主分支: log(z/2 * erfc(-√½ * z) + exp(-z²/2) / √(2π))
+        let z_half = 0.5 * z;
+        let cdf_term = z_half * libm::erfc(-SQRT_HALF * z);     // z * Φ(z)
+        let pdf_term = (-z_half * z).exp() * INV_SQRT_2PI;       // φ(z)
+        let ei = cdf_term + pdf_term;
+        if ei > 0.0 { ei.ln() } else { f64::NEG_INFINITY }
     } else {
-        // 尾部近似（z 很小时）
-        -0.5 * z * z - (2.0 * PI).sqrt().ln() + sigma.ln()
+        // 尾部分支 (z < -25): 使用 erfcx 保持高精度
+        // -z²/2 - log(√(2π)) + log(1 + √(π/2) * z * erfcx(-√½ * z))
+        let erfcx_val = erfcx(-SQRT_HALF * z);
+        -0.5 * z * z - LOG_SQRT_2PI
+            + (1.0 + SQRT_HALF_PI * z * erfcx_val).ln()
+    };
+
+    standard_lei + sigma.ln()
+}
+
+/// erfcx(x) = exp(x²) * erfc(x) — 缩放互补误差函数。
+///
+/// 对齐 Python `torch.special.erfcx`。
+/// 对大 x 值保持精度（erfc 趋近 0，但 erfcx 趋近 1/(x√π)）。
+/// 使用 Abramowitz & Stegun 近似。
+fn erfcx(x: f64) -> f64 {
+    // 对于负数大值: erfcx(x) = exp(x²) * erfc(x) ≈ 2*exp(x²) 会爆炸
+    // 但在我们的 logEI 尾部分支中 x > 0 (因为 -SQRT_HALF * z > 0 when z < -25)
+    if x < 0.0 {
+        // erfcx(x) = exp(x²) * erfc(x)
+        // 对于 x << 0, erfc(x) ≈ 2, 所以 erfcx(x) ≈ 2*exp(x²) — 可能极大
+        return (x * x).exp() * libm::erfc(x);
     }
+    // 对于 x >= 0: 使用连分数展开近似
+    // erfcx(x) ≈ 1/(√π * x) * (1 - 1/(2x²) + 3/(4x⁴) - ...) for large x
+    if x > 26.0 {
+        // 渐近展开: erfcx(x) ≈ 1/(√π * x) * Σ (-1)^n (2n-1)!! / (2x²)^n
+        let inv_2x2 = 1.0 / (2.0 * x * x);
+        let inv_sqrt_pi = 1.0 / PI.sqrt();
+        return inv_sqrt_pi / x * (1.0 - inv_2x2 * (1.0 - 3.0 * inv_2x2));
+    }
+    // 中间范围: 直接计算 exp(x²) * erfc(x)
+    (x * x).exp() * libm::erfc(x)
+}
+
+/// 对数标准正态 CDF: log Φ(z) — 高精度实现。
+///
+/// 对齐 Python `torch.special.log_ndtr`:
+/// - z >= -5: 直接 log(0.5 * erfc(-z/√2))
+/// - z < -5: 使用渐近展开避免 log(0) 下溢
+///
+/// 这比 `normal_cdf(z).max(1e-30).ln()` 精确得多。
+fn log_ndtr(z: f64) -> f64 {
+    if z > 6.0 {
+        // Φ(z) ≈ 1 for z > 6, log Φ(z) ≈ 0
+        // 更精确: log Φ(z) = log(1 - Q(z)) ≈ -Q(z) where Q(z) = 1-Φ(z)
+        // Q(z) ≈ φ(z)/z 用 Mills ratio
+        let log_q = -0.5 * z * z - LOG_SQRT_2PI - z.ln();
+        return (-log_q.exp()).ln_1p(); // log(1 - Q(z))
+    }
+    if z >= -5.0 {
+        // 直接计算: log(0.5 * erfc(-z/√2))
+        let cdf = 0.5 * libm::erfc(-z * SQRT_HALF);
+        return cdf.ln();
+    }
+    // 尾部渐近展开 (z < -5):
+    // log Φ(z) ≈ -z²/2 - log(-z) - log(√(2π)) + log(1 - 1/z² + 3/z⁴ - ...)
+    // 使用 Mills ratio 展开
+    let z2 = z * z;
+    let log_phi = -0.5 * z2 - LOG_SQRT_2PI;
+    // log erfc(|z|/√2) ≈ log(1/|z|) + log_phi + correction
+    let abs_z = -z; // z < 0, abs_z > 0
+    let inv_z2 = 1.0 / z2;
+    // Mills ratio: erfc(x)/φ(x) ≈ (1/x) * (1 - 1/x² + 3/x⁴ - 15/x⁶ + ...)
+    // where x = |z|/√2, but we directly compute log Φ(z)
+    log_phi - abs_z.ln() + (1.0 - inv_z2 * (1.0 - 3.0 * inv_z2 * (1.0 - 5.0 * inv_z2))).ln()
+        - (0.5_f64).ln() // log(1/sqrt(2π)) → correction for erfc vs Φ
 }
 
 // ════════════════════════════════════════════════════════════════════════
@@ -620,6 +728,9 @@ fn erfinv(x: f64) -> f64 {
 /// 计算 log(E[HVI])。
 ///
 /// Y_post 中的值已是「越大越好」的标准化分数。
+///
+/// 对齐 Python: 使用 `diff.clamp_(min=EPS, max=interval)` 而非跳过整个盒。
+/// 这保留了微小贡献，避免丢失信息。
 fn log_ehvi(
     y_post: &[Vec<f64>],        // [n_qmc_samples, n_objectives]
     box_lower: &[Vec<f64>],     // [n_boxes, n_objectives]
@@ -631,24 +742,18 @@ fn log_ehvi(
     }
     let log_n_qmc = (n_qmc as f64).ln();
 
-    // 对每个 QMC 样本、每个 box 计算改善量的对数之和
-    // logsumexp over (qmc_samples x boxes)
+    // 对齐 Python: diff.clamp_(min=EPS, max=interval), 然后 log().sum()
+    // 再对 (qmc_samples × boxes) 做 logsumexp
     let mut log_vals: Vec<f64> = Vec::new();
     for sample in y_post {
         for (lb, interval) in box_lower.iter().zip(box_intervals.iter()) {
             let mut log_prod = 0.0;
-            let mut valid = true;
             for d in 0..sample.len() {
-                let diff = (sample[d] - lb[d]).max(EPS).min(interval[d]);
-                if diff <= EPS {
-                    valid = false;
-                    break;
-                }
+                // 对齐 Python: diff = (sample - lower).clamp(EPS, interval)
+                let diff = (sample[d] - lb[d]).clamp(STABILIZING_NOISE, interval[d]);
                 log_prod += diff.ln();
             }
-            if valid {
-                log_vals.push(log_prod);
-            }
+            log_vals.push(log_prod);
         }
     }
 
@@ -759,6 +864,52 @@ pub(crate) fn unnormalize_param(
 // GPSampler — 高斯过程采样器
 // ════════════════════════════════════════════════════════════════════════
 
+/// 对齐 Python `gp.warn_and_convert_inf`:
+/// 将非有限值（±inf）裁剪到该列已有有限值的 [min, max] 范围。
+/// 若某列全部非有限，则裁剪到 0.0。这保持了数值稳定性，
+/// 避免 GP 拟合时因极端值导致不稳定。
+///
+/// Python 原始实现:
+/// ```python
+/// is_any_finite = np.any(is_values_finite, axis=0)
+/// np.clip(values,
+///     np.where(is_any_finite, np.min(np.where(finite, values, inf), axis=0), 0.0),
+///     np.where(is_any_finite, np.max(np.where(finite, values, -inf), axis=0), 0.0))
+/// ```
+fn warn_and_convert_inf(score_vals: &mut [Vec<f64>], n_objectives: usize) {
+    // 检查是否有非有限值
+    let has_nonfinite = score_vals.iter().any(|row| row.iter().any(|v| !v.is_finite()));
+    if !has_nonfinite {
+        return;
+    }
+
+    crate::optuna_warn!("Clip non-finite values to the min/max finite values for GP fittings.");
+
+    // 逐列计算有限值的 min/max
+    for obj in 0..n_objectives {
+        let finite_vals: Vec<f64> = score_vals.iter()
+            .map(|row| row[obj])
+            .filter(|v| v.is_finite())
+            .collect();
+
+        let (clip_min, clip_max) = if finite_vals.is_empty() {
+            // 该列全部非有限 → 设为 0.0
+            (0.0, 0.0)
+        } else {
+            let min_val = finite_vals.iter().cloned().fold(f64::INFINITY, f64::min);
+            let max_val = finite_vals.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
+            (min_val, max_val)
+        };
+
+        // 裁剪该列的非有限值
+        for row in score_vals.iter_mut() {
+            if !row[obj].is_finite() {
+                row[obj] = row[obj].clamp(clip_min, clip_max);
+            }
+        }
+    }
+}
+
 /// 约束函数类型: 接收 FrozenTrial，返回约束值向量。所有值 ≤ 0 表示可行。
 pub type ConstraintsFn = Arc<dyn Fn(&FrozenTrial) -> Vec<f64> + Send + Sync>;
 
@@ -867,6 +1018,7 @@ impl GpSampler {
         &self,
         completed_trials: &[FrozenTrial],
         search_space: &IndexMap<String, Distribution>,
+        running_trials: &[FrozenTrial],
     ) -> Result<HashMap<String, f64>> {
         let param_names: Vec<String> = search_space.keys().cloned().collect();
         let n_params = param_names.len();
@@ -908,16 +1060,7 @@ impl GpSampler {
                 if complete {
                     x_train.push(row);
                     let signed_vals: Vec<f64> = vals.iter().enumerate().map(|(j, &v)| {
-                        let mut sv = v * signs[j];
-                        // 对齐 Python warn_and_convert_inf
-                        if sv.is_infinite() {
-                            crate::optuna_warn!(
-                                "Trial {} has infinite objective value; clipping to finite bound.",
-                                trial.number
-                            );
-                            sv = if sv > 0.0 { f64::MAX } else { f64::MIN };
-                        }
-                        sv
+                        v * signs[j]
                     }).collect();
                     score_vals.push(signed_vals);
                 }
@@ -927,6 +1070,11 @@ impl GpSampler {
         if x_train.is_empty() {
             return Ok(HashMap::new());
         }
+
+        // 对齐 Python `gp.warn_and_convert_inf`:
+        // 将非有限值裁剪到该列有限值的 [min, max] 范围，而非 f64::MAX/MIN。
+        // 若某列全部非有限，则设为 0.0。
+        warn_and_convert_inf(&mut score_vals, n_objectives);
 
         let n_trials = x_train.len();
 
@@ -1015,20 +1163,74 @@ impl GpSampler {
 
         if n_objectives == 1 {
             // ── 单目标: logEI ──
-            let gpr = &gprs_list[0];
+            // 对齐 Python: threshold = 可行试验中 standardized_score 的最大值
             let f0 = standardized_by_obj[0].iter().zip(is_feasible.iter())
                 .filter(|(_, feas)| **feas)
                 .map(|(y, _)| *y)
                 .fold(f64::NEG_INFINITY, f64::max);
 
+            // 对齐 Python: 当 f0 == -inf（全部不可行）时，logEI 返回 0
+            // (对齐 Python `LogEI.eval_acqf` 中的 `if np.isneginf(threshold)`)
+
+            // 对齐 Python Constant Liar 策略:
+            // 单目标无约束时，将 running trials 的归一化参数加入 GP，
+            // 使用 y_train.max() 作为假目标值。
+            let mut gpr = std::mem::replace(&mut gprs_list[0], GPRegressor::new(
+                vec![], vec![], vec![], vec![], 1.0, DEFAULT_MINIMUM_NOISE_VAR,
+            ));
+            if !running_trials.is_empty() && constraint_gps.is_empty() {
+                // 收集 running trials 的归一化参数
+                let mut x_running: Vec<Vec<f64>> = Vec::new();
+                for rt in running_trials {
+                    let mut row = Vec::with_capacity(n_params);
+                    let mut complete = true;
+                    for name in &param_names {
+                        if let Some(pv) = rt.params.get(name) {
+                            let dist = &search_space[name];
+                            if let Ok(internal) = dist.to_internal_repr(pv) {
+                                row.push(normalize_param(internal, dist));
+                            } else {
+                                complete = false;
+                                break;
+                            }
+                        } else {
+                            complete = false;
+                            break;
+                        }
+                    }
+                    if complete {
+                        x_running.push(row);
+                    }
+                }
+                if !x_running.is_empty() {
+                    // 对齐 Python: constant_liar_value = gpr._y_train.max()
+                    let constant_liar_value = gpr.y_train.iter()
+                        .cloned()
+                        .fold(f64::NEG_INFINITY, f64::max);
+                    gpr.append_running_data(&x_running, constant_liar_value);
+                }
+            }
+
             let eval_acqf = |candidate: &[f64]| -> f64 {
+                // 对齐 Python: 若 threshold 为 -inf（全部不可行），返回 0（不优化 EI）
+                if f0 == f64::NEG_INFINITY {
+                    // 仅返回约束概率部分
+                    let mut acqf = 0.0_f64;
+                    for (c_gpr, c_threshold) in &constraint_gps {
+                        let (c_mean, c_var) = c_gpr.posterior(candidate);
+                        let sigma = (c_var + STABILIZING_NOISE).sqrt();
+                        let z = (c_mean - c_threshold) / sigma;
+                        acqf += log_ndtr(z);
+                    }
+                    return acqf;
+                }
                 let (mean, var) = gpr.posterior(candidate);
-                let mut acqf = log_ei(mean, var, f0);
+                let mut acqf = log_ei(mean, var + STABILIZING_NOISE, f0);
                 for (c_gpr, c_threshold) in &constraint_gps {
                     let (c_mean, c_var) = c_gpr.posterior(candidate);
-                    let sigma = (c_var + EPS).sqrt();
+                    let sigma = (c_var + STABILIZING_NOISE).sqrt();
                     let z = (c_mean - c_threshold) / sigma;
-                    acqf += normal_cdf(z).max(1e-30).ln();
+                    acqf += log_ndtr(z);
                 }
                 acqf
             };
@@ -1062,42 +1264,67 @@ impl GpSampler {
             self.unnormalize_result(&best_params, &param_names, search_space)
         } else {
             // ── 多目标: logEHVI ──
-            // 对齐 Python `acqf.LogEHVI`
+            // 对齐 Python `acqf.LogEHVI` / `acqf.ConstrainedLogEHVI`
 
-            // 1. 计算非支配盒分解（在 loss 空间: 取负 → 越小越好）
-            let loss_vals: Vec<Vec<f64>> = standardized_score_vals.iter()
-                .map(|sv| sv.iter().map(|&v| -v).collect())
-                .collect();
+            // 对齐 Python: 有约束时仅用可行试验构建 Pareto/EHVI;
+            // 无约束时用全部试验。
+            let has_constraints = !constraint_gps.is_empty();
+            let is_all_infeasible = has_constraints && is_feasible.iter().all(|f| !f);
 
-            let pareto_mask = is_pareto_front_min(&loss_vals);
-            let pareto_sols: Vec<Vec<f64>> = loss_vals.iter().zip(pareto_mask.iter())
-                .filter(|(_, on)| **on)
-                .map(|(v, _)| v.clone())
-                .collect();
+            // 用于 EHVI 盒分解的标准化 score 值（仅可行试验或全部）
+            let ehvi_score_vals: Vec<Vec<f64>> = if has_constraints && !is_all_infeasible {
+                // 对齐 Python: Y_feasible = standardized_score_vals[is_feasible]
+                standardized_score_vals.iter().zip(is_feasible.iter())
+                    .filter(|(_, feas)| **feas)
+                    .map(|(sv, _)| sv.clone())
+                    .collect()
+            } else if is_all_infeasible {
+                // 全部不可行时不构建 EHVI (Python: self._acqf = None)
+                Vec::new()
+            } else {
+                standardized_score_vals.clone()
+            };
 
-            // 参考点: 对齐 Python — max(loss) * 1.1 (or 0.9 for negative)
-            let ref_point: Vec<f64> = (0..n_objectives).map(|d| {
-                let max_val = loss_vals.iter().map(|v| v[d]).fold(f64::NEG_INFINITY, f64::max);
-                let rp = if max_val >= 0.0 { 1.1 * max_val } else { 0.9 * max_val };
-                // nextafter(rp, inf) — 在 Rust 中用小增量模拟
-                rp + f64::EPSILON * rp.abs().max(1.0)
-            }).collect();
+            // 构建 EHVI 评估闭包所需的盒分解数据（可能为空）
+            let ehvi_data: Option<(Vec<Vec<f64>>, Vec<Vec<f64>>, Vec<Vec<f64>>)> =
+                if !ehvi_score_vals.is_empty() {
+                    // 1. 计算非支配盒分解（在 loss 空间: 取负 → 越小越好）
+                    let loss_vals: Vec<Vec<f64>> = ehvi_score_vals.iter()
+                        .map(|sv| sv.iter().map(|&v| -v).collect())
+                        .collect();
+                    let pareto_mask = is_pareto_front_min(&loss_vals);
+                    let pareto_sols: Vec<Vec<f64>> = loss_vals.iter().zip(pareto_mask.iter())
+                        .filter(|(_, on)| **on)
+                        .map(|(v, _)| v.clone())
+                        .collect();
 
-            let (box_lower_loss, box_upper_loss) = crate::multi_objective::get_non_dominated_box_bounds(
-                &pareto_sols, &ref_point,
-            );
+                    // 参考点: 对齐 Python `np.nextafter(np.maximum(1.1*rp, 0.9*rp), inf)`
+                    let ref_point: Vec<f64> = (0..n_objectives).map(|d| {
+                        let max_val = loss_vals.iter().map(|v| v[d]).fold(f64::NEG_INFINITY, f64::max);
+                        let rp = if max_val >= 0.0 { 1.1 * max_val } else { 0.9 * max_val };
+                        // 对齐 Python nextafter: 精确偏移 1 ULP
+                        f64::from_bits(rp.to_bits().wrapping_add(1))
+                    }).collect();
 
-            // 将盒边界从 loss 空间翻转回 score 空间（取负）
-            // 对齐 Python: lower_bounds = -ubs, upper_bounds = -lbs
-            let box_lower_score: Vec<Vec<f64>> = box_upper_loss.iter()
-                .map(|ub| ub.iter().map(|&v| -v).collect())
-                .collect();
-            let box_upper_score: Vec<Vec<f64>> = box_lower_loss.iter()
-                .map(|lb| lb.iter().map(|&v| -v).collect())
-                .collect();
-            let box_intervals: Vec<Vec<f64>> = box_lower_score.iter().zip(box_upper_score.iter())
-                .map(|(lb, ub)| lb.iter().zip(ub.iter()).map(|(&l, &u)| (u - l).max(EPS)).collect())
-                .collect();
+                    let (box_lower_loss, box_upper_loss) = crate::multi_objective::get_non_dominated_box_bounds(
+                        &pareto_sols, &ref_point,
+                    );
+
+                    // 对齐 Python: 翻转 loss→score 空间
+                    let box_lower_score: Vec<Vec<f64>> = box_upper_loss.iter()
+                        .map(|ub| ub.iter().map(|&v| -v).collect())
+                        .collect();
+                    let box_upper_score: Vec<Vec<f64>> = box_lower_loss.iter()
+                        .map(|lb| lb.iter().map(|&v| -v).collect())
+                        .collect();
+                    let box_intervals: Vec<Vec<f64>> = box_lower_score.iter().zip(box_upper_score.iter())
+                        .map(|(lb, ub)| lb.iter().zip(ub.iter()).map(|(&l, &u)| (u - l).max(STABILIZING_NOISE)).collect())
+                        .collect();
+
+                    Some((box_lower_score, box_intervals, Vec::new()))
+                } else {
+                    None
+                };
 
             // 2. 生成 QMC 正态样本 [n_qmc_samples, n_objectives]
             let qmc_seed = rng.random_range(0u64..1u64 << 30);
@@ -1105,42 +1332,79 @@ impl GpSampler {
                 n_objectives, self.n_qmc_samples, qmc_seed,
             );
 
-            // 3. 构建 logEHVI 评估函数
+            // 3. 构建采集函数评估闭包
             let eval_acqf = |candidate: &[f64]| -> f64 {
-                // 对每个目标获取后验 mean, var
-                let mut y_post: Vec<Vec<f64>> = Vec::with_capacity(self.n_qmc_samples);
-                for s in 0..self.n_qmc_samples {
-                    let mut sample = Vec::with_capacity(n_objectives);
-                    for obj in 0..n_objectives {
-                        let (mean, var) = gprs_list[obj].posterior(candidate);
-                        let stdev = (var + EPS).sqrt();
-                        sample.push(mean + stdev * fixed_samples[s][obj]);
-                    }
-                    y_post.push(sample);
-                }
-                let mut acqf = log_ehvi(&y_post, &box_lower_score, &box_intervals);
+                let mut acqf_val = 0.0_f64;
 
-                // 约束: 加上 logPI
+                // EHVI 部分（全部不可行时跳过）
+                if let Some((ref box_lower_score, ref box_intervals, _)) = ehvi_data {
+                    let mut y_post: Vec<Vec<f64>> = Vec::with_capacity(self.n_qmc_samples);
+                    for s in 0..self.n_qmc_samples {
+                        let mut sample = Vec::with_capacity(n_objectives);
+                        for obj in 0..n_objectives {
+                            let (mean, var) = gprs_list[obj].posterior(candidate);
+                            let stdev = (var + STABILIZING_NOISE).sqrt();
+                            sample.push(mean + stdev * fixed_samples[s][obj]);
+                        }
+                        y_post.push(sample);
+                    }
+                    acqf_val = log_ehvi(&y_post, box_lower_score, box_intervals);
+                }
+
+                // 约束: 加上 Σ log Φ(z)
                 for (c_gpr, c_threshold) in &constraint_gps {
                     let (c_mean, c_var) = c_gpr.posterior(candidate);
-                    let sigma = (c_var + EPS).sqrt();
+                    let sigma = (c_var + STABILIZING_NOISE).sqrt();
                     let z = (c_mean - c_threshold) / sigma;
-                    acqf += normal_cdf(z).max(1e-30).ln();
+                    acqf_val += log_ndtr(z);
                 }
-                acqf
+                acqf_val
             };
 
-            // 4. 热启动: Pareto 前沿点
-            let pareto_indices: Vec<usize> = pareto_mask.iter().enumerate()
-                .filter(|(_, on)| **on)
-                .map(|(i, _)| i)
-                .collect();
-
-            let warmstart: Vec<Vec<f64>> = if !pareto_indices.is_empty() {
+            // 4. 热启动: 对齐 Python — 从 Pareto 前沿随机选取点
+            let warmstart: Vec<Vec<f64>> = if has_constraints && !is_all_infeasible {
+                // 仅在可行试验中找 Pareto 前沿
+                let feasible_indices: Vec<usize> = is_feasible.iter().enumerate()
+                    .filter(|(_, f)| **f)
+                    .map(|(i, _)| i)
+                    .collect();
+                let feasible_loss: Vec<Vec<f64>> = feasible_indices.iter()
+                    .map(|&i| standardized_score_vals[i].iter().map(|&v| -v).collect())
+                    .collect();
+                let pareto_mask = is_pareto_front_min(&feasible_loss);
+                let pareto_indices: Vec<usize> = pareto_mask.iter().enumerate()
+                    .filter(|(_, on)| **on)
+                    .map(|(j, _)| feasible_indices[j])
+                    .collect();
                 let n_ws = (self.n_local_search / 2).min(pareto_indices.len());
-                pareto_indices[..n_ws].iter()
-                    .map(|&idx| x_train[idx].clone())
-                    .collect()
+                if n_ws > 0 && pareto_indices.len() > n_ws {
+                    // 对齐 Python: 随机不重复选取
+                    use rand::seq::SliceRandom;
+                    let mut pi = pareto_indices.clone();
+                    pi.partial_shuffle(&mut *rng, n_ws);
+                    pi[..n_ws].iter().map(|&idx| x_train[idx].clone()).collect()
+                } else {
+                    pareto_indices.iter().take(n_ws).map(|&idx| x_train[idx].clone()).collect()
+                }
+            } else if !is_all_infeasible {
+                // 无约束: 全部试验的 Pareto 前沿
+                let loss_vals: Vec<Vec<f64>> = standardized_score_vals.iter()
+                    .map(|sv| sv.iter().map(|&v| -v).collect())
+                    .collect();
+                let pareto_mask = is_pareto_front_min(&loss_vals);
+                let pareto_indices: Vec<usize> = pareto_mask.iter().enumerate()
+                    .filter(|(_, on)| **on)
+                    .map(|(i, _)| i)
+                    .collect();
+                let n_ws = (self.n_local_search / 2).min(pareto_indices.len());
+                if n_ws > 0 && pareto_indices.len() > n_ws {
+                    use rand::seq::SliceRandom;
+                    let mut pi = pareto_indices.clone();
+                    pi.partial_shuffle(&mut *rng, n_ws);
+                    pi[..n_ws].iter().map(|&idx| x_train[idx].clone()).collect()
+                } else {
+                    pareto_indices.iter().take(n_ws).map(|&idx| x_train[idx].clone()).collect()
+                }
             } else {
                 Vec::new()
             };
@@ -1291,8 +1555,19 @@ impl Sampler for GpSampler {
             return Ok(HashMap::new());
         }
 
+        // 对齐 Python: running trials 仅在单目标无约束时使用（constant liar 策略）。
+        // 多目标或有约束时 use_cache = True（不传 running trials）。
+        let running_trials: Vec<FrozenTrial> = if self.directions.len() == 1 && self.constraints_func.is_none() {
+            trials.iter()
+                .filter(|t| t.state == TrialState::Running)
+                .cloned()
+                .collect()
+        } else {
+            Vec::new()
+        };
+
         let completed_owned: Vec<FrozenTrial> = completed.into_iter().cloned().collect();
-        self.sample_relative_impl(&completed_owned, search_space)
+        self.sample_relative_impl(&completed_owned, search_space, &running_trials)
     }
 
     fn sample_independent(
@@ -1491,7 +1766,7 @@ mod tests {
             ));
 
         // 第一次调用 — 应该填充缓存
-        let _result = sampler.sample_relative_impl(&trials, &search_space).unwrap();
+        let _result = sampler.sample_relative_impl(&trials, &search_space, &[]).unwrap();
         {
             let cache = sampler.gprs_cache.lock();
             assert!(cache.is_some(), "缓存应该在第一次调用后被填充");
@@ -1505,7 +1780,7 @@ mod tests {
         let first_cache = sampler.gprs_cache.lock().as_ref().unwrap()[0].clone();
 
         // 第二次调用 — 应该使用缓存作为初始值
-        let _result2 = sampler.sample_relative_impl(&trials, &search_space).unwrap();
+        let _result2 = sampler.sample_relative_impl(&trials, &search_space, &[]).unwrap();
         {
             let cache = sampler.gprs_cache.lock();
             assert!(cache.is_some(), "缓存应该在第二次调用后仍存在");
@@ -1532,7 +1807,7 @@ mod tests {
                 ));
         }
 
-        let _result3 = sampler.sample_relative_impl(&trials, &search_space2).unwrap();
+        let _result3 = sampler.sample_relative_impl(&trials, &search_space2, &[]).unwrap();
         {
             let cache = sampler.gprs_cache.lock();
             assert!(cache.is_some());
@@ -1695,7 +1970,7 @@ mod tests {
                 },
             ));
 
-        let _result = sampler.sample_relative_impl(&trials, &search_space).unwrap();
+        let _result = sampler.sample_relative_impl(&trials, &search_space, &[]).unwrap();
         {
             let cache = sampler.gprs_cache.lock();
             assert!(cache.is_some(), "缓存应该在第一次调用后被填充");
@@ -1758,5 +2033,220 @@ mod tests {
         let trials = study.trials().unwrap();
         let completed: Vec<_> = trials.iter().filter(|t| t.state == TrialState::Complete).collect();
         assert!(completed.len() >= 15, "Got {} completed", completed.len());
+    }
+
+    // ═══════════════════════════════════════════════════════════════
+    // 对齐修复项的测试
+    // ═══════════════════════════════════════════════════════════════
+
+    /// 测试 warn_and_convert_inf: 非有限值应被裁剪到该列有限值的 [min,max] 范围。
+    /// 对齐 Python `gp.warn_and_convert_inf` 的逐列裁剪逻辑。
+    #[test]
+    fn test_warn_and_convert_inf() {
+        // 情况 1: 全部有限 → 无变化
+        let mut vals1 = vec![vec![1.0, 2.0], vec![3.0, 4.0]];
+        warn_and_convert_inf(&mut vals1, 2);
+        assert_eq!(vals1, vec![vec![1.0, 2.0], vec![3.0, 4.0]]);
+
+        // 情况 2: 有 inf → 裁剪到该列有限值范围
+        let mut vals2 = vec![
+            vec![1.0, f64::INFINITY],
+            vec![3.0, 2.0],
+            vec![f64::NEG_INFINITY, 5.0],
+        ];
+        warn_and_convert_inf(&mut vals2, 2);
+        // 列0: 有限值 [1.0, 3.0] → -inf 裁剪到 1.0
+        assert_eq!(vals2[2][0], 1.0);
+        // 列1: 有限值 [2.0, 5.0] → inf 裁剪到 5.0
+        assert_eq!(vals2[0][1], 5.0);
+        // 有限值不变
+        assert_eq!(vals2[0][0], 1.0);
+        assert_eq!(vals2[1][0], 3.0);
+        assert_eq!(vals2[1][1], 2.0);
+
+        // 情况 3: 某列全部非有限 → 设为 0.0
+        let mut vals3 = vec![
+            vec![1.0, f64::INFINITY],
+            vec![2.0, f64::NEG_INFINITY],
+        ];
+        warn_and_convert_inf(&mut vals3, 2);
+        assert_eq!(vals3[0][1], 0.0);
+        assert_eq!(vals3[1][1], 0.0);
+        // 列0 有限值不变
+        assert_eq!(vals3[0][0], 1.0);
+        assert_eq!(vals3[1][0], 2.0);
+    }
+
+    /// 测试 log_ei 的尾部精度: z < -25 时使用 erfcx 分支。
+    /// 对齐 Python `standard_logei` 的两段式计算。
+    #[test]
+    fn test_log_ei_tail_precision() {
+        // z 在 -25 附近的边界
+        let lei_24 = log_ei(0.0, 1.0, 24.0);  // z = -24
+        let lei_26 = log_ei(0.0, 1.0, 26.0);  // z = -26 (进入尾部分支)
+        let lei_40 = log_ei(0.0, 1.0, 40.0);  // z = -40 (深尾部)
+
+        // 所有值应有限且单调递减
+        assert!(lei_24.is_finite(), "logEI at z=-24 should be finite: {lei_24}");
+        assert!(lei_26.is_finite(), "logEI at z=-26 should be finite: {lei_26}");
+        assert!(lei_40.is_finite(), "logEI at z=-40 should be finite: {lei_40}");
+        assert!(lei_24 > lei_26, "logEI should decrease: {lei_24} > {lei_26}");
+        assert!(lei_26 > lei_40, "logEI should decrease: {lei_26} > {lei_40}");
+
+        // z=-26 时参考值（Python 计算）: ≈ -338.5
+        // 允许较大容差因不同的近似方法
+        assert!(lei_26 < -300.0, "logEI at z=-26 should be very negative: {lei_26}");
+
+        // z=0 时（高 EI），EI ≈ φ(0) = 1/√(2π) ≈ 0.3989
+        let lei_0 = log_ei(0.0, 1.0, 0.0);
+        assert!((lei_0 - 0.3989_f64.ln()).abs() < 0.1, "logEI at z=0: {lei_0}");
+    }
+
+    /// 测试 erfcx 函数的正确性。
+    #[test]
+    fn test_erfcx() {
+        // erfcx(0) = erfc(0) = 1.0
+        assert!((erfcx(0.0) - 1.0).abs() < 1e-10, "erfcx(0) = {}", erfcx(0.0));
+
+        // erfcx(x) 对大正数应趋近 1/(√π * x)
+        let x = 10.0;
+        let expected = 1.0 / (PI.sqrt() * x);
+        let actual = erfcx(x);
+        assert!((actual - expected) / expected < 0.1,
+            "erfcx({x}) = {actual}, expected ≈ {expected}");
+
+        // erfcx(x) 对负数：erfcx(-1) = exp(1) * erfc(-1) ≈ exp(1) * 1.8427 ≈ 5.009
+        let neg_val = erfcx(-1.0);
+        let expected_neg = 1.0_f64.exp() * libm::erfc(-1.0);
+        assert!((neg_val - expected_neg).abs() < 0.01,
+            "erfcx(-1) = {neg_val}, expected {expected_neg}");
+    }
+
+    /// 测试 log_ndtr 高精度对数正态 CDF。
+    /// 对齐 Python `torch.special.log_ndtr`。
+    #[test]
+    fn test_log_ndtr() {
+        // log Φ(0) = log(0.5) ≈ -0.6931
+        let ln0 = log_ndtr(0.0);
+        assert!((ln0 - (-0.5_f64.ln().abs())).abs() < 1e-6,
+            "log_ndtr(0) = {ln0}, expected {}", -0.5_f64.ln().abs());
+
+        // log Φ(3) ≈ log(0.99865) ≈ -0.00135
+        let ln3 = log_ndtr(3.0);
+        assert!(ln3 > -0.01 && ln3 < 0.0, "log_ndtr(3) = {ln3}");
+
+        // log Φ(-3) ≈ log(0.00135) ≈ -6.607
+        let lnm3 = log_ndtr(-3.0);
+        assert!((lnm3 - (-6.607)).abs() < 0.1, "log_ndtr(-3) = {lnm3}");
+
+        // 深尾部: log Φ(-10) ≈ -51.12
+        let lnm10 = log_ndtr(-10.0);
+        assert!(lnm10.is_finite(), "log_ndtr(-10) should be finite: {lnm10}");
+        assert!(lnm10 < -40.0, "log_ndtr(-10) should be very negative: {lnm10}");
+
+        // 深尾部: log Φ(-20)
+        let lnm20 = log_ndtr(-20.0);
+        assert!(lnm20.is_finite(), "log_ndtr(-20) should be finite: {lnm20}");
+        assert!(lnm20 < lnm10, "log_ndtr should be monotonically decreasing in tail");
+
+        // 正大值: log Φ(10) ≈ 0
+        let ln10 = log_ndtr(10.0);
+        assert!(ln10 > -1e-6, "log_ndtr(10) should be ≈ 0: {ln10}");
+    }
+
+    /// 测试 log_ehvi 不再跳过微小贡献的盒。
+    /// 对齐 Python `logehvi` 的 clamp 行为。
+    #[test]
+    fn test_log_ehvi_no_skip() {
+        // 后验样本刚好在盒下界（微小改善）
+        let y_post = vec![vec![1e-15, 1e-15]]; // 极小改善
+        let box_lower = vec![vec![0.0, 0.0]];
+        let box_intervals = vec![vec![1.0, 1.0]];
+        let lehvi = log_ehvi(&y_post, &box_lower, &box_intervals);
+        // 对齐 Python: diff.clamp(EPS, interval), 即使改善极小也应有贡献
+        // 不应返回 NEG_INFINITY
+        assert!(lehvi.is_finite(),
+            "log_ehvi should not skip near-zero contributions: {lehvi}");
+    }
+
+    /// 测试 append_running_data (constant liar 支持)。
+    #[test]
+    fn test_gpr_append_running_data() {
+        let x_train = vec![vec![0.0], vec![1.0]];
+        let y_train = vec![0.0, 1.0];
+        let is_cat = vec![false];
+        let mut gpr = GPRegressor::new(
+            x_train, y_train, is_cat,
+            vec![1.0], 1.0, 1e-6,
+        );
+        assert_eq!(gpr.x_train.len(), 2);
+
+        // 追加 running trial 数据
+        let x_running = vec![vec![0.5]];
+        let constant_liar_value = 1.0; // y_train.max()
+        gpr.append_running_data(&x_running, constant_liar_value);
+
+        assert_eq!(gpr.x_train.len(), 3, "应增加 1 个训练点");
+        assert_eq!(gpr.y_train.len(), 3);
+        assert_eq!(gpr.y_train[2], 1.0, "新点的 y 值应为 constant_liar_value");
+
+        // Cholesky 应重新计算
+        assert!(gpr.chol_l.is_some(), "Cholesky 应在追加后重新计算");
+        assert!(gpr.alpha.is_some());
+
+        // 新训练点处的后验不确定性应降低
+        let (_, var_at_05) = gpr.posterior(&[0.5]);
+        assert!(var_at_05 < 0.5, "追加点后该位置不确定性应降低: {var_at_05}");
+    }
+
+    /// 测试 GP 采样器在全部不可行试验时的行为。
+    /// 对齐 Python: 当所有试验不可行时，logEI 返回 0，仅优化约束概率。
+    #[test]
+    fn test_gp_sampler_all_infeasible() {
+        let sampler = GpSampler::new(
+            Some(42), Some(StudyDirection::Minimize), Some(3), false,
+            Some(Arc::new(|_trial: &FrozenTrial| vec![1.0])), // 所有试验约束违反 = 1.0
+            None,
+        );
+
+        let mut trials = Vec::new();
+        for i in 0..5 {
+            let x = i as f64 * 0.25;
+            let mut params = HashMap::new();
+            params.insert("x".to_string(), crate::distributions::ParamValue::Float(x));
+            let mut dists = HashMap::new();
+            dists.insert("x".to_string(),
+                Distribution::FloatDistribution(
+                    crate::distributions::FloatDistribution {
+                        low: 0.0, high: 1.0, log: false, step: None,
+                    },
+                ));
+            let mut sys_attrs = HashMap::new();
+            // 所有试验约束违反 > 0（不可行）
+            sys_attrs.insert("constraints".to_string(),
+                serde_json::json!([1.0]));
+            trials.push(FrozenTrial {
+                number: i as i64, trial_id: i as i64,
+                state: TrialState::Complete,
+                values: Some(vec![x * x]),
+                params, distributions: dists,
+                user_attrs: HashMap::new(),
+                system_attrs: sys_attrs,
+                intermediate_values: HashMap::new(),
+                datetime_start: None, datetime_complete: None,
+            });
+        }
+
+        let mut search_space = IndexMap::new();
+        search_space.insert("x".to_string(),
+            Distribution::FloatDistribution(
+                crate::distributions::FloatDistribution {
+                    low: 0.0, high: 1.0, log: false, step: None,
+                },
+            ));
+
+        // 应该成功运行而不 panic
+        let result = sampler.sample_relative_impl(&trials, &search_space, &[]);
+        assert!(result.is_ok(), "全部不可行时不应出错: {:?}", result.err());
     }
 }

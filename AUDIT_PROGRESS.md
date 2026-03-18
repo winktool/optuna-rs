@@ -913,3 +913,52 @@ Rust 中以 `filter_trials` trait 方法实现于 `pruners/mod.rs`，被 `study/
 | src/samplers/gp.rs | 集成 optimize_acqf_mixed, 删除 random/perturb + 2 测试 |
 | src/samplers/mod.rs | 注册 gp_optim_mixed 模块 |
 | tests/test_cross_validation.py | 3 个新 Python 交叉验证测试 |
+
+---
+
+## Session 41 — GP 采集函数 + TPE 排名深度对齐
+
+### 修复清单
+
+| # | 严重度 | 区域 | 修复描述 |
+|---|--------|------|---------|
+| 1 | **HIGH** | GP warn_and_convert_inf | 修复 inf 值裁剪: 从 f64::MAX/MIN 改为该列有限值的 [min,max] 范围，对齐 Python `gp.warn_and_convert_inf` |
+| 2 | **HIGH** | GP ConstrainedLogEHVI | 多目标约束优化时仅用可行试验构建 Pareto/EHVI 盒分解，对齐 Python `Y_feasible` 逻辑；全部不可行时仅优化约束概率 |
+| 3 | **HIGH** | GP Constant Liar | 实现单目标无约束的 running trials 处理: `append_running_data` + 最佳常量说谎者策略，对齐 Python `LogEI(normalized_params_of_running_trials=...)` |
+| 4 | **MED** | GP logEI 尾部精度 | 实现 `erfcx` 缩放互补误差函数 + 两段式 log_ei: z >= -25 用主分支, z < -25 用 erfcx 尾部分支，对齐 Python `standard_logei` |
+| 5 | **MED** | GP LogPI 精度 | 实现高精度 `log_ndtr` (对数标准正态CDF): 3 段式计算覆盖 z > 6 / z >= -5 / z < -5，替代原有的 `normal_cdf().max(1e-30).ln()` |
+| 6 | **MED** | TPE n_below 排名 | 修复 `fast_non_domination_rank_with_n_below` 提前终止后遗漏未排名试验的 bug: 使用 usize::MAX 哨兵值追踪未分配试验 |
+| 7 | **LOW-MED** | GP EHVI 盒跳过 | 修复 `log_ehvi` 跳过 diff<=EPS 盒的行为: 改为 Python 的 `diff.clamp_(min=EPS, max=interval)` 保留微小贡献 |
+| 8 | **LOW** | GP stabilizing_noise | EPS 常量从 1e-10 改为 1e-12 (STABILIZING_NOISE)，对齐 Python `_EPS = 1e-12` |
+| 9 | **LOW** | GP ref_point | nextafter 偏移改为 `f64::from_bits(rp.to_bits().wrapping_add(1))`，精确模拟 Python `np.nextafter(rp, inf)` |
+| 10 | **LOW** | GP 热启动 | 多目标 Pareto 热启动改为随机选取 (`partial_shuffle`)，对齐 Python `rng.choice(n_pareto, replace=False)` |
+
+### 新增函数
+
+| 函数 | 文件 | 描述 |
+|------|------|------|
+| `warn_and_convert_inf` | gp.rs | 逐列有限范围裁剪非有限值 |
+| `erfcx` | gp.rs | 缩放互补误差函数 exp(x²)·erfc(x) |
+| `log_ndtr` | gp.rs | 高精度 log Φ(z)，3 段式渐近展开 |
+| `GPRegressor::append_running_data` | gp.rs | 追加 running trials 数据 (constant liar) |
+
+### 新增测试 (+8)
+
+| 测试 | 文件 | 验证内容 |
+|------|------|---------|
+| test_warn_and_convert_inf | gp.rs | 3 种场景: 全有限/部分inf/全inf列 |
+| test_log_ei_tail_precision | gp.rs | z=-24/-26/-40 的尾部精度 |
+| test_erfcx | gp.rs | erfcx(0)=1, 大正数渐近, 负数计算 |
+| test_log_ndtr | gp.rs | 6 个参考点覆盖三段 |
+| test_log_ehvi_no_skip | gp.rs | 微小改善盒不被跳过 |
+| test_gpr_append_running_data | gp.rs | 追加数据+Cholesky重算+不确定性降低 |
+| test_gp_sampler_all_infeasible | gp.rs | 全部不可行时正确运行 |
+| test_fast_non_domination_rank_n_below_all_remaining | sampler.rs | n_below 终止后所有剩余试验获得排名 |
+
+### 测试统计
+
+| 指标 | 值 |
+|------|---|
+| Rust 测试总数 | 965 (unit) + 5 (doc) |
+| 本次新增 Rust | +8 |
+| 修改文件数 | 2 (gp.rs, tpe/sampler.rs) |

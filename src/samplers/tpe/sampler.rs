@@ -582,7 +582,9 @@ impl TpeSampler {
             }
         }
 
-        let mut ranks = vec![0usize; n];
+        // 对齐 Python `_calculate_nondomination_rank`:
+        // 使用 usize::MAX 标记未分配排名
+        let mut ranks = vec![usize::MAX; n];
         let mut assigned = 0usize;
         let mut current_front: Vec<usize> = (0..n).filter(|&i| dominated_count[i] == 0).collect();
         let mut rank = 0;
@@ -599,16 +601,27 @@ impl TpeSampler {
                     }
                 }
             }
-            // 对齐 Python n_below 提前终止: 当已分配排名的数量 >= n_below 时停止
+            // 对齐 Python n_below 提前终止:
+            // 当已分配排名的数量 >= n_below 时停止。
+            // 对齐 Python: `ranks[indices] = rank` — 将所有剩余未分配的试验设为最差 rank。
             if assigned >= n_below {
-                // 将剩余未分配的试验设为下一个 rank
-                for &j in &next_front {
-                    ranks[j] = rank + 1;
+                let worst_rank = rank + 1;
+                for i in 0..n {
+                    if ranks[i] == usize::MAX {
+                        ranks[i] = worst_rank;
+                    }
                 }
                 break;
             }
             current_front = next_front;
             rank += 1;
+        }
+
+        // 无提前终止时标记孤立未排名的试验
+        for r in ranks.iter_mut() {
+            if *r == usize::MAX {
+                *r = rank;
+            }
         }
 
         ranks
@@ -1712,6 +1725,35 @@ mod tests {
         // n_below=None (默认): 全部计算
         let ranks_full = TpeSampler::fast_non_domination_rank_with_n_below(&loss_values, None);
         assert_eq!(ranks_full, vec![0, 1, 2]);
+    }
+
+    /// 测试 n_below 提前终止时所有剩余试验都获得正确排名。
+    /// 对齐 Python: `ranks[indices] = rank` — 所有未排名试验（不仅是 next_front）
+    /// 都设为最差 rank。此前有 bug: 只标了 next_front 而遗漏其余试验。
+    #[test]
+    fn test_fast_non_domination_rank_n_below_all_remaining() {
+        // 5 个试验: front-0 有 1 个, front-1 有 1 个, front-2 有 3 个
+        let loss_values = vec![
+            vec![1.0, 1.0],  // rank 0 (Pareto front)
+            vec![2.0, 2.0],  // rank 1
+            vec![3.0, 3.0],  // rank 2
+            vec![4.0, 4.0],  // rank 3
+            vec![5.0, 5.0],  // rank 4
+        ];
+
+        // n_below=1: 只排 front-0 的 1 个元素
+        let ranks = TpeSampler::fast_non_domination_rank_with_n_below(&loss_values, Some(1));
+        assert_eq!(ranks[0], 0, "front-0 trial");
+        // 关键测试: 所有剩余试验都应有 rank > 0
+        assert!(ranks[1] > 0, "trial 1 should have rank > 0: {}", ranks[1]);
+        assert!(ranks[2] > 0, "trial 2 should have rank > 0: {}", ranks[2]);
+        assert!(ranks[3] > 0, "trial 3 should have rank > 0: {}", ranks[3]);
+        assert!(ranks[4] > 0, "trial 4 should have rank > 0: {}", ranks[4]);
+        // 所有剩余试验应该在同一个 worst rank = 1
+        assert_eq!(ranks[1], 1);
+        assert_eq!(ranks[2], 1);
+        assert_eq!(ranks[3], 1);
+        assert_eq!(ranks[4], 1);
     }
 
     #[test]

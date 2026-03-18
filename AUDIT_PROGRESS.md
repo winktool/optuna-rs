@@ -1,6 +1,57 @@
 # optuna-rs 对齐 Python 审计进度报告
 
-## Session 37 — 全仓深度审计与修复
+## Session 41 — CMA-ES 深度对齐 + TPE EPS 修正
+
+### 修复清单
+
+| # | 严重度 | 区域 | 修复描述 |
+|---|--------|------|---------|
+| 1 | **HIGH** | CMA-ES 维度检查 | 状态恢复后检查维度是否匹配当前搜索空间，不匹配时回退独立采样，对齐 Python `if optimizer.dim != len(trans.bounds): warn(); return {}` |
+| 2 | **HIGH** | CMA-ES 重采样循环 | 将直接 clamp 改为 Python 的三层策略: 重采样 `10*n_dim` 次 → 全部失败才 clamp，对齐 Python `cmaes.CMA.ask()` 的 `_is_feasible` + `_repair_infeasible_params` |
+| 3 | **HIGH** | CMA-ES warm-start MGD | 实现完整 `get_warm_start_mgd` 算法: 排序→top γ%→均值+协方差→行列式分解 `(mean, sigma, cov)`，对齐 Python `cmaes.get_warm_start_mgd(gamma=0.1, alpha=0.1)` |
+| 4 | **LOW** | TPE EPS 常量 | `get_reference_point` 和 `calculate_mo_weights` 中 EPS 从 `1e-10` 修正为 `1e-12`，对齐 Python `EPS = 1e-12` |
+
+### 新增函数
+
+| 函数 | 文件 | 描述 |
+|------|------|------|
+| `CmaState::sample_solution` | cmaes.rs | 从当前分布采样一个候选解（无 clamp） |
+| `CmaState::is_feasible` | cmaes.rs | 检查候选解是否在 [0,1] 内 |
+| `CmaState::repair_infeasible_params` | cmaes.rs | 越界值 clamp 到 [0,1] |
+| `CmaEsSampler::get_warm_start_mgd` | cmaes.rs | MGD 热启动算法 (mean, sigma, cov) |
+| `CmaEsSampler::matrix_det` | cmaes.rs | LU 分解法行列式计算 |
+
+### 新增测试 (+15)
+
+| 测试 | 文件 | 验证内容 |
+|------|------|---------|
+| test_cmaes_ask_resampling_bounds | cmaes.rs | 大 sigma 下 ask() 重采样后值仍在 [0,1] |
+| test_cmaes_feasibility_check | cmaes.rs | is_feasible + repair_infeasible_params |
+| test_cmaes_sample_solution_raw | cmaes.rs | sample_solution 产生无 clamp 原始值 |
+| test_warm_start_mgd_basic | cmaes.rs | 20 solutions MGD 的 mean/sigma/cov |
+| test_warm_start_mgd_single_solution | cmaes.rs | 单解防御性 (Python 会 assert 失败) |
+| test_matrix_det | cmaes.rs | 2x2/3x3 identity, 非对角, 奇异矩阵 |
+| test_cmaes_dimension_change_fallback | cmaes.rs | 维度变化后回退独立采样 |
+| test_cmaes_source_trials_warm_start | cmaes.rs | 10 个 source trials 的 MGD 热启动 |
+| test_cmaes_separable | cmaes.rs | use_separable_cma=true 完整运行 |
+| test_cmaes_lr_adapt | cmaes.rs | lr_adapt=true 完整运行 |
+| test_cmaes_with_margin_int_params | cmaes.rs | with_margin + 整数参数 |
+| test_cmaes_maximize | cmaes.rs | Maximize 方向优化 |
+| test_cmaes_consider_pruned_trials | cmaes.rs | pruned 试验作为有效结果 |
+| test_cmaes_x0_initialization | cmaes.rs | x0 热启动 |
+| test_warm_start_mgd_cross_validate_python | cmaes.rs | 与 Python cmaes.get_warm_start_mgd 数值一致 |
+
+### 测试统计
+
+| 指标 | 值 |
+|------|---|
+| Rust 测试总数 | 980 (unit) + 5 (doc) |
+| 本次新增 | +15 |
+| 修改文件数 | 2 (cmaes.rs, tpe/sampler.rs) |
+
+---
+
+## Session 40 — GP 采集函数 + TPE 排名深度对齐 Python
 
 ### 审计状态总览
 

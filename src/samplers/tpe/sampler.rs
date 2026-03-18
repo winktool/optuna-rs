@@ -657,7 +657,7 @@ impl TpeSampler {
             }
         }
         // 对齐 Python: reference_point = max(1.1 * worst, 0.9 * worst); [==0] = EPS
-        let eps = 1e-10;
+        let eps = 1e-12;
         worst.iter().map(|&w| {
             if w == 0.0 { eps }
             else if w > 0.0 { 1.1 * w }
@@ -678,7 +678,8 @@ impl TpeSampler {
             return vec![];
         }
 
-        let eps = 1e-10_f64;
+        // 对齐 Python: EPS = 1e-12
+        let eps = 1e-12_f64;
 
         // 对齐 Python: 识别可行/不可行试验
         let is_feasible: Vec<bool> = below_trials.iter().map(|t| {

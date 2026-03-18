@@ -178,6 +178,10 @@ impl CmaState {
     }
 
     /// Sample a new candidate from the distribution.
+    ///
+    /// 对齐 Python cmaes.CMA.ask():
+    /// 先尝试重采样 n_max_resampling 次（默认 10*n_dim），
+    /// 仅当所有重采样均越界时才 clamp（_repair_infeasible_params）。
     fn ask(&mut self, rng: &mut ChaCha8Rng) -> Vec<f64> {
         if self.pending_idx < self.pending.len() {
             let result = self.pending[self.pending_idx].clone();
@@ -189,31 +193,67 @@ impl CmaState {
         self.pending.clear();
         self.pending_idx = 0;
 
-        for _ in 0..self.lambda {
-            let z: Vec<f64> = (0..self.n)
-                .map(|_| {
-                    StandardNormal.sample(&mut *rng)
-                })
-                .collect();
+        // 对齐 Python: n_max_resampling = 10 * n_dimension
+        let n_max_resampling = 10 * self.n;
 
-            // y = B * D * z
-            let mut y = vec![0.0; self.n];
-            for i in 0..self.n {
-                for j in 0..self.n {
-                    y[i] += self.b[i][j] * self.eigenvalues[j].sqrt() * z[j];
+        for _ in 0..self.lambda {
+            let mut x = None;
+
+            // 对齐 Python cmaes.CMA.ask(): 重采样循环
+            for _ in 0..n_max_resampling {
+                let candidate = self.sample_solution(rng);
+                if self.is_feasible(&candidate) {
+                    x = Some(candidate);
+                    break;
                 }
             }
 
-            // x = mean + sigma * y
-            let x: Vec<f64> = (0..self.n)
-                .map(|i| (self.mean[i] + self.sigma * y[i]).clamp(0.0, 1.0))
-                .collect();
+            // 对齐 Python cmaes.CMA._repair_infeasible_params():
+            // 所有重采样失败后，采样一次并 clamp
+            let x = x.unwrap_or_else(|| {
+                let candidate = self.sample_solution(rng);
+                self.repair_infeasible_params(&candidate)
+            });
+
             self.pending.push(x);
         }
 
         let result = self.pending[self.pending_idx].clone();
         self.pending_idx += 1;
         result
+    }
+
+    /// 对齐 Python cmaes.CMA._sample_solution():
+    /// 从当前分布采样一个候选解。
+    fn sample_solution(&self, rng: &mut ChaCha8Rng) -> Vec<f64> {
+        let z: Vec<f64> = (0..self.n)
+            .map(|_| StandardNormal.sample(&mut *rng))
+            .collect();
+
+        // y = B * D * z
+        let mut y = vec![0.0; self.n];
+        for i in 0..self.n {
+            for j in 0..self.n {
+                y[i] += self.b[i][j] * self.eigenvalues[j].sqrt() * z[j];
+            }
+        }
+
+        // x = mean + sigma * y
+        (0..self.n)
+            .map(|i| self.mean[i] + self.sigma * y[i])
+            .collect()
+    }
+
+    /// 对齐 Python cmaes.CMA._is_feasible():
+    /// 检查候选解是否在 bounds [0, 1] 内。
+    fn is_feasible(&self, x: &[f64]) -> bool {
+        x.iter().all(|&v| (0.0..=1.0).contains(&v))
+    }
+
+    /// 对齐 Python cmaes.CMA._repair_infeasible_params():
+    /// 将越界值 clamp 到合法范围 [0, 1]。
+    fn repair_infeasible_params(&self, x: &[f64]) -> Vec<f64> {
+        x.iter().map(|&v| v.clamp(0.0, 1.0)).collect()
     }
 
     /// Record a result and update if generation is complete.
@@ -560,6 +600,113 @@ impl CmaEsSampler {
         }
         None
     }
+
+    /// 对齐 Python `cmaes.get_warm_start_mgd(source_solutions, gamma=0.1, alpha=0.1)`:
+    /// 从 source trials 估计多元高斯分布参数 (mean, sigma, cov)。
+    ///
+    /// 算法:
+    /// 1. 按目标值排序，取 top gamma% 的解
+    /// 2. 计算均值 mean
+    /// 3. 计算协方差 Sigma = alpha^2 * I + (1/n) * sum(x * x^T) - mean * mean^T
+    /// 4. 分解 sigma = det(Sigma)^(1/(2*dim)), cov = Sigma / det(Sigma)^(1/dim)
+    fn get_warm_start_mgd(
+        source_solutions: &[(Vec<f64>, f64)],
+        dim: usize,
+    ) -> (Vec<f64>, f64, Vec<Vec<f64>>) {
+        const GAMMA: f64 = 0.1;
+        const ALPHA: f64 = 0.1;
+
+        // 1. 按目标值排序（升序 = 最小化）
+        let mut sorted: Vec<(Vec<f64>, f64)> = source_solutions.to_vec();
+        sorted.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
+
+        // 2. 取 top gamma% 的解（至少 1 个）
+        let gamma_n = ((sorted.len() as f64 * GAMMA).floor() as usize).max(1);
+        let top_solutions: Vec<&Vec<f64>> = sorted[..gamma_n].iter().map(|(x, _)| x).collect();
+
+        // 3. 计算均值
+        let mut mean = vec![0.0; dim];
+        for x in &top_solutions {
+            for i in 0..dim {
+                mean[i] += x[i];
+            }
+        }
+        for i in 0..dim {
+            mean[i] /= gamma_n as f64;
+        }
+
+        // 4. 计算协方差: Sigma = alpha^2 * I + (1/n) * sum(x*x^T) - mean*mean^T
+        let mut sigma_mat = vec![vec![0.0; dim]; dim];
+        // alpha^2 * I (正则化项)
+        for i in 0..dim {
+            sigma_mat[i][i] = ALPHA * ALPHA;
+        }
+        // (1/n) * sum(x * x^T)
+        for x in &top_solutions {
+            for i in 0..dim {
+                for j in 0..dim {
+                    sigma_mat[i][j] += x[i] * x[j] / gamma_n as f64;
+                }
+            }
+        }
+        // - mean * mean^T
+        for i in 0..dim {
+            for j in 0..dim {
+                sigma_mat[i][j] -= mean[i] * mean[j];
+            }
+        }
+
+        // 5. 分解 sigma 和归一化 cov
+        // det(Sigma) 通过 LU 分解或对角近似计算
+        // 这里使用特征值积来计算行列式
+        let det = Self::matrix_det(&sigma_mat, dim);
+        let det_abs = det.abs().max(1e-300); // 避免零行列式
+
+        let sigma = det_abs.powf(1.0 / (2.0 * dim as f64));
+        let det_norm = det_abs.powf(1.0 / dim as f64);
+
+        let mut cov = vec![vec![0.0; dim]; dim];
+        for i in 0..dim {
+            for j in 0..dim {
+                cov[i][j] = sigma_mat[i][j] / det_norm;
+            }
+        }
+
+        (mean, sigma, cov)
+    }
+
+    /// 计算矩阵行列式（LU 分解法）。
+    fn matrix_det(mat: &[Vec<f64>], n: usize) -> f64 {
+        // Gaussian elimination with partial pivoting
+        let mut a: Vec<Vec<f64>> = mat.to_vec();
+        let mut det = 1.0;
+        for col in 0..n {
+            // Find pivot
+            let mut max_val = a[col][col].abs();
+            let mut max_row = col;
+            for row in (col + 1)..n {
+                if a[row][col].abs() > max_val {
+                    max_val = a[row][col].abs();
+                    max_row = row;
+                }
+            }
+            if max_val < 1e-300 {
+                return 0.0;
+            }
+            if max_row != col {
+                a.swap(col, max_row);
+                det = -det;
+            }
+            det *= a[col][col];
+            for row in (col + 1)..n {
+                let factor = a[row][col] / a[col][col];
+                for j in (col + 1)..n {
+                    a[row][j] -= factor * a[col][j];
+                }
+            }
+        }
+        det
+    }
 }
 
 impl Sampler for CmaEsSampler {
@@ -635,6 +782,16 @@ impl Sampler for CmaEsSampler {
             // 优先从最近的已完成 trial 的 system_attrs 恢复状态
             let restored = Self::try_restore_state(complete.iter().rev().copied());
             if let Some(restored_state) = restored {
+                // 对齐 Python: 检查恢复的状态维度是否匹配当前搜索空间
+                // Python: `if optimizer.dim != len(trans.bounds): warn(); return {}`
+                if restored_state.n != n_dims {
+                    crate::optuna_warn!(
+                        "CMA-ES state dimension ({}) doesn't match search space ({}). \
+                         Falling back to independent sampling.",
+                        restored_state.n, n_dims
+                    );
+                    return Ok(HashMap::new());
+                }
                 *state_guard = Some(restored_state);
             } else {
             // 对齐 Python: sigma0 默认值 = min(upper - lower) / 6
@@ -670,31 +827,71 @@ impl Sampler for CmaEsSampler {
                     vec![0.5; n_dims]
                 }
             } else if let Some(ref source) = self.source_trials {
-                // Warm-start from source trials: use the best source trial
-                let best_source = source
-                    .iter()
-                    .filter(|t| t.state == TrialState::Complete && t.values.is_some())
-                    .min_by(|a, b| {
-                        let va = a.values.as_ref().unwrap()[0];
-                        let vb = b.values.as_ref().unwrap()[0];
-                        let va = if self.direction == StudyDirection::Maximize { -va } else { va };
-                        let vb = if self.direction == StudyDirection::Maximize { -vb } else { vb };
-                        va.partial_cmp(&vb).unwrap_or(std::cmp::Ordering::Equal)
-                    });
-                if let Some(bt) = best_source {
-                    let mut bp = IndexMap::new();
+                // 对齐 Python: get_warm_start_mgd 算法
+                // 从 source_trials 中估计 (mean, sigma, cov) 用于初始化 CMA-ES
+                let sign = if self.direction == StudyDirection::Maximize { -1.0 } else { 1.0 };
+                let expected_states = [TrialState::Complete];
+                let mut source_solutions: Vec<(Vec<f64>, f64)> = Vec::new();
+                for t in source {
+                    if !expected_states.contains(&t.state) {
+                        continue;
+                    }
+                    let vals = match &t.values {
+                        Some(v) if !v.is_empty() => v,
+                        _ => continue,
+                    };
+                    // 检查搜索空间兼容性：所有参数必须存在且分布兼容
+                    let mut trial_params = IndexMap::new();
+                    let mut compatible = true;
                     for name in &param_names {
-                        if let Some(pv) = bt.params.get(name) {
-                            bp.insert(name.clone(), pv.clone());
+                        if let Some(pv) = t.params.get(name) {
+                            trial_params.insert(name.clone(), pv.clone());
+                        } else {
+                            compatible = false;
+                            break;
                         }
                     }
-                    if bp.len() == ordered_space.len() {
-                        transform.transform(&bp)
-                    } else {
-                        vec![0.5; n_dims]
+                    if !compatible || trial_params.len() != ordered_space.len() {
+                        continue;
                     }
-                } else {
+                    let encoded = transform.transform(&trial_params);
+                    source_solutions.push((encoded, sign * vals[0]));
+                }
+
+                if source_solutions.is_empty() {
+                    crate::optuna_warn!("No compatible source_trials found. Using center.");
                     vec![0.5; n_dims]
+                } else {
+                    // 对齐 Python cmaes.get_warm_start_mgd(gamma=0.1, alpha=0.1)
+                    let (mgd_mean, mgd_sigma, mgd_cov) =
+                        Self::get_warm_start_mgd(&source_solutions, n_dims);
+
+                    // 用 MGD 结果构造 CmaState，跳过默认初始化
+                    let lambda_val = self.popsize.unwrap_or_else(|| Self::default_popsize(n_dims));
+                    let mut new_state =
+                        CmaState::new(mgd_mean, mgd_sigma, lambda_val, param_names.clone());
+                    // 设置协方差矩阵（归一化后的）
+                    new_state.c = mgd_cov;
+                    new_state.update_eigen();
+                    *state_guard = Some(new_state);
+
+                    // 已经初始化了 state，直接跳到 ask
+                    let state = state_guard.as_mut().unwrap();
+                    let candidate = state.ask(&mut rng);
+
+                    drop(rng);
+                    drop(state_guard);
+
+                    // Untransform
+                    let decoded = transform.untransform(&candidate)?;
+                    let mut result = HashMap::new();
+                    for (name, dist) in &ordered_space {
+                        if let Some(pv) = decoded.get(name) {
+                            let internal = dist.to_internal_repr(pv)?;
+                            result.insert(name.clone(), internal);
+                        }
+                    }
+                    return Ok(result);
                 }
             } else {
                 // 对齐 Python: 使用搜索空间的中心作为初始均值
@@ -1368,5 +1565,461 @@ mod tests {
             t.system_attrs.contains_key("cma:generation")
         });
         assert!(has_gen, "至少一个 trial 应包含 generation 标记");
+    }
+
+    /// 对齐 Python: CMA-ES ask() 重采样 vs clamp
+    /// 验证 ask() 返回的候选解在 [0, 1] 范围内
+    #[test]
+    fn test_cmaes_ask_resampling_bounds() {
+        let mut rng = ChaCha8Rng::seed_from_u64(42);
+        // 使用 sigma=2.0 让样本容易越界, 触发重采样逻辑
+        let mut state = CmaState::new(
+            vec![0.5, 0.5],
+            2.0, // 大 sigma → 容易越界
+            6,
+            vec!["x".into(), "y".into()],
+        );
+
+        // 产生多个批次的候选解
+        for _ in 0..5 {
+            for _ in 0..state.lambda {
+                let x = state.ask(&mut rng);
+                for &v in &x {
+                    assert!(
+                        (0.0..=1.0).contains(&v),
+                        "ask() 返回的值 {v} 超出 [0, 1]"
+                    );
+                }
+                // 模拟 tell 以触发下一代
+                state.tell(x, rand_distr::Distribution::sample(&StandardNormal, &mut rng));
+            }
+        }
+    }
+
+    /// 对齐 Python: is_feasible 和 repair_infeasible_params
+    #[test]
+    fn test_cmaes_feasibility_check() {
+        let state = CmaState::new(vec![0.5], 0.1, 4, vec!["x".into()]);
+        // 可行值
+        assert!(state.is_feasible(&[0.0]));
+        assert!(state.is_feasible(&[0.5]));
+        assert!(state.is_feasible(&[1.0]));
+        // 不可行值
+        assert!(!state.is_feasible(&[-0.01]));
+        assert!(!state.is_feasible(&[1.01]));
+
+        // repair
+        let repaired = state.repair_infeasible_params(&[-0.5, 1.5, 0.5]);
+        assert_eq!(repaired, vec![0.0, 1.0, 0.5]);
+    }
+
+    /// 对齐 Python: sample_solution 产生无 clamp 的原始样本
+    #[test]
+    fn test_cmaes_sample_solution_raw() {
+        let mut rng = ChaCha8Rng::seed_from_u64(99);
+        let state = CmaState::new(
+            vec![0.5, 0.5],
+            5.0, // 极大 sigma → 几乎一定越界
+            4,
+            vec!["x".into(), "y".into()],
+        );
+        // 采 100 次，至少有一些越界的
+        let mut any_out = false;
+        for _ in 0..100 {
+            let x = state.sample_solution(&mut rng);
+            for &v in &x {
+                if v < 0.0 || v > 1.0 {
+                    any_out = true;
+                }
+            }
+        }
+        assert!(any_out, "大 sigma 下 sample_solution 应产生越界值");
+    }
+
+    /// 对齐 Python: get_warm_start_mgd 算法
+    /// 验证 MGD 估计的 mean ≈ source solutions 的 top-10% 均值
+    #[test]
+    fn test_warm_start_mgd_basic() {
+        // 构造 20 个 2D source solutions
+        let mut solutions = Vec::new();
+        for i in 0..20 {
+            let x = vec![0.3 + i as f64 * 0.01, 0.4 + i as f64 * 0.01];
+            let value = (x[0] - 0.3).powi(2) + (x[1] - 0.4).powi(2);
+            solutions.push((x, value));
+        }
+        let (mean, sigma, cov) = CmaEsSampler::get_warm_start_mgd(&solutions, 2);
+
+        // top 10% = top 2 → 最好的两个是 i=0, i=1
+        // mean ≈ [0.305, 0.405]
+        assert!((mean[0] - 0.305).abs() < 1e-6, "mean[0] = {}", mean[0]);
+        assert!((mean[1] - 0.405).abs() < 1e-6, "mean[1] = {}", mean[1]);
+
+        // sigma > 0
+        assert!(sigma > 0.0, "sigma 应为正数: {sigma}");
+
+        // cov 应为 2x2 正定矩阵
+        assert_eq!(cov.len(), 2);
+        assert_eq!(cov[0].len(), 2);
+        assert!(cov[0][0] > 0.0, "cov[0][0] 应为正数");
+        assert!(cov[1][1] > 0.0, "cov[1][1] 应为正数");
+    }
+
+    /// 对齐 Python: get_warm_start_mgd 单解情况
+    /// 注意: Python cmaes.get_warm_start_mgd 对单解 (gamma=0.1) 会 assert 失败，
+    /// 因为 floor(1 * 0.1) = 0 < 1。我们的实现用 max(1) 做了防御，
+    /// 结果等价于 alpha^2*I 的协方差。
+    #[test]
+    fn test_warm_start_mgd_single_solution() {
+        let solutions = vec![(vec![0.3, 0.7], 1.0)];
+        let (mean, sigma, cov) = CmaEsSampler::get_warm_start_mgd(&solutions, 2);
+
+        // gamma_n = max(floor(1 * 0.1), 1) = 1, 用唯一解
+        assert!((mean[0] - 0.3).abs() < 1e-10);
+        assert!((mean[1] - 0.7).abs() < 1e-10);
+        // sigma = det(alpha^2 * I)^(1/(2*dim)) = (0.01^2)^(1/4) = 0.1
+        assert!((sigma - 0.1).abs() < 1e-10, "sigma = {sigma}");
+        // cov = (alpha^2 * I) / det(alpha^2 * I)^(1/dim) = I
+        assert!((cov[0][0] - 1.0).abs() < 1e-10, "cov[0][0] = {}", cov[0][0]);
+        assert!((cov[1][1] - 1.0).abs() < 1e-10, "cov[1][1] = {}", cov[1][1]);
+    }
+
+    /// 对齐 Python: matrix_det 行列式计算
+    #[test]
+    fn test_matrix_det() {
+        // 2x2 identity → det = 1
+        let id2 = vec![vec![1.0, 0.0], vec![0.0, 1.0]];
+        assert!((CmaEsSampler::matrix_det(&id2, 2) - 1.0).abs() < 1e-10);
+
+        // [[2, 1], [1, 3]] → det = 5
+        let m2 = vec![vec![2.0, 1.0], vec![1.0, 3.0]];
+        assert!((CmaEsSampler::matrix_det(&m2, 2) - 5.0).abs() < 1e-10);
+
+        // 3x3 identity → det = 1
+        let id3 = vec![vec![1.0, 0.0, 0.0], vec![0.0, 1.0, 0.0], vec![0.0, 0.0, 1.0]];
+        assert!((CmaEsSampler::matrix_det(&id3, 3) - 1.0).abs() < 1e-10);
+
+        // 奇异矩阵 → det = 0
+        let singular = vec![vec![1.0, 2.0], vec![2.0, 4.0]];
+        assert!(CmaEsSampler::matrix_det(&singular, 2).abs() < 1e-10);
+    }
+
+    /// 对齐 Python: 维度变化时 CMA-ES 回退到独立采样
+    #[test]
+    fn test_cmaes_dimension_change_fallback() {
+        let sampler: Arc<dyn Sampler> = Arc::new(CmaEsSampler::new(
+            StudyDirection::Minimize,
+            Some(0.5), Some(3), Some(6),
+            None, Some(42), None,
+            false, false, false, false, None,
+        ));
+
+        let study = create_study(
+            None, Some(sampler), None, None,
+            Some(StudyDirection::Minimize), None, false,
+        ).unwrap();
+
+        // Phase 1: 用 2 个参数运行
+        study.optimize(
+            |trial| {
+                let x = trial.suggest_float("x", -5.0, 5.0, false, None)?;
+                let y = trial.suggest_float("y", -5.0, 5.0, false, None)?;
+                Ok(x * x + y * y)
+            },
+            Some(15),
+            None, None,
+        ).unwrap();
+
+        let n1 = study.trials().unwrap().len();
+        assert_eq!(n1, 15);
+
+        // Phase 2: 用 3 个参数运行 → 维度变化，CMA-ES 应回退
+        study.optimize(
+            |trial| {
+                let x = trial.suggest_float("x", -5.0, 5.0, false, None)?;
+                let y = trial.suggest_float("y", -5.0, 5.0, false, None)?;
+                let z = trial.suggest_float("z", -5.0, 5.0, false, None)?;
+                Ok(x * x + y * y + z * z)
+            },
+            Some(5),
+            None, None,
+        ).unwrap();
+
+        assert_eq!(study.trials().unwrap().len(), 20);
+    }
+
+    /// 对齐 Python: CMA-ES with source_trials (warm-start MGD)
+    #[test]
+    fn test_cmaes_source_trials_warm_start() {
+        let now = chrono::Utc::now();
+        // 创建一些 source trials 模拟另一个 study 的结果
+        let source_trials: Vec<FrozenTrial> = (0..10).map(|i| {
+            let x_val = 0.5 + i as f64 * 0.1;
+            let y_val = -0.5 + i as f64 * 0.1;
+            let mut params = HashMap::new();
+            params.insert("x".to_string(),
+                crate::distributions::ParamValue::Float(x_val));
+            params.insert("y".to_string(),
+                crate::distributions::ParamValue::Float(y_val));
+            let mut dists = HashMap::new();
+            dists.insert("x".to_string(),
+                Distribution::FloatDistribution(
+                    crate::distributions::FloatDistribution::new(-5.0, 5.0, false, None).unwrap()));
+            dists.insert("y".to_string(),
+                Distribution::FloatDistribution(
+                    crate::distributions::FloatDistribution::new(-5.0, 5.0, false, None).unwrap()));
+            FrozenTrial {
+                number: i, trial_id: i as i64,
+                state: TrialState::Complete,
+                values: Some(vec![(x_val - 1.0).powi(2) + (y_val + 1.0).powi(2)]),
+                datetime_start: Some(now), datetime_complete: Some(now),
+                params, distributions: dists,
+                user_attrs: HashMap::new(),
+                system_attrs: HashMap::new(),
+                intermediate_values: HashMap::new(),
+            }
+        }).collect();
+
+        let sampler: Arc<dyn Sampler> = Arc::new(
+            CmaEsSamplerBuilder::new(StudyDirection::Minimize)
+                .n_startup_trials(3)
+                .popsize(6)
+                .seed(42)
+                .source_trials(source_trials)
+                .build()
+        );
+
+        let study = create_study(
+            None, Some(sampler), None, None,
+            Some(StudyDirection::Minimize), None, false,
+        ).unwrap();
+
+        study.optimize(
+            |trial| {
+                let x = trial.suggest_float("x", -5.0, 5.0, false, None)?;
+                let y = trial.suggest_float("y", -5.0, 5.0, false, None)?;
+                Ok((x - 1.0).powi(2) + (y + 1.0).powi(2))
+            },
+            Some(30),
+            None, None,
+        ).unwrap();
+
+        assert_eq!(study.trials().unwrap().len(), 30);
+        let best = study.best_value().unwrap();
+        // warm-start 应帮助找到更好的解
+        assert!(best < 10.0, "warm-start 应该有效, got best={best}");
+    }
+
+    /// 对齐 Python: CMA-ES with separable CMA
+    #[test]
+    fn test_cmaes_separable() {
+        let sampler: Arc<dyn Sampler> = Arc::new(
+            CmaEsSamplerBuilder::new(StudyDirection::Minimize)
+                .sigma0(0.5)
+                .n_startup_trials(5)
+                .popsize(8)
+                .seed(42)
+                .use_separable_cma(true)
+                .build()
+        );
+        let study = create_study(
+            None, Some(sampler), None, None,
+            Some(StudyDirection::Minimize), None, false,
+        ).unwrap();
+        study.optimize(
+            |trial| {
+                let x = trial.suggest_float("x", -5.0, 5.0, false, None)?;
+                let y = trial.suggest_float("y", -5.0, 5.0, false, None)?;
+                Ok(x * x + y * y)
+            },
+            Some(40),
+            None, None,
+        ).unwrap();
+        assert_eq!(study.trials().unwrap().len(), 40);
+    }
+
+    /// 对齐 Python: CMA-ES with lr_adapt
+    #[test]
+    fn test_cmaes_lr_adapt() {
+        let sampler: Arc<dyn Sampler> = Arc::new(
+            CmaEsSamplerBuilder::new(StudyDirection::Minimize)
+                .sigma0(0.5)
+                .n_startup_trials(5)
+                .popsize(8)
+                .seed(42)
+                .lr_adapt(true)
+                .build()
+        );
+        let study = create_study(
+            None, Some(sampler), None, None,
+            Some(StudyDirection::Minimize), None, false,
+        ).unwrap();
+        study.optimize(
+            |trial| {
+                let x = trial.suggest_float("x", -5.0, 5.0, false, None)?;
+                let y = trial.suggest_float("y", -5.0, 5.0, false, None)?;
+                Ok(x * x + y * y)
+            },
+            Some(40),
+            None, None,
+        ).unwrap();
+        assert_eq!(study.trials().unwrap().len(), 40);
+    }
+
+    /// 对齐 Python: CMA-ES with with_margin
+    #[test]
+    fn test_cmaes_with_margin_int_params() {
+        let sampler: Arc<dyn Sampler> = Arc::new(
+            CmaEsSamplerBuilder::new(StudyDirection::Minimize)
+                .sigma0(0.5)
+                .n_startup_trials(3)
+                .popsize(6)
+                .seed(42)
+                .with_margin(true)
+                .build()
+        );
+        let study = create_study(
+            None, Some(sampler), None, None,
+            Some(StudyDirection::Minimize), None, false,
+        ).unwrap();
+        study.optimize(
+            |trial| {
+                let x = trial.suggest_int("x", -10, 10, false, 1)?;
+                let y = trial.suggest_int("y", -10, 10, false, 1)?;
+                Ok((x * x + y * y) as f64)
+            },
+            Some(30),
+            None, None,
+        ).unwrap();
+        assert_eq!(study.trials().unwrap().len(), 30);
+    }
+
+    /// 对齐 Python: CMA-ES maximize direction
+    #[test]
+    fn test_cmaes_maximize() {
+        let sampler: Arc<dyn Sampler> = Arc::new(
+            CmaEsSamplerBuilder::new(StudyDirection::Maximize)
+                .sigma0(0.5)
+                .n_startup_trials(5)
+                .popsize(6)
+                .seed(42)
+                .build()
+        );
+        let study = create_study(
+            None, Some(sampler), None, None,
+            Some(StudyDirection::Maximize), None, false,
+        ).unwrap();
+        study.optimize(
+            |trial| {
+                let x = trial.suggest_float("x", -5.0, 5.0, false, None)?;
+                Ok(-(x - 2.0).powi(2) + 10.0)
+            },
+            Some(40),
+            None, None,
+        ).unwrap();
+        let best = study.best_value().unwrap();
+        assert!(best > 5.0, "maximize 应该找到近最优解, got {best}");
+    }
+
+    /// 对齐 Python: consider_pruned_trials
+    #[test]
+    fn test_cmaes_consider_pruned_trials() {
+        let sampler: Arc<dyn Sampler> = Arc::new(
+            CmaEsSamplerBuilder::new(StudyDirection::Minimize)
+                .sigma0(0.5)
+                .n_startup_trials(3)
+                .popsize(6)
+                .seed(42)
+                .consider_pruned_trials(true)
+                .build()
+        );
+        let study = create_study(
+            None, Some(sampler), None, None,
+            Some(StudyDirection::Minimize), None, false,
+        ).unwrap();
+        study.optimize(
+            |trial| {
+                let x = trial.suggest_float("x", -5.0, 5.0, false, None)?;
+                // 报告中间值
+                trial.report(x * x, 0)?;
+                if trial.number() < 5 {
+                    // 前 5 个试验被剪枝
+                    return Err(crate::error::OptunaError::TrialPruned);
+                }
+                Ok(x * x)
+            },
+            Some(30),
+            None, None,
+        ).unwrap();
+        assert_eq!(study.trials().unwrap().len(), 30);
+    }
+
+    /// 对齐 Python: x0 初始化
+    #[test]
+    fn test_cmaes_x0_initialization() {
+        let mut x0 = HashMap::new();
+        x0.insert("x".to_string(), 2.0);
+        x0.insert("y".to_string(), -1.0);
+
+        let sampler: Arc<dyn Sampler> = Arc::new(
+            CmaEsSamplerBuilder::new(StudyDirection::Minimize)
+                .sigma0(0.5)
+                .n_startup_trials(3)
+                .popsize(6)
+                .seed(42)
+                .x0(x0)
+                .build()
+        );
+        let study = create_study(
+            None, Some(sampler), None, None,
+            Some(StudyDirection::Minimize), None, false,
+        ).unwrap();
+        study.optimize(
+            |trial| {
+                let x = trial.suggest_float("x", -5.0, 5.0, false, None)?;
+                let y = trial.suggest_float("y", -5.0, 5.0, false, None)?;
+                Ok((x - 2.0).powi(2) + (y + 1.0).powi(2))
+            },
+            Some(30),
+            None, None,
+        ).unwrap();
+        let best = study.best_value().unwrap();
+        assert!(best < 5.0, "x0 warm-start 应帮助找到近最优解, got {best}");
+    }
+
+    /// Python 交叉验证: get_warm_start_mgd 与 Python cmaes.get_warm_start_mgd 结果一致
+    /// Python 验证值:
+    ///   mean = [0.305, 0.405]
+    ///   sigma = 0.10012476630625274
+    ///   cov_diag ≈ [1.00000311, 1.00000311]
+    ///   cov[0][1] ≈ 0.002493773340268805
+    #[test]
+    fn test_warm_start_mgd_cross_validate_python() {
+        let mut solutions = Vec::new();
+        for i in 0..20 {
+            let x = vec![0.3 + i as f64 * 0.01, 0.4 + i as f64 * 0.01];
+            let value = (x[0] - 0.3).powi(2) + (x[1] - 0.4).powi(2);
+            solutions.push((x, value));
+        }
+        let (mean, sigma, cov) = CmaEsSampler::get_warm_start_mgd(&solutions, 2);
+
+        // 与 Python cmaes.get_warm_start_mgd 结果对比
+        assert!((mean[0] - 0.305).abs() < 1e-10, "mean[0] = {}", mean[0]);
+        assert!((mean[1] - 0.405).abs() < 1e-10, "mean[1] = {}", mean[1]);
+        assert!(
+            (sigma - 0.10012476630625274).abs() < 1e-8,
+            "sigma = {sigma}, expected 0.10012476630625274"
+        );
+        assert!(
+            (cov[0][0] - 1.00000311).abs() < 1e-5,
+            "cov[0][0] = {}, expected ~1.00000311", cov[0][0]
+        );
+        assert!(
+            (cov[1][1] - 1.00000311).abs() < 1e-5,
+            "cov[1][1] = {}, expected ~1.00000311", cov[1][1]
+        );
+        assert!(
+            (cov[0][1] - 0.002493773340268805).abs() < 1e-5,
+            "cov[0][1] = {}, expected ~0.00249", cov[0][1]
+        );
     }
 }

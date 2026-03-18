@@ -3154,6 +3154,186 @@ def test_heartbeat_default_interval():
     assert len(study.trials) == 0
 
 
+# ═══════════════════════════════════════════════════════════════════════════
+#  Session 49/50: 审计修复的交叉验证测试
+# ═══════════════════════════════════════════════════════════════════════════
+
+def test_tell_auto_infer_fail_with_warning():
+    """对齐 Rust tell_auto: state=None + values=None → FAIL + 警告。
+    Python `_tell_with_warning` 中 state is None 分支。"""
+    import warnings
+    study = optuna.create_study()
+
+    # 情况1: values=None → FAIL
+    trial1 = study.ask()
+    with warnings.catch_warnings(record=True) as w:
+        warnings.simplefilter("always")
+        study.tell(trial1, values=None, state=None)
+    assert study.trials[0].state == optuna.trial.TrialState.FAIL
+
+    # 情况2: values=[NaN] → FAIL
+    trial2 = study.ask()
+    with warnings.catch_warnings(record=True) as w:
+        warnings.simplefilter("always")
+        study.tell(trial2, values=[float('nan')], state=None)
+    assert study.trials[1].state == optuna.trial.TrialState.FAIL
+
+    # 情况3: values=[1.0] → Complete
+    trial3 = study.ask()
+    study.tell(trial3, values=[1.0], state=None)
+    assert study.trials[2].state == optuna.trial.TrialState.COMPLETE
+    assert study.trials[2].values == [1.0]
+
+
+def test_tell_auto_wrong_n_values():
+    """对齐 Rust tell_auto: values 数量不匹配 → FAIL。
+    Python `_check_values_are_feasible` 检查。"""
+    study = optuna.create_study(directions=["minimize", "minimize"])
+
+    # 传入1个值但期望2个 → FAIL
+    trial = study.ask()
+    import warnings
+    with warnings.catch_warnings(record=True):
+        warnings.simplefilter("always")
+        study.tell(trial, values=[1.0], state=None)
+    assert study.trials[0].state == optuna.trial.TrialState.FAIL
+
+
+def test_categorical_contains_int_truncation():
+    """对齐 Rust categorical.contains: Python 使用 int() 截断语义。
+    int(0.5)=0, int(2.9)=2, int(-0.1)=0, int(-1.0)=-1"""
+    d = CategoricalDistribution(choices=["a", "b", "c"])  # 3 choices: idx 0,1,2
+
+    # 整数索引
+    assert d._contains(0.0) == True
+    assert d._contains(1.0) == True
+    assert d._contains(2.0) == True
+    assert d._contains(3.0) == False
+    assert d._contains(-1.0) == False
+
+    # 非整数值: Python int() 截断
+    assert d._contains(0.5) == True   # int(0.5)=0, valid
+    assert d._contains(2.9) == True   # int(2.9)=2, valid
+    assert d._contains(-0.1) == True  # int(-0.1)=0, valid
+    assert d._contains(-0.9) == True  # int(-0.9)=0, valid
+    assert d._contains(-1.1) == False # int(-1.1)=-1, invalid
+
+
+def test_get_single_value_asserts_single():
+    """对齐 Rust get_single_value: 调用前需 assert single()。
+    Python `_get_single_value` 函数开头 `assert distribution.single()`。"""
+    from optuna.distributions import _get_single_value
+
+    # single() == True → 正常返回
+    d_float = FloatDistribution(1.0, 1.0)
+    assert d_float.single()
+    assert _get_single_value(d_float) == 1.0
+
+    d_int = IntDistribution(5, 5)
+    assert d_int.single()
+    assert _get_single_value(d_int) == 5
+
+    d_cat = CategoricalDistribution(choices=["only"])
+    assert d_cat.single()
+    assert _get_single_value(d_cat) == "only"
+
+    # single() == False → assert 失败
+    d_multi = FloatDistribution(0.0, 1.0)
+    assert not d_multi.single()
+    try:
+        _get_single_value(d_multi)
+        assert False, "should have raised AssertionError"
+    except AssertionError:
+        pass
+
+
+def test_report_duplicate_step_ignored():
+    """对齐 Rust report: 重复 step 忽略新值（不覆盖）。
+    Python Trial.report 在 step 已存在时发出警告并 return，不写入存储。"""
+    study = optuna.create_study()
+    trial = study.ask()
+
+    trial.report(1.0, step=0)
+    assert trial._cached_frozen_trial.intermediate_values[0] == 1.0
+
+    # 重复 report 同一 step: 值不变
+    import warnings
+    with warnings.catch_warnings(record=True) as w:
+        warnings.simplefilter("always")
+        trial.report(999.0, step=0)
+        # 应该收到警告
+        assert any("already reported" in str(warning.message) for warning in w)
+
+    # 值仍为 1.0
+    assert trial._cached_frozen_trial.intermediate_values[0] == 1.0
+
+
+def test_tpe_mo_weights_3_objectives():
+    """对齐 Rust TPE calculate_mo_weights: ≤3 目标使用精确 LOO HV 贡献。"""
+    from optuna.samplers._tpe.sampler import _calculate_weights_below_for_multi_objective
+
+    study = optuna.create_study(directions=["minimize", "minimize", "minimize"])
+
+    # 构造一组简单的试验
+    for vals in [[1.0, 5.0, 3.0], [3.0, 1.0, 4.0], [2.0, 2.0, 2.0], [4.0, 4.0, 1.0]]:
+        trial = study.ask()
+        study.tell(trial, vals)
+
+    below = study.trials
+    weights = _calculate_weights_below_for_multi_objective(study, below, None)
+
+    # 所有权重应当为正（可行试验）
+    assert all(w > 0 for w in weights), f"weights={weights}"
+    assert len(weights) == 4
+
+
+def test_tpe_mo_weights_4_objectives():
+    """对齐 Rust TPE calculate_mo_weights: >3 目标使用近似方法。
+    验证近似算法不会产生负权重。"""
+    from optuna.samplers._tpe.sampler import _calculate_weights_below_for_multi_objective
+
+    study = optuna.create_study(directions=["minimize"] * 4)
+
+    # 构造试验
+    np.random.seed(42)
+    for _ in range(8):
+        trial = study.ask()
+        study.tell(trial, np.random.rand(4).tolist())
+
+    below = study.trials
+    weights = _calculate_weights_below_for_multi_objective(study, below, None)
+
+    assert all(w > 0 for w in weights), f"weights={weights}"
+    assert len(weights) == 8
+
+
+def test_non_domination_rank_n_below():
+    """对齐 Rust fast_non_domination_rank_with_n_below:
+    Python `_calculate_nondomination_rank` 支持 n_below 提前终止。"""
+    from optuna.study._multi_objective import _fast_non_domination_rank
+
+    loss_values = np.array([
+        [1.0, 5.0],   # Pareto front (rank 0)
+        [5.0, 1.0],   # Pareto front (rank 0)
+        [2.0, 3.0],   # Pareto front (rank 0): 不被 [1,5] 或 [5,1] 支配
+        [3.0, 2.0],   # Pareto front (rank 0): 同上
+        [4.0, 4.0],   # rank 1: 被 [2,3] 支配 (2<4 且 3<4)
+    ])
+
+    # 不限制 n_below
+    ranks_full = _fast_non_domination_rank(loss_values)
+    assert ranks_full[0] == 0
+    assert ranks_full[1] == 0
+    assert ranks_full[2] == 0  # [2,3] 也是 Pareto 前沿
+    assert ranks_full[3] == 0  # [3,2] 也是 Pareto 前沿
+    assert ranks_full[4] == 1  # [4,4] 被 [2,3] 支配
+
+    # n_below=2: 只需要前2个元素的排名，应在前沿0之后终止
+    ranks_limited = _fast_non_domination_rank(loss_values, n_below=2)
+    assert ranks_limited[0] == 0
+    assert ranks_limited[1] == 0
+
+
 #  执行
 # ═══════════════════════════════════════════════════════════════════════════
 

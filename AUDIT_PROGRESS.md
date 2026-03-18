@@ -669,3 +669,76 @@
 | src/samplers/tpe/sampler.rs | MOTPE 约束权重 + split_trials 重写 + 4 个测试 |
 | src/terminators.rs | CVErrorEvaluator panic + 1 个测试 |
 | tests/test_cross_validation.py | 12 个新 Python 测试 |
+
+---
+
+## Session 49/50 — 全仓深度审计（续）
+
+### 四模块并行审计结论 + 修复
+
+#### 已修复项
+
+1. **tell_auto 缺少 FAIL 状态警告** (study/core.rs)
+   - 根因: Python `_tell_with_warning` 中 `state is None` 分支，推断为 FAIL 时会调用 `optuna_warn()`
+   - 修复: 添加 `check_values_feasible()` 方法，实现完整的值可行性检查（数量匹配 + NaN + Inf），推断 FAIL 时发出警告
+   - 新增 6 个 Rust 测试 + 2 个 Python 交叉验证测试
+
+2. **get_single_value 缺少 assert single() 守卫** (distributions/mod.rs)
+   - 根因: Python `_get_single_value()` 开头有 `assert distribution.single()`
+   - 修复: 添加 `assert!(self.single(), ...)` 前置检查
+   - 1 个 Python 交叉验证测试
+
+3. **CategoricalDistribution.contains 语义不一致** (distributions/categorical.rs)
+   - 根因: Rust 使用 `(index as f64 - value).abs() < 1e-8` 容差检查，Python 使用 `int()` 截断
+   - 行为差异: `contains(0.5)` → Rust: false, Python: true（因为 `int(0.5)=0` 是有效索引）
+   - 修复: 改为 `value as i64`（向零截断），与 Python `int()` 语义完全一致
+   - 1 个 Python 交叉验证测试
+
+4. **TPE >3 目标 HV 贡献计算缺少快速近似路径** (samplers/tpe/sampler.rs)
+   - 根因: Rust 对所有目标数都使用简单 LOO HV（精确但 >3 目标时慢）
+   - Python: ≤3 目标用精确 LOO，>3 目标用近似方法 `prod(ref-sol) - hv(limited_sols[loo])`
+   - 修复: 实现 `n_objectives <= 3` 分支判断，>3 目标使用近似算法
+   - 2 个 Python 交叉验证测试（3 目标 + 4 目标）
+
+5. **fast_non_domination_rank 缺少 n_below 提前终止** (samplers/tpe/sampler.rs)
+   - 根因: Python `_calculate_nondomination_rank` 支持 `n_below` 参数，排完足够的前沿后提前退出
+   - 修复: 新增 `fast_non_domination_rank_with_n_below()` 方法，`split_complete_multi_objective` 传入 n_below
+   - 附加: 单目标特殊路径（使用唯一排名，对齐 Python 的 `np.unique` 逻辑）
+   - 3 个 Rust 测试 + 1 个 Python 交叉验证测试
+
+6. **report 重复 step 行为** — 已确认对齐（Python 也是忽略+警告，不覆盖）
+   - 1 个 Python 交叉验证测试确认一致
+
+#### 待修复项变更
+
+以下 Session 37 待修复项已部分解决:
+- ~~#4 tell() state=None 缺失~~ → ✅ 已通过 `tell_auto` 实现
+- #1 MOTPE → 部分解决（>3 目标近似路径 + n_below 优化）
+
+仍待修复:
+- #2 NSGA-II 无代际系统
+- #3 CMA-ES 状态不持久化
+- #5 _filter_study 缺失
+- #6 reseed_rng 缺失
+- #9 GP 缺少多目标支持（LogEHVI/ConstrainedLogEHVI）
+- #10 GP 采集函数优化简化（无 L-BFGS-B + QMC）
+
+### 测试统计
+
+| 指标 | 数值 |
+|------|------|
+| Rust 测试总数 | 942 (unit) + 5 (doc) |
+| Python 交叉验证 | 209 |
+| 本次新增 Rust | +8 |
+| 本次新增 Python | +8 |
+| 修改文件数 | 5 |
+
+### 修改文件清单
+
+| 文件 | 修改内容 |
+|------|---------|
+| src/study/core.rs | tell_auto 警告 + check_values_feasible + 6 测试 |
+| src/distributions/mod.rs | get_single_value assert 守卫 |
+| src/distributions/categorical.rs | contains 对齐 int() 截断 + 更新测试 |
+| src/samplers/tpe/sampler.rs | >3 目标近似 HV + n_below 提前终止 + 单目标路径 + 3 测试 |
+| tests/test_cross_validation.py | 8 个新 Python 交叉验证测试 |

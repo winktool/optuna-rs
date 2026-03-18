@@ -71,9 +71,14 @@ impl CategoricalDistribution {
     }
 
     /// Check if `value` (an index as f64) is contained in this distribution.
+    ///
+    /// 对齐 Python `CategoricalDistribution._contains`:
+    /// Python 使用 `index = int(param_value_in_internal_repr)` 进行截断，
+    /// 然后检查 `0 <= index < len(choices)`。
+    /// 注意: Python 的 `int()` 是向零截断，0.9 → 0，-0.1 → 0。
     pub fn contains(&self, value: f64) -> bool {
-        let index = value as usize;
-        index < self.choices.len() && (index as f64 - value).abs() < 1e-8
+        let index = value as i64; // 对齐 Python int() 截断语义
+        index >= 0 && (index as usize) < self.choices.len()
     }
 
     /// Convert an external value to internal representation (the index as f64).
@@ -141,7 +146,16 @@ mod tests {
         assert!(d.contains(2.0));
         assert!(!d.contains(3.0));
         assert!(!d.contains(-1.0));
-        assert!(!d.contains(0.5));
+        // 对齐 Python: int(0.5) = 0，有效索引，contains 返回 true
+        assert!(d.contains(0.5));
+        // 对齐 Python: int(2.9) = 2，有效索引
+        assert!(d.contains(2.9));
+        // 对齐 Python: int(3.0) = 3，超出范围
+        assert!(!d.contains(3.0));
+        // 对齐 Python: int(-0.1) = 0（Rust `as i64` 截断），但 Python int(-0.1)=0
+        // 注意: Rust `as i64` 对负数是向零截断，与 Python int() 一致
+        assert!(d.contains(-0.1));
+        assert!(!d.contains(-1.0)); // int(-1.0) = -1 → 负数
     }
 
     #[test]

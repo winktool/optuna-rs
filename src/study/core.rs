@@ -451,19 +451,28 @@ impl Study {
         trial_id: i64,
         values: Option<&[f64]>,
     ) -> Result<FrozenTrial> {
-        let inferred_state = if let Some(vals) = values {
-            // 检查 values 是否合法
-            let feasible = vals.iter().all(|v| !v.is_nan())
-                && vals.len() == self.directions.len();
-            if feasible {
-                TrialState::Complete
+        // 对齐 Python `_tell_with_warning` 中 `state is None` 分支：
+        // 1. 检查 values 可行性
+        // 2. 可行 → Complete；不可行 → Fail + 发出警告
+        let (inferred_state, failure_msg) = if let Some(vals) = values {
+            let feasibility_msg = self.check_values_feasible(vals);
+            if feasibility_msg.is_none() {
+                (TrialState::Complete, None)
             } else {
-                TrialState::Fail
+                (TrialState::Fail, feasibility_msg)
             }
         } else {
             // values=None → Fail（对齐 Python: "The value None could not be cast to float."）
-            TrialState::Fail
+            (
+                TrialState::Fail,
+                Some("The value None could not be cast to float.".to_string()),
+            )
         };
+
+        // 对齐 Python: suppress_warning=False 时发出警告
+        if let Some(msg) = &failure_msg {
+            crate::optuna_warn!("{}", msg);
+        }
 
         let final_values = if inferred_state == TrialState::Complete {
             values
@@ -472,6 +481,36 @@ impl Study {
         };
 
         self.tell_with_options(trial_id, inferred_state, final_values, false)
+    }
+
+    /// 检查 values 是否可以被接受为 Complete 状态的目标值。
+    ///
+    /// 对齐 Python `_check_values_are_feasible`:
+    /// - 检查数量与 directions 匹配
+    /// - 检查所有值不为 NaN/Inf
+    fn check_values_feasible(&self, values: &[f64]) -> Option<String> {
+        if values.len() != self.directions.len() {
+            return Some(format!(
+                "The number of the values {} did not match the number of the objectives {}.",
+                values.len(),
+                self.directions.len()
+            ));
+        }
+        for (i, &v) in values.iter().enumerate() {
+            if v.is_nan() {
+                return Some(format!(
+                    "The value {} at index {} could not be cast to float.",
+                    v, i
+                ));
+            }
+            if v.is_infinite() {
+                return Some(format!(
+                    "The value {} at index {} is infinite.",
+                    v, i
+                ));
+            }
+        }
+        None
     }
 
     /// 带 skip_if_finished 选项的 tell。
@@ -2847,5 +2886,73 @@ mod tests {
         // Maximize: 最优可行试验应为 value=5.0
         assert_eq!(best.values, Some(vec![5.0]),
             "Maximize: should return the best feasible trial");
+    }
+
+    #[test]
+    fn test_tell_auto_values_none_infers_fail() {
+        // 对齐 Python: tell(state=None, values=None) → FAIL + 警告
+        let study = create_study(None, None, None, None, None, None, false).unwrap();
+        let trial = study.ask(None).unwrap();
+        let frozen = study.tell_auto(trial.trial_id(), None).unwrap();
+        assert_eq!(frozen.state, TrialState::Fail);
+        assert!(frozen.values.is_none());
+    }
+
+    #[test]
+    fn test_tell_auto_nan_infers_fail() {
+        // 对齐 Python: tell(state=None, values=[NaN]) → FAIL
+        let study = create_study(None, None, None, None, None, None, false).unwrap();
+        let trial = study.ask(None).unwrap();
+        let frozen = study.tell_auto(trial.trial_id(), Some(&[f64::NAN])).unwrap();
+        assert_eq!(frozen.state, TrialState::Fail);
+    }
+
+    #[test]
+    fn test_tell_auto_inf_infers_fail() {
+        // 对齐 Python: tell(state=None, values=[Inf]) → FAIL
+        let study = create_study(None, None, None, None, None, None, false).unwrap();
+        let trial = study.ask(None).unwrap();
+        let frozen = study.tell_auto(trial.trial_id(), Some(&[f64::INFINITY])).unwrap();
+        assert_eq!(frozen.state, TrialState::Fail);
+    }
+
+    #[test]
+    fn test_tell_auto_wrong_count_infers_fail() {
+        // 对齐 Python: values 数量不匹配 directions → FAIL
+        let study = create_study(
+            None, None, None, None, None,
+            Some(vec![StudyDirection::Minimize, StudyDirection::Minimize]),
+            false,
+        ).unwrap();
+        let trial = study.ask(None).unwrap();
+        let frozen = study.tell_auto(trial.trial_id(), Some(&[1.0])).unwrap();
+        assert_eq!(frozen.state, TrialState::Fail);
+    }
+
+    #[test]
+    fn test_tell_auto_valid_infers_complete() {
+        // 对齐 Python: tell(state=None, values=[1.0]) → Complete
+        let study = create_study(None, None, None, None, None, None, false).unwrap();
+        let trial = study.ask(None).unwrap();
+        let frozen = study.tell_auto(trial.trial_id(), Some(&[1.0])).unwrap();
+        assert_eq!(frozen.state, TrialState::Complete);
+        assert_eq!(frozen.values, Some(vec![1.0]));
+    }
+
+    #[test]
+    fn test_check_values_feasible() {
+        let study = create_study(
+            None, None, None, None, None,
+            Some(vec![StudyDirection::Minimize, StudyDirection::Maximize]),
+            false,
+        ).unwrap();
+        // 合法
+        assert!(study.check_values_feasible(&[1.0, 2.0]).is_none());
+        // 数量不匹配
+        assert!(study.check_values_feasible(&[1.0]).is_some());
+        // NaN
+        assert!(study.check_values_feasible(&[1.0, f64::NAN]).is_some());
+        // Inf
+        assert!(study.check_values_feasible(&[f64::NEG_INFINITY, 1.0]).is_some());
     }
 }

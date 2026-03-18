@@ -49,8 +49,15 @@ impl Distribution {
         }
     }
 
-    /// 对齐 Python `_get_single_value()`: 返回唯一值（调用前需确保 `single()` 为 true）。
+    /// 对齐 Python `_get_single_value()`: 返回唯一值。
+    ///
+    /// 对齐 Python: 函数开头有 `assert distribution.single()`，
+    /// 确保调用前分布确实只有一个值。
     pub fn get_single_value(&self) -> Result<ParamValue> {
+        assert!(
+            self.single(),
+            "get_single_value called on a distribution that is not single-valued"
+        );
         match self {
             Self::FloatDistribution(d) => Ok(ParamValue::Float(d.low)),
             Self::IntDistribution(d) => Ok(ParamValue::Int(d.low)),

@@ -467,8 +467,8 @@ impl TpeSampler {
             }).collect()
         }).collect();
 
-        // 非支配排序
-        let ranks = Self::fast_non_domination_rank(&loss_values);
+        // 非支配排序（传入 n_below 以启用提前终止优化）
+        let ranks = Self::fast_non_domination_rank_with_n_below(&loss_values, Some(n_below));
 
         let mut below_indices = Vec::new();
         let mut above_indices = Vec::new();
@@ -526,10 +526,43 @@ impl TpeSampler {
 
     /// 对齐 Python `_fast_non_domination_rank`:
     /// 直接在 loss values 矩阵上计算非支配层级。
+    ///
+    /// `n_below`: 可选的提前终止参数。当已分配排名的试验数达到 `n_below` 后，
+    /// 剩余未分配的试验全部设为当前 rank（对齐 Python `_calculate_nondomination_rank`
+    /// 中的 `n_below` 语义，避免不必要的排名计算开销）。
     fn fast_non_domination_rank(loss_values: &[Vec<f64>]) -> Vec<usize> {
+        Self::fast_non_domination_rank_with_n_below(loss_values, None)
+    }
+
+    fn fast_non_domination_rank_with_n_below(
+        loss_values: &[Vec<f64>],
+        n_below: Option<usize>,
+    ) -> Vec<usize> {
         let n = loss_values.len();
         if n == 0 {
             return vec![];
+        }
+
+        let n_below = n_below.unwrap_or(n);
+
+        // 对齐 Python: 单目标特殊路径（使用唯一排名）
+        if !loss_values.is_empty() && loss_values[0].len() == 1 {
+            let mut indexed: Vec<(usize, f64)> = loss_values.iter().enumerate()
+                .map(|(i, v)| (i, v[0]))
+                .collect();
+            indexed.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
+            let mut ranks = vec![0usize; n];
+            let mut current_rank = 0;
+            for w in indexed.windows(2) {
+                ranks[w[0].0] = current_rank;
+                if (w[1].1 - w[0].1).abs() > f64::EPSILON {
+                    current_rank += 1;
+                }
+            }
+            if let Some(last) = indexed.last() {
+                ranks[last.0] = current_rank;
+            }
+            return ranks;
         }
 
         let mut dominated_count = vec![0usize; n];
@@ -550,6 +583,7 @@ impl TpeSampler {
         }
 
         let mut ranks = vec![0usize; n];
+        let mut assigned = 0usize;
         let mut current_front: Vec<usize> = (0..n).filter(|&i| dominated_count[i] == 0).collect();
         let mut rank = 0;
 
@@ -557,12 +591,21 @@ impl TpeSampler {
             let mut next_front = Vec::new();
             for &i in &current_front {
                 ranks[i] = rank;
+                assigned += 1;
                 for &j in &dominates_list[i] {
                     dominated_count[j] -= 1;
                     if dominated_count[j] == 0 {
                         next_front.push(j);
                     }
                 }
+            }
+            // 对齐 Python n_below 提前终止: 当已分配排名的数量 >= n_below 时停止
+            if assigned >= n_below {
+                // 将剩余未分配的试验设为下一个 rank
+                for &j in &next_front {
+                    ranks[j] = rank + 1;
+                }
+                break;
             }
             current_front = next_front;
             rank += 1;
@@ -673,18 +716,57 @@ impl TpeSampler {
         }
 
         // Leave-one-out: 每个 Pareto 点的 HV 贡献
+        // 对齐 Python: ≤3 目标使用精确 LOO，>3 目标使用近似方法
+        let n_objectives = directions.len();
         let mut contribs = vec![0.0_f64; n_feasible];
-        for (pi, &local_idx) in pareto_local_indices.iter().enumerate() {
-            let without: Vec<Vec<f64>> = pareto_losses.iter().enumerate()
-                .filter(|(i, _)| *i != pi)
-                .map(|(_, v)| v.clone())
-                .collect();
-            let hv_without = if without.is_empty() {
-                0.0
-            } else {
-                crate::multi_objective::hypervolume(&without, &ref_point)
-            };
-            contribs[local_idx] = full_hv - hv_without;
+
+        if n_objectives <= 3 {
+            // ≤3 目标: 精确 LOO（对齐 Python `contribs[on_front] = [hv - compute_hypervolume(pareto_sols[loo], ...)]`）
+            for (pi, &local_idx) in pareto_local_indices.iter().enumerate() {
+                let without: Vec<Vec<f64>> = pareto_losses.iter().enumerate()
+                    .filter(|(i, _)| *i != pi)
+                    .map(|(_, v)| v.clone())
+                    .collect();
+                let hv_without = if without.is_empty() {
+                    0.0
+                } else {
+                    crate::multi_objective::hypervolume(&without, &ref_point)
+                };
+                contribs[local_idx] = full_hv - hv_without;
+            }
+        } else {
+            // >3 目标: 近似方法（对齐 Python）
+            // contribs[on_front] = prod(ref_point - pareto_sols, axis=-1)
+            //                    - [compute_hypervolume(limited_sols[i, loo], ref_point)]
+            // 其中 limited_sols = max(pareto_sols, pareto_sols[:, newaxis])
+
+            let n_pareto = pareto_losses.len();
+
+            // 计算每个 Pareto 点与参考点的体积乘积
+            let box_volumes: Vec<f64> = pareto_losses.iter().map(|sol| {
+                sol.iter().zip(ref_point.iter()).map(|(&s, &r)| r - s).product::<f64>()
+            }).collect();
+
+            // limited_sols[i][j] = max(pareto_sols[i], pareto_sols[j]) (element-wise)
+            // 对于每个 Pareto 点 i，计算 LOO HV 中移除 i 后的 limited_sols
+            for (pi, &local_idx) in pareto_local_indices.iter().enumerate() {
+                // 构造 limited_sols[pi, loo]: 对其他 Pareto 点 j，取 max(pareto[pi], pareto[j])
+                let limited_without: Vec<Vec<f64>> = (0..n_pareto)
+                    .filter(|&j| j != pi)
+                    .map(|j| {
+                        pareto_losses[pi].iter().zip(pareto_losses[j].iter())
+                            .map(|(&a, &b)| a.max(b))
+                            .collect()
+                    })
+                    .collect();
+
+                let limited_hv = if limited_without.is_empty() {
+                    0.0
+                } else {
+                    crate::multi_objective::hypervolume(&limited_without, &ref_point)
+                };
+                contribs[local_idx] = box_volumes[pi] - limited_hv;
+            }
         }
 
         // 对齐 Python: weights[feasible] = max(contribs / max(max(contribs), EPS), EPS)
@@ -1604,6 +1686,48 @@ mod tests {
         assert_eq!(ranks2[0], 0);
         assert_eq!(ranks2[1], 1);
         assert_eq!(ranks2[2], 2);
+    }
+
+    #[test]
+    fn test_fast_non_domination_rank_with_n_below() {
+        // 对齐 Python `_calculate_nondomination_rank(loss_values, n_below=...)`:
+        // n_below 提前终止排名计算
+        let loss_values = vec![
+            vec![1.0, 1.0],  // rank 0
+            vec![2.0, 2.0],  // rank 1
+            vec![3.0, 3.0],  // rank 2
+        ];
+
+        // n_below=1: 只需要 1 个元素的排名
+        let ranks = TpeSampler::fast_non_domination_rank_with_n_below(&loss_values, Some(1));
+        assert_eq!(ranks[0], 0);
+        // 提前终止后，其余元素位于下一个 rank
+        assert!(ranks[1] >= 1);
+
+        // n_below=2: 需要前2个元素
+        let ranks2 = TpeSampler::fast_non_domination_rank_with_n_below(&loss_values, Some(2));
+        assert_eq!(ranks2[0], 0);
+        assert_eq!(ranks2[1], 1);
+
+        // n_below=None (默认): 全部计算
+        let ranks_full = TpeSampler::fast_non_domination_rank_with_n_below(&loss_values, None);
+        assert_eq!(ranks_full, vec![0, 1, 2]);
+    }
+
+    #[test]
+    fn test_fast_non_domination_rank_single_objective() {
+        // 对齐 Python: 单目标特殊路径，使用唯一排名
+        let loss_values = vec![
+            vec![3.0],
+            vec![1.0],
+            vec![2.0],
+            vec![1.0],  // 与 index 1 相同
+        ];
+        let ranks = TpeSampler::fast_non_domination_rank(&loss_values);
+        assert_eq!(ranks[0], 2);  // 3.0 → rank 2
+        assert_eq!(ranks[1], 0);  // 1.0 → rank 0
+        assert_eq!(ranks[2], 1);  // 2.0 → rank 1
+        assert_eq!(ranks[3], 0);  // 1.0 → rank 0 (same as index 1)
     }
 
     #[test]

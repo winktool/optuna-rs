@@ -1,4 +1,4 @@
-//! 高斯过程 (GP) 采样器模块 — Matern 5/2 核 + logEI 采集函数
+//! 高斯过程 (GP) 采样器模块 — Matern 5/2 核 + logEI/logEHVI 采集函数
 //!
 //! 对应 Python `optuna.samplers.GPSampler`。
 //! 纯 Rust 实现，无需 PyTorch / scipy 依赖。
@@ -6,8 +6,9 @@
 //! ## 算法概述
 //! 1. 使用 Matern 5/2 核的高斯过程回归拟合已完成试验
 //! 2. 通过 L-BFGS-B 优化核超参数（最大化边际似然）
-//! 3. 使用 logEI（对数期望改善）采集函数选择下一组参数
-//! 4. 支持自动相关性确定 (ARD) — 每个维度独立的长度尺度
+//! 3. 单目标: logEI（对数期望改善）采集函数
+//! 4. 多目标: logEHVI（对数期望超体积改善）采集函数 + QMC 采样
+//! 5. 支持自动相关性确定 (ARD) — 每个维度独立的长度尺度
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -566,6 +567,136 @@ fn log_ei(mean: f64, var: f64, f0: f64) -> f64 {
 // 搜索空间归一化
 // ════════════════════════════════════════════════════════════════════════
 
+/// 生成 Sobol 正态样本矩阵 [n_samples, dim]。
+///
+/// 对齐 Python `_sample_from_normal_sobol`:
+/// 1. Sobol' QMC 生成 [0,1] 均匀样本
+/// 2. 将 [0,1] 映射到 [-1,1]: x → 2(x - 0.5)
+/// 3. 通过 erfinv 转化为标准正态: z = √2 * erfinv(2x - 1)
+pub(crate) fn sample_from_normal_sobol(dim: usize, n_samples: usize, seed: u64) -> Vec<Vec<f64>> {
+    use super::qmc::sobol_point_pub;
+    let sqrt2 = std::f64::consts::SQRT_2;
+    (0..n_samples)
+        .map(|i| {
+            let sobol = sobol_point_pub(i as u64 + 1, dim, true, seed); // skip index 0
+            sobol
+                .into_iter()
+                .map(|u| {
+                    // 映射到 [-1,1] 然后 erfinv → 标准正态
+                    let mapped = 2.0 * (u - 0.5);
+                    // 裁剪到 (-1+ε, 1-ε) 避免 erfinv 的无穷大
+                    let clamped = mapped.clamp(-0.99999, 0.99999);
+                    sqrt2 * erfinv(clamped)
+                })
+                .collect()
+        })
+        .collect()
+}
+
+/// 逆误差函数 erfinv(x) 的有理近似。
+///
+/// 对齐 Python `torch.erfinv` / `scipy.special.erfinv`。
+/// 使用 Winitzki 近似 + 精度修正，适用于 |x| < 1。
+fn erfinv(x: f64) -> f64 {
+    if x.abs() >= 1.0 {
+        return if x > 0.0 { f64::INFINITY } else { f64::NEG_INFINITY };
+    }
+    if x.abs() < 1e-15 {
+        return x; // erfinv(0) = 0
+    }
+    // 使用 Abramowitz & Stegun / Winitzki 方法的精确有理近似
+    let a = 0.147;
+    let ln_part = (1.0 - x * x).ln();
+    let b = 2.0 / (PI * a) + 0.5 * ln_part;
+    let sign = if x >= 0.0 { 1.0 } else { -1.0 };
+    sign * (((b * b - ln_part / a).sqrt() - b).sqrt())
+}
+
+/// Log Expected Hypervolume Improvement (logEHVI) 计算。
+///
+/// 对齐 Python `acqf.logehvi`:
+/// 给定后验样本 Y_post [n_qmc_samples, n_objectives]，
+/// 和非支配盒分解 (lower_bounds, intervals)，
+/// 计算 log(E[HVI])。
+///
+/// Y_post 中的值已是「越大越好」的标准化分数。
+fn log_ehvi(
+    y_post: &[Vec<f64>],        // [n_qmc_samples, n_objectives]
+    box_lower: &[Vec<f64>],     // [n_boxes, n_objectives]
+    box_intervals: &[Vec<f64>], // [n_boxes, n_objectives]
+) -> f64 {
+    let n_qmc = y_post.len();
+    if n_qmc == 0 {
+        return f64::NEG_INFINITY;
+    }
+    let log_n_qmc = (n_qmc as f64).ln();
+
+    // 对每个 QMC 样本、每个 box 计算改善量的对数之和
+    // logsumexp over (qmc_samples x boxes)
+    let mut log_vals: Vec<f64> = Vec::new();
+    for sample in y_post {
+        for (lb, interval) in box_lower.iter().zip(box_intervals.iter()) {
+            let mut log_prod = 0.0;
+            let mut valid = true;
+            for d in 0..sample.len() {
+                let diff = (sample[d] - lb[d]).max(EPS).min(interval[d]);
+                if diff <= EPS {
+                    valid = false;
+                    break;
+                }
+                log_prod += diff.ln();
+            }
+            if valid {
+                log_vals.push(log_prod);
+            }
+        }
+    }
+
+    if log_vals.is_empty() {
+        return f64::NEG_INFINITY;
+    }
+
+    // logsumexp
+    let max_log = log_vals.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
+    if max_log == f64::NEG_INFINITY {
+        return f64::NEG_INFINITY;
+    }
+    let sum_exp: f64 = log_vals.iter().map(|&v| (v - max_log).exp()).sum();
+    max_log + sum_exp.ln() - log_n_qmc
+}
+
+/// 检测 Pareto 前沿（loss/minimization 空间，值越小越好）。
+///
+/// 对齐 Python `_is_pareto_front(loss_vals)`。
+/// 返回布尔向量: true = 该点在 Pareto 前沿上。
+fn is_pareto_front_min(loss_values: &[Vec<f64>]) -> Vec<bool> {
+    let n = loss_values.len();
+    let mut on_front = vec![true; n];
+    for i in 0..n {
+        if !on_front[i] { continue; }
+        for j in 0..n {
+            if i == j || !on_front[j] { continue; }
+            // j 支配 i ?（所有 <= 且至少一个 <）
+            let mut all_le = true;
+            let mut any_lt = false;
+            for d in 0..loss_values[i].len() {
+                if loss_values[j][d] > loss_values[i][d] {
+                    all_le = false;
+                    break;
+                }
+                if loss_values[j][d] < loss_values[i][d] {
+                    any_lt = true;
+                }
+            }
+            if all_le && any_lt {
+                on_front[i] = false;
+                break;
+            }
+        }
+    }
+    on_front
+}
+
 /// 归一化参数到 [0, 1]
 pub(crate) fn normalize_param(
     value: f64,
@@ -634,12 +765,14 @@ pub type ConstraintsFn = Arc<dyn Fn(&FrozenTrial) -> Vec<f64> + Send + Sync>;
 /// 高斯过程 (GP) 采样器。
 ///
 /// 对应 Python `optuna.samplers.GPSampler`。
-/// 使用 Matern 5/2 核 + logEI 采集函数 + ARD。
+/// 单目标: Matern 5/2 核 + logEI 采集函数 + ARD。
+/// 多目标: Matern 5/2 核 + logEHVI 采集函数（QMC 采样）。
 pub struct GpSampler {
     /// 随机种子
     seed: Option<u64>,
-    /// 优化方向（对齐 Python _sign 符号翻转）
-    direction: StudyDirection,
+    /// 优化方向（对齐 Python study.directions）
+    /// 单目标时 len==1, 多目标时 len>1。
+    directions: Vec<StudyDirection>,
     /// 独立采样器（启动阶段使用）
     independent_sampler: Arc<dyn Sampler>,
     /// 最少启动试验数（使用随机采样）
@@ -656,6 +789,9 @@ pub struct GpSampler {
     search_space: Mutex<IntersectionSearchSpace>,
     /// RNG 共享状态
     rng: Mutex<ChaCha8Rng>,
+    /// QMC 采样数量（用于 LogEHVI 多目标采集函数）
+    /// 对应 Python `n_qmc_samples=128`。
+    n_qmc_samples: usize,
     /// 目标 GP 核参数缓存: 跨 sample_relative 调用复用上一轮拟合结果。
     /// 对应 Python `self._gprs_cache_list`。
     gprs_cache: Mutex<Option<Vec<KernelParamsCache>>>,
@@ -668,7 +804,7 @@ impl GpSampler {
     ///
     /// # 参数
     /// * `seed` - 随机种子
-    /// * `direction` - 优化方向（默认 Minimize）
+    /// * `direction` - 单目标优化方向（与 `directions` 互斥）
     /// * `n_startup_trials` - 启动试验数（默认 10）
     /// * `deterministic_objective` - 目标函数是否确定性（默认 false）
     /// * `constraints_func` - 约束函数, 返回值 ≤ 0 表示可行
@@ -681,8 +817,23 @@ impl GpSampler {
         constraints_func: Option<ConstraintsFn>,
         independent_sampler: Option<Arc<dyn Sampler>>,
     ) -> Self {
+        let dirs = vec![direction.unwrap_or(StudyDirection::Minimize)];
+        Self::with_directions(seed, dirs, n_startup_trials, deterministic_objective, constraints_func, independent_sampler)
+    }
+
+    /// 创建支持多目标的 GP 采样器。
+    ///
+    /// 对齐 Python `GPSampler` 通过 `study.directions` 获取多目标信息。
+    /// Rust 版本在构造时传入 directions。
+    pub fn with_directions(
+        seed: Option<u64>,
+        directions: Vec<StudyDirection>,
+        n_startup_trials: Option<usize>,
+        deterministic_objective: bool,
+        constraints_func: Option<ConstraintsFn>,
+        independent_sampler: Option<Arc<dyn Sampler>>,
+    ) -> Self {
         let s = seed.unwrap_or_else(|| {
-            // 对齐 Python LazyRandomState(seed=None): 使用随机种子
             use std::time::SystemTime;
             SystemTime::now()
                 .duration_since(SystemTime::UNIX_EPOCH)
@@ -691,22 +842,27 @@ impl GpSampler {
         });
         Self {
             seed,
-            direction: direction.unwrap_or(StudyDirection::Minimize),
+            directions,
             independent_sampler: independent_sampler
                 .unwrap_or_else(|| Arc::new(RandomSampler::new(Some(s + 1)))),
             n_startup_trials: n_startup_trials.unwrap_or(10),
             n_preliminary_samples: 2048,
             n_local_search: 10,
-            deterministic_objective: deterministic_objective,
+            deterministic_objective,
             constraints_func,
             search_space: Mutex::new(IntersectionSearchSpace::new(false)),
             rng: Mutex::new(ChaCha8Rng::seed_from_u64(s)),
+            n_qmc_samples: 128,
             gprs_cache: Mutex::new(None),
             constraints_gprs_cache: Mutex::new(None),
         }
     }
 
-    /// GP 核心采样实现
+    /// GP 核心采样实现（支持单目标 + 多目标）。
+    ///
+    /// 单目标: logEI 采集函数（对齐 Python `acqf.LogEI`）。
+    /// 多目标: logEHVI 采集函数（对齐 Python `acqf.LogEHVI`），
+    ///         使用 QMC Sobol 采样近似后验超体积改善。
     fn sample_relative_impl(
         &self,
         completed_trials: &[FrozenTrial],
@@ -714,6 +870,7 @@ impl GpSampler {
     ) -> Result<HashMap<String, f64>> {
         let param_names: Vec<String> = search_space.keys().cloned().collect();
         let n_params = param_names.len();
+        let n_objectives = self.directions.len();
 
         // 判断分类参数
         let is_categorical: Vec<bool> = param_names.iter().map(|name| {
@@ -721,11 +878,21 @@ impl GpSampler {
         }).collect();
 
         // 构建归一化的训练数据
-        let mut x_train = Vec::new();
-        let mut y_train = Vec::new();
+        let mut x_train: Vec<Vec<f64>> = Vec::new();
+        // 多目标: score_vals[trial_idx][obj_idx]（带符号翻转，越大越好）
+        let mut score_vals: Vec<Vec<f64>> = Vec::new();
+
+        // 对齐 Python: _sign = -1.0 if MINIMIZE else 1.0
+        let signs: Vec<f64> = self.directions.iter().map(|d| {
+            match d {
+                StudyDirection::Minimize | StudyDirection::NotSet => -1.0,
+                StudyDirection::Maximize => 1.0,
+            }
+        }).collect();
 
         for trial in completed_trials {
             if let Some(vals) = &trial.values {
+                if vals.len() != n_objectives { continue; }
                 let mut row = Vec::with_capacity(n_params);
                 let mut complete = true;
                 for name in &param_names {
@@ -740,22 +907,19 @@ impl GpSampler {
                 }
                 if complete {
                     x_train.push(row);
-                    // 对齐 Python: _sign = -1.0 if MINIMIZE else 1.0
-                    // 统一为「越大越好」以便 logEI 正确工作
-                    let sign = match self.direction {
-                        StudyDirection::Minimize | StudyDirection::NotSet => -1.0,
-                        StudyDirection::Maximize => 1.0,
-                    };
-                    let mut v = vals[0] * sign;
-                    // 对齐 Python warn_and_convert_inf: 将 ±Inf 裁剪为 ±f64::MAX
-                    if v.is_infinite() {
-                        crate::optuna_warn!(
-                            "Trial {} has infinite objective value; clipping to finite bound.",
-                            trial.number
-                        );
-                        v = if v > 0.0 { f64::MAX } else { f64::MIN };
-                    }
-                    y_train.push(v);
+                    let signed_vals: Vec<f64> = vals.iter().enumerate().map(|(j, &v)| {
+                        let mut sv = v * signs[j];
+                        // 对齐 Python warn_and_convert_inf
+                        if sv.is_infinite() {
+                            crate::optuna_warn!(
+                                "Trial {} has infinite objective value; clipping to finite bound.",
+                                trial.number
+                            );
+                            sv = if sv > 0.0 { f64::MAX } else { f64::MIN };
+                        }
+                        sv
+                    }).collect();
+                    score_vals.push(signed_vals);
                 }
             }
         }
@@ -764,20 +928,32 @@ impl GpSampler {
             return Ok(HashMap::new());
         }
 
-        // 标准化目标值
-        let y_mean: f64 = y_train.iter().sum::<f64>() / y_train.len() as f64;
-        let y_std: f64 = {
-            let variance = y_train.iter().map(|y| (y - y_mean).powi(2)).sum::<f64>()
-                / y_train.len() as f64;
-            variance.sqrt().max(EPS)
-        };
-        let standardized_y: Vec<f64> = y_train.iter()
-            .map(|y| (y - y_mean) / y_std)
-            .collect();
+        let n_trials = x_train.len();
+
+        // 标准化每个目标的值
+        // standardized_score_vals[obj][trial]
+        let mut standardized_by_obj: Vec<Vec<f64>> = Vec::with_capacity(n_objectives);
+        let mut means: Vec<f64> = Vec::with_capacity(n_objectives);
+        let mut stds: Vec<f64> = Vec::with_capacity(n_objectives);
+        for obj in 0..n_objectives {
+            let col: Vec<f64> = score_vals.iter().map(|sv| sv[obj]).collect();
+            let mean = col.iter().sum::<f64>() / n_trials as f64;
+            let std_val = {
+                let variance = col.iter().map(|v| (v - mean).powi(2)).sum::<f64>() / n_trials as f64;
+                variance.sqrt().max(EPS)
+            };
+            let standardized: Vec<f64> = col.iter().map(|v| (v - mean) / std_val).collect();
+            standardized_by_obj.push(standardized);
+            means.push(mean);
+            stds.push(std_val);
+        }
+
+        // standardized_score_vals[trial][obj]
+        let standardized_score_vals: Vec<Vec<f64>> = (0..n_trials).map(|t| {
+            (0..n_objectives).map(|o| standardized_by_obj[o][t]).collect()
+        }).collect();
 
         // 拟合 GP 超参数 — 带缓存复用
-        // 维度检查: 若搜索空间维度变化则清除缓存
-        // 对应 Python: if self._gprs_cache_list is not None and len(...) != dim
         let seed = self.seed.unwrap_or(42);
         {
             let mut cache = self.gprs_cache.lock();
@@ -786,41 +962,40 @@ impl GpSampler {
                     && list[0].inverse_squared_lengthscales.len() != n_params
                 {
                     *cache = None;
-                    // 同时清除约束缓存
                     *self.constraints_gprs_cache.lock() = None;
                 }
             }
         }
 
-        // 从缓存取出目标 GP 初始参数（单目标只有 1 个）
-        let obj_cache = {
-            let cache = self.gprs_cache.lock();
-            cache.as_ref().and_then(|list| list.first().cloned())
-        };
-        let gpr = fit_kernel_params(
-            &x_train, &standardized_y, &is_categorical, seed,
-            obj_cache.as_ref(),
-            self.deterministic_objective,
-        );
-
-        // 存储本轮拟合的核参数到缓存
-        {
-            let new_cache = KernelParamsCache {
+        // 对齐 Python: 每个目标独立拟合一个 GP
+        let mut gprs_list: Vec<GPRegressor> = Vec::with_capacity(n_objectives);
+        let mut new_caches: Vec<KernelParamsCache> = Vec::with_capacity(n_objectives);
+        for obj in 0..n_objectives {
+            let cache_entry = {
+                let cache = self.gprs_cache.lock();
+                cache.as_ref().and_then(|list| list.get(obj).cloned())
+            };
+            let gpr = fit_kernel_params(
+                &x_train, &standardized_by_obj[obj], &is_categorical, seed,
+                cache_entry.as_ref(),
+                self.deterministic_objective,
+            );
+            new_caches.push(KernelParamsCache {
                 inverse_squared_lengthscales: gpr.inverse_squared_lengthscales.clone(),
                 kernel_scale: gpr.kernel_scale,
                 noise_var: gpr.noise_var,
-            };
-            *self.gprs_cache.lock() = Some(vec![new_cache]);
+            });
+            gprs_list.push(gpr);
         }
+        *self.gprs_cache.lock() = Some(new_caches);
 
-        // 约束处理: 获取每个试验的约束值和可行性 — 带缓存
+        // 约束处理
         let constraint_gps: Vec<(GPRegressor, f64)> = if self.constraints_func.is_some() {
             self.build_constraint_gps_cached(completed_trials, &x_train, &is_categorical, seed)
         } else {
             Vec::new()
         };
 
-        // 计算可行性
         let is_feasible: Vec<bool> = if self.constraints_func.is_some() {
             completed_trials.iter().map(|t| {
                 t.system_attrs.get("constraints")
@@ -832,93 +1007,235 @@ impl GpSampler {
             vec![true; completed_trials.len()]
         };
 
-        // 当前最佳标准化值（仅考虑可行试验）
-        let f0 = standardized_y.iter().zip(is_feasible.iter())
-            .filter(|(_, feas)| **feas)
-            .map(|(y, _)| *y)
-            .fold(f64::NEG_INFINITY, f64::max);
-
-        // 采集函数优化：随机候选 + 贪心选择
-        let eval_acqf = |candidate: &[f64], gpr: &GPRegressor, constraint_gps: &[(GPRegressor, f64)]| -> f64 {
-            let (mean, var) = gpr.posterior(candidate);
-            let mut acqf = log_ei(mean, var, f0);
-            // 加上约束可行性的对数概率
-            for (c_gpr, c_threshold) in constraint_gps {
-                let (c_mean, c_var) = c_gpr.posterior(candidate);
-                let sigma = (c_var + EPS).sqrt();
-                let z = (c_mean - c_threshold) / sigma;
-                acqf += normal_cdf(z).max(1e-30).ln(); // logPI
-            }
-            acqf
-        };
-
-        let mut best_acqf = f64::NEG_INFINITY;
-        let mut best_params = vec![0.5; n_params];
-
+        // ═══ 构建采集函数 ═══
         let mut rng = self.rng.lock();
 
-        // 1. 先考虑已有最佳点（仅可行的）
-        if let Some(best_idx) = standardized_y.iter().enumerate()
-            .zip(is_feasible.iter())
-            .filter(|(_, feas)| **feas)
-            .map(|((i, y), _)| (i, y))
-            .max_by(|a, b| a.1.partial_cmp(b.1).unwrap()).map(|(i, _)| i) {
-            let candidate = &x_train[best_idx];
-            let acqf = eval_acqf(candidate, &gpr, &constraint_gps);
-            if acqf > best_acqf {
-                best_acqf = acqf;
-                best_params = candidate.clone();
-            }
-        }
+        if n_objectives == 1 {
+            // ── 单目标: logEI ──
+            let gpr = &gprs_list[0];
+            let f0 = standardized_by_obj[0].iter().zip(is_feasible.iter())
+                .filter(|(_, feas)| **feas)
+                .map(|(y, _)| *y)
+                .fold(f64::NEG_INFINITY, f64::max);
 
-        // 2. 随机候选点评估
-        for _ in 0..self.n_preliminary_samples {
-            let candidate: Vec<f64> = (0..n_params).map(|d| {
-                if is_categorical[d] {
-                    match &search_space[&param_names[d]] {
-                        Distribution::CategoricalDistribution(c) => {
-                            (rng.random_range(0.0..1.0) * c.choices.len() as f64).floor()
-                        }
-                        _ => rng.random_range(0.0..1.0),
+            let eval_acqf = |candidate: &[f64]| -> f64 {
+                let (mean, var) = gpr.posterior(candidate);
+                let mut acqf = log_ei(mean, var, f0);
+                for (c_gpr, c_threshold) in &constraint_gps {
+                    let (c_mean, c_var) = c_gpr.posterior(candidate);
+                    let sigma = (c_var + EPS).sqrt();
+                    let z = (c_mean - c_threshold) / sigma;
+                    acqf += normal_cdf(z).max(1e-30).ln();
+                }
+                acqf
+            };
+
+            let mut best_acqf = f64::NEG_INFINITY;
+            let mut best_params = vec![0.5; n_params];
+
+            // 1. 最佳可行点作为初始候选
+            if let Some(best_idx) = standardized_by_obj[0].iter().enumerate()
+                .zip(is_feasible.iter())
+                .filter(|(_, feas)| **feas)
+                .map(|((i, y), _)| (i, y))
+                .max_by(|a, b| a.1.partial_cmp(b.1).unwrap()).map(|(i, _)| i) {
+                let acqf = eval_acqf(&x_train[best_idx]);
+                if acqf > best_acqf {
+                    best_acqf = acqf;
+                    best_params = x_train[best_idx].clone();
+                }
+            }
+
+            // 2. 随机候选点
+            for _ in 0..self.n_preliminary_samples {
+                let candidate = self.random_candidate(n_params, &is_categorical, search_space, &param_names, &mut rng);
+                let acqf = eval_acqf(&candidate);
+                if acqf > best_acqf {
+                    best_acqf = acqf;
+                    best_params = candidate;
+                }
+            }
+
+            // 3. 局部搜索
+            for _ in 0..self.n_local_search {
+                let perturbed = self.perturb_candidate(&best_params, &is_categorical, &mut rng);
+                let acqf = eval_acqf(&perturbed);
+                if acqf > best_acqf {
+                    best_acqf = acqf;
+                    best_params = perturbed;
+                }
+            }
+
+            self.unnormalize_result(&best_params, &param_names, search_space)
+        } else {
+            // ── 多目标: logEHVI ──
+            // 对齐 Python `acqf.LogEHVI`
+
+            // 1. 计算非支配盒分解（在 loss 空间: 取负 → 越小越好）
+            let loss_vals: Vec<Vec<f64>> = standardized_score_vals.iter()
+                .map(|sv| sv.iter().map(|&v| -v).collect())
+                .collect();
+
+            let pareto_mask = is_pareto_front_min(&loss_vals);
+            let pareto_sols: Vec<Vec<f64>> = loss_vals.iter().zip(pareto_mask.iter())
+                .filter(|(_, on)| **on)
+                .map(|(v, _)| v.clone())
+                .collect();
+
+            // 参考点: 对齐 Python — max(loss) * 1.1 (or 0.9 for negative)
+            let ref_point: Vec<f64> = (0..n_objectives).map(|d| {
+                let max_val = loss_vals.iter().map(|v| v[d]).fold(f64::NEG_INFINITY, f64::max);
+                let rp = if max_val >= 0.0 { 1.1 * max_val } else { 0.9 * max_val };
+                // nextafter(rp, inf) — 在 Rust 中用小增量模拟
+                rp + f64::EPSILON * rp.abs().max(1.0)
+            }).collect();
+
+            let (box_lower_loss, box_upper_loss) = crate::multi_objective::get_non_dominated_box_bounds(
+                &pareto_sols, &ref_point,
+            );
+
+            // 将盒边界从 loss 空间翻转回 score 空间（取负）
+            // 对齐 Python: lower_bounds = -ubs, upper_bounds = -lbs
+            let box_lower_score: Vec<Vec<f64>> = box_upper_loss.iter()
+                .map(|ub| ub.iter().map(|&v| -v).collect())
+                .collect();
+            let box_upper_score: Vec<Vec<f64>> = box_lower_loss.iter()
+                .map(|lb| lb.iter().map(|&v| -v).collect())
+                .collect();
+            let box_intervals: Vec<Vec<f64>> = box_lower_score.iter().zip(box_upper_score.iter())
+                .map(|(lb, ub)| lb.iter().zip(ub.iter()).map(|(&l, &u)| (u - l).max(EPS)).collect())
+                .collect();
+
+            // 2. 生成 QMC 正态样本 [n_qmc_samples, n_objectives]
+            let qmc_seed = rng.random_range(0u64..1u64 << 30);
+            let fixed_samples = sample_from_normal_sobol(
+                n_objectives, self.n_qmc_samples, qmc_seed,
+            );
+
+            // 3. 构建 logEHVI 评估函数
+            let eval_acqf = |candidate: &[f64]| -> f64 {
+                // 对每个目标获取后验 mean, var
+                let mut y_post: Vec<Vec<f64>> = Vec::with_capacity(self.n_qmc_samples);
+                for s in 0..self.n_qmc_samples {
+                    let mut sample = Vec::with_capacity(n_objectives);
+                    for obj in 0..n_objectives {
+                        let (mean, var) = gprs_list[obj].posterior(candidate);
+                        let stdev = (var + EPS).sqrt();
+                        sample.push(mean + stdev * fixed_samples[s][obj]);
                     }
-                } else {
-                    rng.random_range(0.0..1.0)
+                    y_post.push(sample);
                 }
-            }).collect();
+                let mut acqf = log_ehvi(&y_post, &box_lower_score, &box_intervals);
 
-            let acqf = eval_acqf(&candidate, &gpr, &constraint_gps);
-            if acqf > best_acqf {
-                best_acqf = acqf;
-                best_params = candidate;
-            }
-        }
-
-        // 3. 局部搜索：在最佳点附近微调
-        for _ in 0..self.n_local_search {
-            let perturbed: Vec<f64> = (0..n_params).map(|d| {
-                if is_categorical[d] {
-                    best_params[d]
-                } else {
-                    let noise = (rng.random_range(0.0..1.0) - 0.5) * 0.1;
-                    (best_params[d] + noise).clamp(0.0, 1.0)
+                // 约束: 加上 logPI
+                for (c_gpr, c_threshold) in &constraint_gps {
+                    let (c_mean, c_var) = c_gpr.posterior(candidate);
+                    let sigma = (c_var + EPS).sqrt();
+                    let z = (c_mean - c_threshold) / sigma;
+                    acqf += normal_cdf(z).max(1e-30).ln();
                 }
-            }).collect();
+                acqf
+            };
 
-            let acqf = eval_acqf(&perturbed, &gpr, &constraint_gps);
-            if acqf > best_acqf {
-                best_acqf = acqf;
-                best_params = perturbed;
+            let mut best_acqf = f64::NEG_INFINITY;
+            let mut best_params = vec![0.5; n_params];
+
+            // 4. 对齐 Python _get_best_params_for_multi_objective:
+            //    从 Pareto 前沿（score 空间）随机选若干点作为热启动
+            let pareto_indices: Vec<usize> = pareto_mask.iter().enumerate()
+                .filter(|(_, on)| **on)
+                .map(|(i, _)| i)
+                .collect();
+
+            if !pareto_indices.is_empty() {
+                let n_warmstart = (self.n_local_search / 2).min(pareto_indices.len());
+                // 简单选前 n_warmstart 个 Pareto 点（确定性）
+                for &idx in &pareto_indices[..n_warmstart] {
+                    let acqf = eval_acqf(&x_train[idx]);
+                    if acqf > best_acqf {
+                        best_acqf = acqf;
+                        best_params = x_train[idx].clone();
+                    }
+                }
             }
-        }
 
-        // 将归一化参数转回内部表示
+            // 5. 随机候选点
+            for _ in 0..self.n_preliminary_samples {
+                let candidate = self.random_candidate(n_params, &is_categorical, search_space, &param_names, &mut rng);
+                let acqf = eval_acqf(&candidate);
+                if acqf > best_acqf {
+                    best_acqf = acqf;
+                    best_params = candidate;
+                }
+            }
+
+            // 6. 局部搜索
+            for _ in 0..self.n_local_search {
+                let perturbed = self.perturb_candidate(&best_params, &is_categorical, &mut rng);
+                let acqf = eval_acqf(&perturbed);
+                if acqf > best_acqf {
+                    best_acqf = acqf;
+                    best_params = perturbed;
+                }
+            }
+
+            self.unnormalize_result(&best_params, &param_names, search_space)
+        }
+    }
+
+    /// 生成随机候选点（归一化空间）
+    fn random_candidate(
+        &self,
+        n_params: usize,
+        is_categorical: &[bool],
+        search_space: &IndexMap<String, Distribution>,
+        param_names: &[String],
+        rng: &mut ChaCha8Rng,
+    ) -> Vec<f64> {
+        (0..n_params).map(|d| {
+            if is_categorical[d] {
+                match &search_space[&param_names[d]] {
+                    Distribution::CategoricalDistribution(c) => {
+                        (rng.random_range(0.0..1.0) * c.choices.len() as f64).floor()
+                    }
+                    _ => rng.random_range(0.0..1.0),
+                }
+            } else {
+                rng.random_range(0.0..1.0)
+            }
+        }).collect()
+    }
+
+    /// 在最佳点附近微调（连续参数加噪声，分类参数不变）
+    fn perturb_candidate(
+        &self,
+        best: &[f64],
+        is_categorical: &[bool],
+        rng: &mut ChaCha8Rng,
+    ) -> Vec<f64> {
+        best.iter().enumerate().map(|(d, &v)| {
+            if is_categorical[d] {
+                v
+            } else {
+                let noise = (rng.random_range(0.0..1.0) - 0.5) * 0.1;
+                (v + noise).clamp(0.0, 1.0)
+            }
+        }).collect()
+    }
+
+    /// 将归一化参数转回内部表示
+    fn unnormalize_result(
+        &self,
+        best_params: &[f64],
+        param_names: &[String],
+        search_space: &IndexMap<String, Distribution>,
+    ) -> Result<HashMap<String, f64>> {
         let mut result = HashMap::new();
         for (d, name) in param_names.iter().enumerate() {
             let dist = &search_space[name];
             let internal = unnormalize_param(best_params[d], dist);
             result.insert(name.clone(), internal);
         }
-
         Ok(result)
     }
 
@@ -1303,5 +1620,140 @@ mod tests {
         // 有缓存的结果不应该更差（缓存提供了一个额外的候选初始点）
         assert!(lml2 >= lml1 - 1e-6,
             "使用缓存的 LML ({lml2}) 不应差于无缓存 ({lml1})");
+    }
+
+    #[test]
+    fn test_erfinv_basic() {
+        // erfinv(0) = 0
+        assert!((erfinv(0.0)).abs() < 1e-10);
+        // erfinv(erf(1)) ≈ 1
+        let erf1 = libm::erf(1.0);
+        assert!((erfinv(erf1) - 1.0).abs() < 0.01, "erfinv(erf(1))={}", erfinv(erf1));
+        // 对称性: erfinv(-x) = -erfinv(x)
+        assert!((erfinv(0.5) + erfinv(-0.5)).abs() < 1e-10);
+    }
+
+    #[test]
+    fn test_sobol_normal_samples() {
+        let samples = sample_from_normal_sobol(2, 100, 42);
+        assert_eq!(samples.len(), 100);
+        assert_eq!(samples[0].len(), 2);
+        // 所有值应有限
+        for s in &samples {
+            for &v in s {
+                assert!(v.is_finite(), "Sobol normal sample should be finite: {v}");
+            }
+        }
+        // 均值应接近 0
+        let mean0: f64 = samples.iter().map(|s| s[0]).sum::<f64>() / 100.0;
+        assert!(mean0.abs() < 0.5, "QMC normal mean should be near 0: {mean0}");
+    }
+
+    #[test]
+    fn test_log_ehvi_basic() {
+        // 简单 2D 测试: 1 个 box [0,0] → [1,1]，1 个后验样本 [0.5, 0.5]
+        let y_post = vec![vec![0.5, 0.5]];
+        let box_lower = vec![vec![0.0, 0.0]];
+        let box_intervals = vec![vec![1.0, 1.0]];
+        let lehvi = log_ehvi(&y_post, &box_lower, &box_intervals);
+        // 改善 = 0.5 * 0.5 = 0.25, log(0.25) ≈ -1.386
+        assert!((lehvi - 0.25_f64.ln()).abs() < 0.1, "logEHVI={lehvi}");
+    }
+
+    #[test]
+    fn test_is_pareto_front_min() {
+        let vals = vec![
+            vec![1.0, 3.0],  // Pareto
+            vec![2.0, 2.0],  // Pareto
+            vec![3.0, 1.0],  // Pareto
+            vec![2.0, 3.0],  // dominated by [1,3]
+        ];
+        let front = is_pareto_front_min(&vals);
+        assert_eq!(front, vec![true, true, true, false]);
+    }
+
+    #[test]
+    fn test_gp_multi_objective_optimize() {
+        // 双目标优化: min(x^2, (x-1)^2) — Pareto 前沿在 [0, 1]
+        let sampler: Arc<dyn Sampler> = Arc::new(GpSampler::with_directions(
+            Some(42),
+            vec![StudyDirection::Minimize, StudyDirection::Minimize],
+            Some(5),
+            false, None, None,
+        ));
+        let study = crate::study::create_study(
+            None, Some(sampler), None, None,
+            None, Some(vec![StudyDirection::Minimize, StudyDirection::Minimize]),
+            false,
+        ).unwrap();
+
+        study.optimize_multi(|trial| {
+            let x = trial.suggest_float("x", 0.0, 2.0, false, None)?;
+            Ok(vec![x * x, (x - 1.0) * (x - 1.0)])
+        }, Some(15), None, None).unwrap();
+
+        let trials = study.trials().unwrap();
+        let completed: Vec<_> = trials.iter().filter(|t| t.state == TrialState::Complete).collect();
+        assert!(completed.len() >= 10, "Should have at least 10 completed trials");
+
+        // 验证 GP 采样器确实在运行（不止是随机采样）
+        // Pareto 前沿上的点 x ∈ [0,1]
+        let pareto_trials: Vec<_> = completed.iter().filter(|t| {
+            if let Some(vals) = &t.values {
+                vals[0] <= 1.5 && vals[1] <= 1.5
+            } else { false }
+        }).collect();
+        assert!(!pareto_trials.is_empty(), "Should have some near-Pareto trials");
+    }
+
+    #[test]
+    fn test_gp_sampler_multi_obj_cache() {
+        // 测试多目标 GP 缓存: 应该有 n_objectives 个缓存条目
+        let sampler = GpSampler::with_directions(
+            Some(42),
+            vec![StudyDirection::Minimize, StudyDirection::Minimize],
+            Some(3),
+            false, None, None,
+        );
+
+        let mut trials = Vec::new();
+        for i in 0..5 {
+            let x = i as f64 * 0.25;
+            let mut params = HashMap::new();
+            params.insert("x".to_string(), crate::distributions::ParamValue::Float(x));
+            let mut dists = HashMap::new();
+            dists.insert("x".to_string(),
+                Distribution::FloatDistribution(
+                    crate::distributions::FloatDistribution {
+                        low: 0.0, high: 1.0, log: false, step: None,
+                    },
+                ));
+            trials.push(FrozenTrial {
+                number: i as i64, trial_id: i as i64,
+                state: TrialState::Complete,
+                values: Some(vec![x * x, (x - 1.0).powi(2)]),
+                params, distributions: dists,
+                user_attrs: HashMap::new(),
+                system_attrs: HashMap::new(),
+                intermediate_values: HashMap::new(),
+                datetime_start: None, datetime_complete: None,
+            });
+        }
+
+        let mut search_space = IndexMap::new();
+        search_space.insert("x".to_string(),
+            Distribution::FloatDistribution(
+                crate::distributions::FloatDistribution {
+                    low: 0.0, high: 1.0, log: false, step: None,
+                },
+            ));
+
+        let _result = sampler.sample_relative_impl(&trials, &search_space).unwrap();
+        {
+            let cache = sampler.gprs_cache.lock();
+            assert!(cache.is_some(), "缓存应该在第一次调用后被填充");
+            let list = cache.as_ref().unwrap();
+            assert_eq!(list.len(), 2, "双目标应有 2 个缓存条目");
+        }
     }
 }

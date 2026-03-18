@@ -716,11 +716,11 @@
 - #1 MOTPE → 部分解决（>3 目标近似路径 + n_below 优化）
 
 仍待修复:
-- #2 NSGA-II 无代际系统
-- #3 CMA-ES 状态不持久化
+- ~~#2 NSGA-II 无代际系统~~ → ✅ Session 51 确认已实现
+- ~~#3 CMA-ES 状态不持久化~~ → ✅ Session 51 确认已实现
 - #5 _filter_study 缺失
-- #6 reseed_rng 缺失
-- #9 GP 缺少多目标支持（LogEHVI/ConstrainedLogEHVI）
+- ~~#6 reseed_rng 缺失~~ → ✅ Session 51 确认已实现
+- ~~#9 GP 缺少多目标支持（LogEHVI/ConstrainedLogEHVI）~~ → ✅ Session 51 已修复
 - #10 GP 采集函数优化简化（无 L-BFGS-B + QMC）
 
 ### 测试统计
@@ -742,3 +742,82 @@
 | src/distributions/categorical.rs | contains 对齐 int() 截断 + 更新测试 |
 | src/samplers/tpe/sampler.rs | >3 目标近似 HV + n_below 提前终止 + 单目标路径 + 3 测试 |
 | tests/test_cross_validation.py | 8 个新 Python 交叉验证测试 |
+
+---
+
+## Session 51/52 — GP 多目标支持 (LogEHVI)
+
+### 审计发现
+
+对 Session 37 遗留的 5 个待修复项逐一核实：
+
+| 待修复项 | 状态 | 说明 |
+|----------|------|------|
+| NSGA-II 无代际系统 | ✅ 已实现 | GaSampler trait: get_trial_generation / get_population / get_parent_population，system_attrs 持久化 |
+| CMA-ES 状态不持久化 | ✅ 已实现 | JSON 序列化 + 2045 字节分块 + system_attrs 存储 + try_restore_state |
+| reseed_rng 缺失 | ✅ 已实现 | Sampler trait 已有 reseed_rng()，所有采样器均覆写 |
+| GP 缺少多目标 (LogEHVI) | 🔧 本次修复 | 见下方 |
+| GP 采集函数优化简化 | ⏳ 待改进 | 目前使用随机+扰动，Python 使用 L-BFGS-B + QMC |
+
+### 已修复项
+
+#### GP 多目标支持 (LogEHVI)
+
+**根因**: Rust GpSampler 仅支持单目标 (LogEI)，Python 同时支持单目标和多目标 (LogEHVI)。
+
+**修复内容**:
+
+1. **GpSampler 结构体重构**
+   - `direction: StudyDirection` → `directions: Vec<StudyDirection>`
+   - 新增 `n_qmc_samples: usize` 字段 (默认 128)
+   - 新增 `with_directions()` 构造函数支持多目标
+
+2. **LogEHVI 采集函数实现** (`log_ehvi()`)
+   - 基于非支配盒分解 (`get_non_dominated_box_bounds`)
+   - QMC Sobol 后验采样 (`sample_from_normal_sobol`)
+   - 对每个候选点计算期望超体积改善的对数
+
+3. **QMC 正态采样** (`sample_from_normal_sobol()`)
+   - Sobol 序列 → 逆误差函数 → 标准正态分布
+   - 自实现 `erfinv()` (Winitzki 有理近似)
+
+4. **Pareto 前沿检测** (`is_pareto_front_min()`)
+   - 用于多目标优化中识别非支配解
+
+5. **sample_relative_impl 全面重写**
+   - 单目标路径: LogEI (不变)
+   - 多目标路径: 为每个目标独立拟合 GP → QMC 后验采样 → LogEHVI 选择最佳候选
+   - 辅助方法提取: `random_candidate()`, `perturb_candidate()`, `unnormalize_result()`
+
+### 新增测试
+
+#### Rust 单元测试 (+6)
+- `test_erfinv_basic` — erfinv 精度验证
+- `test_sobol_normal_samples` — QMC 正态采样分布验证
+- `test_log_ehvi_basic` — LogEHVI 计算正确性
+- `test_is_pareto_front_min` — Pareto 前沿检测
+- `test_gp_multi_objective_optimize` — 双目标集成测试 (15 trials)
+- `test_gp_sampler_multi_obj_cache` — 多目标 GP 缓存测试
+
+#### Python 交叉验证测试 (+3)
+- `test_gp_sampler_multi_objective` — 双目标 minimize
+- `test_gp_sampler_multi_objective_3d` — 三目标 minimize
+- `test_gp_sampler_multi_objective_maximize` — 双目标 maximize
+
+### 测试统计
+
+| 指标 | 数值 |
+|------|------|
+| Rust 测试总数 | 948 (unit) + 5 (doc) |
+| Python 交叉验证 | 212 |
+| 本次新增 Rust | +6 |
+| 本次新增 Python | +3 |
+| 修改文件数 | 3 |
+
+### 修改文件清单
+
+| 文件 | 修改内容 |
+|------|---------|
+| src/samplers/gp.rs | 多目标重构 + LogEHVI + erfinv + QMC + 6 测试 |
+| src/samplers/qmc.rs | sobol_point_pub() 公开接口 |
+| tests/test_cross_validation.py | 3 个新 Python 交叉验证测试 |

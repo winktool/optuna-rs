@@ -184,6 +184,11 @@ fn van_der_corput_scrambled(mut n: u64, base: u64, seed: u64) -> f64 {
     result
 }
 
+/// 公开的 Sobol 点生成接口，供 GP 采样器的 LogEHVI 使用。
+pub fn sobol_point_pub(index: u64, dim: usize, scramble: bool, seed: u64) -> Vec<f64> {
+    sobol_point(index, dim, scramble, seed)
+}
+
 /// 生成第 index 个 Halton 点（[0,1]^d 空间）。
 fn halton_point(index: u64, dim: usize, scramble: bool, seed: u64) -> Vec<f64> {
     (0..dim)

@@ -3334,6 +3334,68 @@ def test_non_domination_rank_n_below():
     assert ranks_limited[1] == 0
 
 
+# ═══════════════════════════════════════════════════════════════════════════
+#  Session 51/52: GP 多目标 (LogEHVI) 交叉验证测试
+# ═══════════════════════════════════════════════════════════════════════════
+
+def test_gp_sampler_multi_objective():
+    """对齐 Rust gp.rs: GPSampler 支持多目标优化 (LogEHVI)。
+    Python GPSampler 在多 directions 时，使用 LogEHVI 采集函数。"""
+    sampler = optuna.samplers.GPSampler(seed=42)
+    study = optuna.create_study(
+        sampler=sampler,
+        directions=["minimize", "minimize"],
+    )
+
+    def objective(trial):
+        x = trial.suggest_float("x", 0.0, 2.0)
+        return x ** 2, (x - 1.0) ** 2
+
+    study.optimize(objective, n_trials=15)
+    completed = [t for t in study.trials if t.state == optuna.trial.TrialState.COMPLETE]
+    assert len(completed) >= 10, f"Should have >= 10 completed, got {len(completed)}"
+
+    # 某些试验应接近 Pareto 前沿: x ∈ [0,1], f ∈ [0,1]²
+    pareto_near = [t for t in completed
+                   if t.values[0] <= 1.5 and t.values[1] <= 1.5]
+    assert len(pareto_near) > 0, "Should have trials near the Pareto front"
+
+
+def test_gp_sampler_multi_objective_3d():
+    """对齐 Rust gp.rs: GPSampler 3 目标优化。"""
+    sampler = optuna.samplers.GPSampler(seed=42)
+    study = optuna.create_study(
+        sampler=sampler,
+        directions=["minimize", "minimize", "minimize"],
+    )
+
+    def objective(trial):
+        x = trial.suggest_float("x", 0.0, 3.0)
+        y = trial.suggest_float("y", 0.0, 3.0)
+        return x ** 2, y ** 2, (x - y) ** 2
+
+    study.optimize(objective, n_trials=15)
+    completed = [t for t in study.trials if t.state == optuna.trial.TrialState.COMPLETE]
+    assert len(completed) >= 10, f"Should have >= 10 completed, got {len(completed)}"
+
+
+def test_gp_sampler_multi_objective_maximize():
+    """对齐 Rust gp.rs: GPSampler 多目标 maximize 方向。"""
+    sampler = optuna.samplers.GPSampler(seed=42)
+    study = optuna.create_study(
+        sampler=sampler,
+        directions=["maximize", "maximize"],
+    )
+
+    def objective(trial):
+        x = trial.suggest_float("x", 0.0, 1.0)
+        return x, 1.0 - x  # Pareto front: (x, 1-x) for x ∈ [0,1]
+
+    study.optimize(objective, n_trials=15)
+    completed = [t for t in study.trials if t.state == optuna.trial.TrialState.COMPLETE]
+    assert len(completed) >= 10
+
+
 #  执行
 # ═══════════════════════════════════════════════════════════════════════════
 

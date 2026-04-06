@@ -34,8 +34,21 @@ use crate::search_space::SearchSpaceTransform;
 use crate::trial::{FrozenTrial, TrialState};
 use crate::optuna_warn;
 
-/// Halton 序列的前 20 个素数基底。
-const PRIMES: [u64; 20] = [2, 3, 5, 7, 11, 13, 17, 19, 23, 29, 31, 37, 41, 43, 47, 53, 59, 61, 67, 71];
+/// Halton 序列的前 100 个素数基底。
+/// Python scipy.stats.qmc.Halton 同样使用素数基底生成 Van der Corput 序列。
+/// 扩展到 100 维以支持高维搜索空间（原 20 维限制会导致非素数退化）。
+const PRIMES: [u64; 100] = [
+    2, 3, 5, 7, 11, 13, 17, 19, 23, 29,           // dim 0-9
+    31, 37, 41, 43, 47, 53, 59, 61, 67, 71,        // dim 10-19
+    73, 79, 83, 89, 97, 101, 103, 107, 109, 113,    // dim 20-29
+    127, 131, 137, 139, 149, 151, 157, 163, 167, 173, // dim 30-39
+    179, 181, 191, 193, 197, 199, 211, 223, 227, 229, // dim 40-49
+    233, 239, 241, 251, 257, 263, 269, 271, 277, 281, // dim 50-59
+    283, 293, 307, 311, 313, 317, 331, 337, 347, 349, // dim 60-69
+    353, 359, 367, 373, 379, 383, 389, 397, 401, 409, // dim 70-79
+    419, 421, 431, 433, 439, 443, 449, 457, 461, 463, // dim 80-89
+    467, 479, 487, 491, 499, 503, 509, 521, 523, 541, // dim 90-99
+];
 
 /// QMC 序列类型。对应 Python `QMCSampler(qmc_type=...)`.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -157,7 +170,7 @@ impl QmcSampler {
 
 /// 计算 Van der Corput 序列值。
 /// 将索引 n 按照基底 base 展开为小数序列值。
-fn van_der_corput(mut n: u64, base: u64) -> f64 {
+pub fn van_der_corput(mut n: u64, base: u64) -> f64 {
     let mut result = 0.0;
     let mut denom = 1.0;
     while n > 0 {
@@ -190,14 +203,14 @@ pub fn sobol_point_pub(index: u64, dim: usize, scramble: bool, seed: u64) -> Vec
 }
 
 /// 生成第 index 个 Halton 点（[0,1]^d 空间）。
-fn halton_point(index: u64, dim: usize, scramble: bool, seed: u64) -> Vec<f64> {
+pub fn halton_point(index: u64, dim: usize, scramble: bool, seed: u64) -> Vec<f64> {
     (0..dim)
         .map(|d| {
             let base = if d < PRIMES.len() {
                 PRIMES[d]
             } else {
-                // For high dimensions, use odd numbers as bases
-                2 * d as u64 + 3
+                // 超过 100 维：运行时生成第 d 个素数（筛法）
+                nth_prime(d)
             };
             if scramble {
                 van_der_corput_scrambled(index, base, seed.wrapping_add(d as u64))
@@ -206,6 +219,35 @@ fn halton_point(index: u64, dim: usize, scramble: bool, seed: u64) -> Vec<f64> {
             }
         })
         .collect()
+}
+
+/// 返回第 n 个素数（0-索引，即 nth_prime(0)=2, nth_prime(1)=3, ...）。
+/// 用于 Halton 序列在超出 PRIMES 表时的动态扩展。
+fn nth_prime(n: usize) -> u64 {
+    let mut count = 0usize;
+    let mut candidate = 2u64;
+    loop {
+        if is_prime(candidate) {
+            if count == n {
+                return candidate;
+            }
+            count += 1;
+        }
+        candidate += 1;
+    }
+}
+
+/// 简单素数检测，仅供 nth_prime 内部使用。
+fn is_prime(n: u64) -> bool {
+    if n < 2 { return false; }
+    if n < 4 { return true; }
+    if n % 2 == 0 || n % 3 == 0 { return false; }
+    let mut i = 5u64;
+    while i * i <= n {
+        if n % i == 0 || n % (i + 2) == 0 { return false; }
+        i += 6;
+    }
+    true
 }
 
 // ════════════════════════════════════════════════════════════════════════
@@ -418,8 +460,8 @@ impl Sampler for QmcSampler {
     }
 
     /// 对应 Python `before_trial` — 委托给 independent_sampler。
-    fn before_trial(&self, trials: &[FrozenTrial]) {
-        self.independent_sampler.before_trial(trials);
+    fn before_trial(&self, trials: &[FrozenTrial], trial_id: i64, storage: &dyn crate::storage::Storage) {
+        self.independent_sampler.before_trial(trials, trial_id, storage);
     }
 
     /// 对应 Python `after_trial` — 委托给 independent_sampler。

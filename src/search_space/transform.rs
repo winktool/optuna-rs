@@ -236,6 +236,23 @@ fn transform_numerical_int(value: i64, d: &IntDistribution, transform_log: bool)
     }
 }
 
+/// 银行家舍入 (round half to even)，对齐 Python `np.round()` / IEEE 754 默认舍入。
+/// Rust `f64::round()` 使用 "round half away from zero"，在 0.5 边界处与 Python 不一致。
+/// 例如: `np.round(4.5) = 4`, 但 `4.5_f64.round() = 5`。
+pub fn round_ties_even(x: f64) -> f64 {
+    let r = x.round();
+    // 检测是否精确在 0.5 边界: 0.5 在 IEEE 754 中可以精确表示，
+    // 所以只需精确比较。容差过大会导致接近 0.5 的非 tie 值被误判。
+    let frac = x - x.floor();
+    if frac == 0.5 {
+        // 在 0.5 边界时，round() 可能给出奇数结果，需要修正为偶数
+        if r as i64 % 2 != 0 {
+            return if x > 0.0 { r - 1.0 } else { r + 1.0 };
+        }
+    }
+    r
+}
+
 fn untransform_numerical_float(trans: f64, d: &FloatDistribution, transform_log: bool) -> f64 {
     if d.log {
         let v = if transform_log { trans.exp() } else { trans };
@@ -246,7 +263,8 @@ fn untransform_numerical_float(trans: f64, d: &FloatDistribution, transform_log:
             v.clamp(d.low, next_down(d.high))
         }
     } else if let Some(step) = d.step {
-        let v = ((trans - d.low) / step).round() * step + d.low;
+        // 使用银行家舍入对齐 Python np.round()
+        let v = round_ties_even((trans - d.low) / step) * step + d.low;
         v.clamp(d.low, d.high)
     } else if d.single() {
         trans
@@ -260,15 +278,18 @@ fn untransform_numerical_int(trans: f64, d: &IntDistribution, transform_log: boo
     if d.log {
         if transform_log {
             // 对齐 Python: int(np.clip(np.round(exp(trans)), low, high))
+            // np.round 使用银行家舍入
             let v = trans.exp();
-            (v.round() as i64).clamp(d.low, d.high)
+            (round_ties_even(v) as i64).clamp(d.low, d.high)
         } else {
             // 对齐 Python: int(trans_param) — 向零截断（非四舍五入）
             (trans as i64).clamp(d.low, d.high)
         }
     } else {
-        let v = ((trans - d.low as f64) / d.step as f64).round() * d.step as f64 + d.low as f64;
-        (v.round() as i64).clamp(d.low, d.high)
+        // 使用银行家舍入对齐 Python np.round()
+        let v = round_ties_even((trans - d.low as f64) / d.step as f64) * d.step as f64
+            + d.low as f64;
+        (round_ties_even(v) as i64).clamp(d.low, d.high)
     }
 }
 

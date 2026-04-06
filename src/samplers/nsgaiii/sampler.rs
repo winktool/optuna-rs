@@ -282,7 +282,7 @@ impl NSGAIIISampler {
 }
 
 /// Perpendicular distance from a point to a reference direction line.
-fn perpendicular_distance(point: &[f64], direction: &[f64]) -> f64 {
+pub fn perpendicular_distance(point: &[f64], direction: &[f64]) -> f64 {
     let norm_sq: f64 = direction.iter().map(|d| d * d).sum();
     if norm_sq < 1e-14 {
         return f64::INFINITY;
@@ -501,15 +501,18 @@ impl Sampler for NSGAIIISampler {
         };
 
         // Mutation: 对齐 Python — 被 mutate 的参数从返回结果中排除
+        // 对齐 Python: mutation_prob = 1.0 / max(1, n_params)
+        // 注意: Python 用原始参数数量 n_params, 不是编码维度 n_dims
+        let n_params = ordered_space.len();
         let mutation_prob = self
             .mutation_prob
-            .unwrap_or_else(|| 1.0 / n_dims.max(1) as f64);
-        let mut mutated = vec![false; n_dims];
-        for (i, m) in mutated.iter_mut().enumerate() {
+            .unwrap_or_else(|| 1.0 / n_params.max(1) as f64);
+        // 对齐 Python: 每个参数（非编码维度）独立决定是否变异
+        let mut mutated = vec![false; n_params];
+        for m in mutated.iter_mut() {
             if rng.random::<f64>() < mutation_prob {
                 *m = true;
             }
-            let _ = i;
         }
 
         for v in &mut child {

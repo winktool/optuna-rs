@@ -1,2 +1,6 @@
 /target
 tests/__pycache__/
+.DS_Store
+*.zip
+.pytest_cache/
+.md

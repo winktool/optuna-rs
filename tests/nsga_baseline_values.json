@@ -1,0 +1,52 @@
+{
+  "cd_2d": [
+    "Infinity",
+    1.1,
+    0.9,
+    0.9,
+    "Infinity"
+  ],
+  "cd_same_dim": [
+    "Infinity",
+    1.0,
+    "Infinity"
+  ],
+  "cd_two": [
+    "Infinity",
+    "Infinity"
+  ],
+  "cd_one": [
+    0.0
+  ],
+  "cd_inf": [
+    "Infinity",
+    "Infinity",
+    "Infinity",
+    "Infinity"
+  ],
+  "cd_3d": [
+    "Infinity",
+    "Infinity",
+    1.833333333333333,
+    "Infinity"
+  ],
+  "nds_ranks_2d": [
+    0,
+    0,
+    0,
+    1,
+    2
+  ],
+  "nds_ranks_3d": [
+    0,
+    0,
+    0,
+    0,
+    1
+  ],
+  "nds_ranks_same": [
+    0,
+    0,
+    0
+  ]
+}

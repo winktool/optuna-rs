@@ -461,14 +461,20 @@ impl Crossover for VSBXCrossover {
             }
 
             // 基因选择逻辑（逐维度）
+            // 对齐 Python: 无论是使用子代基因还是父代基因，
+            //   都需要检查 uniform_crossover_prob 并消耗一个随机数。
             let r1: f64 = rng_f64(rng);
+            let r2: f64 = rng_f64(rng); // 对齐 Python: 两个分支都消耗此随机数
             if r1 >= self.use_child_gene_prob {
                 // 使用父代基因
                 child1[i] = p0;
                 child2[i] = p1;
+                // 对齐 Python: 父代基因也需要检查 uniform_crossover_prob 交换
+                if r2 < self.uniform_crossover_prob {
+                    std::mem::swap(&mut child1[i], &mut child2[i]);
+                }
             } else {
-                // 交叉概率选择
-                let r2: f64 = rng_f64(rng);
+                // 使用子代基因，检查交叉概率
                 if r2 < self.uniform_crossover_prob {
                     std::mem::swap(&mut child1[i], &mut child2[i]);
                 }

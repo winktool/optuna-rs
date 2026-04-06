@@ -669,7 +669,9 @@ impl TpeSampler {
     /// 对齐 Python `_calculate_weights_below_for_multi_objective`:
     /// 基于超体积贡献计算 below 组的权重。
     /// 不可行试验（约束违反 > 0）权重设为 EPS，不参与 HV 计算。
-    fn calculate_mo_weights(
+    /// 对齐 Python `_calculate_weights_below_for_multi_objective`:
+    /// 在多目标 TPE 中，为 below 组的每个试验分配基于超体积贡献的权重。
+    pub fn calculate_mo_weights(
         below_trials: &[&FrozenTrial],
         directions: &[StudyDirection],
         constraints_enabled: bool,

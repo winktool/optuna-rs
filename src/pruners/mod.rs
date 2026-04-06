@@ -15,6 +15,7 @@ pub use percentile::PercentilePruner;
 pub use successive_halving::SuccessiveHalvingPruner;
 pub use threshold::ThresholdPruner;
 pub use wilcoxon::WilcoxonPruner;
+pub use wilcoxon::wilcoxon_signed_rank_test;
 
 use crate::error::Result;
 use crate::storage::Storage;

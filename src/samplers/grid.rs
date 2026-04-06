@@ -262,17 +262,21 @@ impl Sampler for GridSampler {
         )))
     }
 
-    fn before_trial(&self, trials: &[FrozenTrial]) {
-        // This is called before a trial starts. We need to assign a grid_id.
-        // However, we can't modify the trial from here — the study will need to
-        // set the system_attr. We'll store the suggested grid_id so the study
-        // can retrieve it.
-        //
-        // Note: In Python optuna, before_trial sets the grid_id as a system_attr
-        // on the trial via study._storage. Since our trait doesn't give us storage
-        // access, the Study::ask() method handles this by calling
-        // `suggest_grid_id()` and setting the system_attr.
-        let _ = trials;
+    fn before_trial(&self, trials: &[FrozenTrial], trial_id: i64, storage: &dyn crate::storage::Storage) {
+        // 对齐 Python GridSampler.before_trial: 在 trial 开始前分配 grid_id
+        // 检查是否已有 grid_id（来自 enqueue_trial 或 RetryFailedTrialCallback）
+        if let Ok(trial) = storage.get_trial(trial_id) {
+            if trial.system_attrs.contains_key("grid_id") || trial.system_attrs.contains_key("fixed_params") {
+                return;
+            }
+        }
+        if let Ok(grid_id) = self.pick_grid_id(trials) {
+            let _ = storage.set_trial_system_attr(
+                trial_id,
+                "grid_id",
+                serde_json::json!(grid_id),
+            );
+        }
     }
 
     /// 对齐 Python: grid 耗尽时通知 study 停止优化循环。

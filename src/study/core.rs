@@ -374,7 +374,10 @@ impl Study {
         let filtered_trials = self.pruner.filter_trials(&all_trials, &trial);
 
         // Run sampler hooks
-        self.sampler.before_trial(&filtered_trials);
+        self.sampler.before_trial(&filtered_trials, trial_id, self.storage.as_ref());
+
+        // Re-fetch trial after before_trial (GridSampler may have set system_attrs)
+        let trial = self.storage.get_trial(trial_id)?;
 
         // Determine search space: fixed_distributions override sampler's relative space
         let search_space = if let Some(fixed) = fixed_distributions {

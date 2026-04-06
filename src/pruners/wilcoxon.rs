@@ -181,7 +181,7 @@ impl Pruner for WilcoxonPruner {
 ///
 /// # 返回值
 /// p 值。p < threshold 表示差异显著。
-fn wilcoxon_signed_rank_test(diff_values: &[f64], direction: StudyDirection) -> f64 {
+pub fn wilcoxon_signed_rank_test(diff_values: &[f64], direction: StudyDirection) -> f64 {
     let n = diff_values.len();
     if n == 0 {
         return 1.0;
@@ -205,71 +205,40 @@ fn wilcoxon_signed_rank_test(diff_values: &[f64], direction: StudyDirection) -> 
     // 分配秩次（处理并列）
     let ranks = assign_ranks(&abs_diffs);
 
-    // 计算正秩和与负秩和
+    // 计算正秩和与负秩和，同时收集非零秩次
     let mut r_plus = 0.0;
     let mut r_minus = 0.0;
-    let mut has_zero = false;
-    let mut has_ties = false;
+    let mut zero_contribution = 0.0;
+    let mut nonzero_ranks = Vec::new();
 
     for (rank, &(_abs_d, orig_idx)) in ranks.iter().zip(abs_diffs.iter()) {
         let d = diff_values[orig_idx];
         if d > 0.0 {
             r_plus += rank;
+            nonzero_ranks.push(*rank);
         } else if d < 0.0 {
             r_minus += rank;
+            nonzero_ranks.push(*rank);
         } else {
             // zsplit：零值平分到两边
             r_plus += rank / 2.0;
             r_minus += rank / 2.0;
-            has_zero = true;
+            zero_contribution += rank / 2.0;
         }
     }
 
-    // 检查并列
-    {
-        let mut i = 0;
-        while i < abs_diffs.len() {
-            let mut j = i;
-            while j < abs_diffs.len() && (abs_diffs[j].0 - abs_diffs[i].0).abs() < 1e-14 {
-                j += 1;
-            }
-            if j - i > 1 {
-                has_ties = true;
-                break;
-            }
-            i = j;
-        }
-    }
-
-    // 对齐 scipy method='auto':
-    // 无并列且无零值时，n ≤ 50 使用精确分布
-    let use_exact = !has_ties && !has_zero && n <= 50;
-
-    if use_exact {
-        // 精确分布
-        let pmf = wilcoxon_exact_pmf(n);
+    // 对齐 scipy method='auto': n ≤ 50 使用精确分布（含并列和零值情况）
+    if n <= 50 {
+        // 精确分布：DP 枚举所有非零秩次的 2^n_nonzero 种符号分配
+        // 零值贡献固定（zsplit），从统计量中减去
         let stat = match direction {
             StudyDirection::Maximize => r_minus,
             _ => r_plus,
         };
-        // alternative="greater": P(T >= stat) = sf(stat)
-        // alternative="less": P(T <= stat) = cdf(stat)
-        // Python scipy 对齐: 单尾测试
-        // greater: p = P(T >= stat) = 1 - P(T <= stat-1)
-        // Rust 对齐: both directions use the same formula
-        // For Minimize (alternative "greater"): test if r_plus is large → p = P(R+ >= r_plus)
-        // For Maximize (alternative "less"): test if r_minus is large → p = P(R- >= r_minus)
-        //   Since R+ + R- = n(n+1)/2, P(R- >= x) = P(R+ <= n(n+1)/2 - x)
-        //   But it's symmetric, so we can also compute: P(R_stat >= stat) directly
-        let stat_int = stat.floor() as usize;
-        // P(T >= stat) = sum of pmf[stat_int..]
-        if stat_int >= pmf.len() {
-            0.0
-        } else {
-            pmf[stat_int..].iter().sum()
-        }
+        let stat_nonzero = stat - zero_contribution;
+        wilcoxon_exact_p(&nonzero_ranks, stat_nonzero)
     } else {
-        // 正态近似（correction=False，对齐 Python optuna 默认）
+        // 正态近似（correction=False，对齐 Python optuna / scipy 默认）
         let nn = n as f64;
         let mean = nn * (nn + 1.0) / 4.0;
         let tie_correction = compute_tie_correction(&abs_diffs);
@@ -282,8 +251,6 @@ fn wilcoxon_signed_rank_test(diff_values: &[f64], direction: StudyDirection) -> 
 
         let std_dev = var.sqrt();
 
-        // 根据方向选择检验统计量
-        // 不使用连续性修正（对齐 Python optuna: correction=False）
         let z = match direction {
             StudyDirection::Maximize => (r_minus - mean) / std_dev,
             _ => (r_plus - mean) / std_dev,
@@ -294,30 +261,55 @@ fn wilcoxon_signed_rank_test(diff_values: &[f64], direction: StudyDirection) -> 
     }
 }
 
-/// 计算 Wilcoxon 符号秩统计量 R+ 的精确 PMF。
+/// 计算 Wilcoxon 符号秩检验的精确 p 值。
 ///
-/// 对齐 scipy `_get_wilcoxon_distr`: 枚举所有 2^n 种正负号分配，
-/// 动态规划构建 R+ 的精确概率质量函数。
+/// 对齐 scipy method='auto' (n ≤ 50): 使用 DP 枚举所有 2^n 种符号分配，
+/// 支持并列秩次（半整数秩）和 zsplit 零值处理。
 ///
-/// 返回 pmf[k] = P(R+ = k)，k = 0, 1, ..., n*(n+1)/2
-fn wilcoxon_exact_pmf(n: usize) -> Vec<f64> {
-    let mut c = vec![1.0_f64]; // P(R+=0) = 1.0
-    for k in 1..=n {
-        let prev = c;
-        let new_len = k * (k + 1) / 2 + 1;
-        let mut new_c = vec![0.0_f64; new_len];
-        let m = prev.len();
-        // 不包含秩 k（贡献到低位）
-        for i in 0..m {
-            new_c[i] += prev[i] * 0.5;
-        }
-        // 包含秩 k（右移 k 位）
-        for i in 0..m {
-            new_c[i + k] += prev[i] * 0.5;
-        }
-        c = new_c;
+/// # 参数
+/// * `nonzero_ranks` - 非零差值的秩次（可能是半整数，如 4.5）
+/// * `stat_nonzero` - 非零部分的统计量（R+ 或 R- 减去零贡献）
+///
+/// # 返回值
+/// P(R+_nonzero >= stat_nonzero)。由于精确分布关于 total/2 对称，
+/// 对 Maximize 方向：P(R+_nonzero >= r_minus_nonzero) = P(R+_nonzero <= r_plus_nonzero)
+fn wilcoxon_exact_p(nonzero_ranks: &[f64], stat_nonzero: f64) -> f64 {
+    if nonzero_ranks.is_empty() {
+        // 所有差值为零 → stat_nonzero ≈ 0 → P(R+ >= 0) = 1.0
+        return 1.0;
     }
-    c
+
+    // 秩次始终是 0.5 的倍数，乘以 2 转为整数
+    let scaled: Vec<usize> = nonzero_ranks
+        .iter()
+        .map(|&r| (r * 2.0).round() as usize)
+        .collect();
+    let max_sum: usize = scaled.iter().sum();
+
+    // DP: c[s] = 在所有 2^n 种符号分配中，scaled_R+_nonzero = s 的概率
+    let mut c = vec![0.0f64; max_sum + 1];
+    c[0] = 1.0;
+
+    for &r in &scaled {
+        let prev = c.clone();
+        c.fill(0.0);
+        for s in 0..=max_sum {
+            if prev[s] > 0.0 {
+                c[s] += prev[s] * 0.5; // 不选此秩（归入 R-）
+                if s + r <= max_sum {
+                    c[s + r] += prev[s] * 0.5; // 选此秩（归入 R+）
+                }
+            }
+        }
+    }
+
+    let scaled_stat = (stat_nonzero * 2.0).round() as usize;
+
+    if scaled_stat > max_sum {
+        0.0
+    } else {
+        c[scaled_stat..].iter().sum()
+    }
 }
 
 /// 为排序后的绝对差值分配秩次，处理并列情况。
@@ -363,31 +355,10 @@ fn compute_tie_correction(sorted: &[(f64, usize)]) -> f64 {
     correction / 2.0
 }
 
-/// 标准正态分布的累积分布函数（高精度近似）。
-/// 使用 Abramowitz and Stegun 近似公式。
+/// 标准正态分布的累积分布函数。
+/// 使用 libm::erfc 实现机器精度，对齐 scipy.stats.norm.cdf。
 fn normal_cdf(x: f64) -> f64 {
-    // 使用互补误差函数的近似
-    0.5 * erfc(-x / std::f64::consts::SQRT_2)
-}
-
-/// 互补误差函数的近似（Horner 形式）。
-/// 基于 Abramowitz and Stegun, equation 7.1.26。
-fn erfc(x: f64) -> f64 {
-    if x >= 0.0 {
-        erfc_inner(x)
-    } else {
-        2.0 - erfc_inner(-x)
-    }
-}
-
-/// erfc(x) 对 x >= 0 的近似。
-fn erfc_inner(x: f64) -> f64 {
-    let t = 1.0 / (1.0 + 0.3275911 * x);
-    let poly = t
-        * (0.254829592
-            + t * (-0.284496736
-                + t * (1.421413741 + t * (-1.453152027 + t * 1.061405429))));
-    poly * (-x * x).exp()
+    0.5 * libm::erfc(-x / std::f64::consts::SQRT_2)
 }
 
 #[cfg(test)]
@@ -534,8 +505,9 @@ mod tests {
     fn test_python_cross_wilcoxon_clear_diff() {
         let diff: Vec<f64> = vec![10.0; 20];
         let p = wilcoxon_signed_rank_test(&diff, StudyDirection::Minimize);
-        // Python 精确值: 3.872108215522035e-06
-        assert!(p < 0.001, "Python p≈3.87e-06, got {p}");
+        // n=20 ≤ 50, 无并列无零值 → 精确分布
+        // R+ = 1+2+...+20 = 210, P(R+ >= 210) = 1/2^20 ≈ 9.54e-07
+        assert!(p < 0.001, "expected very small p, got {p}");
     }
 
     /// Python: wilcoxon([0]*10, alt='greater', zero_method='zsplit').pvalue = 1.0
@@ -544,28 +516,25 @@ mod tests {
     fn test_python_cross_wilcoxon_all_zero() {
         let diff: Vec<f64> = vec![0.0; 10];
         let p = wilcoxon_signed_rank_test(&diff, StudyDirection::Minimize);
-        // Python 精确值: 1.0
-        assert!((p - 1.0).abs() < 0.05, "Python p=1.0, got {p}");
+        assert!((p - 1.0).abs() < 1e-10, "Python p=1.0, got {p}");
     }
 
-    /// Python: wilcoxon(mixed, alt='greater', zero_method='zsplit').pvalue ≈ 0.0439453125
-    /// 混合正负差值, abs值有并列(0.5出现2次) → 正态近似（无连续性修正）
+    /// Python: wilcoxon(mixed, alt='greater', zero_method='zsplit').pvalue = 0.0439453125
+    /// 混合正负差值, abs值有并列(0.5出现2次) → 精确分布（n=10 ≤ 50）
     #[test]
     fn test_python_cross_wilcoxon_mixed() {
         let diff = vec![1.0, -0.5, 2.0, -0.3, 1.5, 0.8, -0.1, 1.2, 0.5, -0.2];
         let p = wilcoxon_signed_rank_test(&diff, StudyDirection::Minimize);
-        // Python 精确值: 0.0439453125 (permutation); normal approx ≈ 0.0415
-        assert!((p - 0.044).abs() < 0.01, "Python p≈0.044, got {p}");
+        assert!((p - 0.0439453125).abs() < 1e-10, "Python p=0.0439453125, got {p}");
     }
 
-    /// Python: wilcoxon(mixed, alt='less', zero_method='zsplit').pvalue ≈ 0.9599609375
-    /// 同数据用 Maximize 方向, 有并列 → 正态近似
+    /// Python: wilcoxon(mixed, alt='less', zero_method='zsplit').pvalue = 0.9599609375
+    /// 同数据用 Maximize 方向, 有并列 → 精确分布
     #[test]
     fn test_python_cross_wilcoxon_mixed_maximize() {
         let diff = vec![1.0, -0.5, 2.0, -0.3, 1.5, 0.8, -0.1, 1.2, 0.5, -0.2];
         let p = wilcoxon_signed_rank_test(&diff, StudyDirection::Maximize);
-        // Python 精确值: 0.9599609375; normal approx ≈ 0.9585
-        assert!((p - 0.96).abs() < 0.01, "Python p≈0.96, got {p}");
+        assert!((p - 0.9599609375).abs() < 1e-10, "Python p=0.9599609375, got {p}");
     }
 
     #[test]
@@ -594,37 +563,37 @@ mod tests {
     }
 
     /// Python 交叉验证: 大量并列值
-    /// Python: wilcoxon([1,1,1,-1,-1,2,2,-2,3,0], alt='greater', zsplit).pvalue ≈ 0.171875
+    /// Python: wilcoxon([1,1,1,-1,-1,2,2,-2,3,0], alt='greater', zsplit).pvalue = 0.171875
     #[test]
     fn test_python_cross_wilcoxon_tied() {
         let diff = vec![1.0, 1.0, 1.0, -1.0, -1.0, 2.0, 2.0, -2.0, 3.0, 0.0];
         let p = wilcoxon_signed_rank_test(&diff, StudyDirection::Minimize);
-        // Python 精确值: 0.171875; 正态近似允许 0.05 容差
+        // 精确分布（n=10 ≤ 50，含并列和零值）
         assert!(
-            (p - 0.172).abs() < 0.05,
-            "Python p≈0.172, got {p}"
+            (p - 0.171875).abs() < 1e-10,
+            "Python p=0.171875, got {p}"
         );
     }
 
     /// Python 交叉验证: normal_cdf 精度
     /// 对比 scipy.stats.norm.cdf 的精确值
-    /// Abramowitz & Stegun 公式精度约 1.5e-7
+    /// 使用 libm::erfc 实现机器精度
     #[test]
     fn test_python_cross_normal_cdf() {
         // Python: norm.cdf(0) = 0.5
-        assert!((normal_cdf(0.0) - 0.5).abs() < 1e-7, "cdf(0)={}", normal_cdf(0.0));
+        assert!((normal_cdf(0.0) - 0.5).abs() < 1e-15, "cdf(0)={}", normal_cdf(0.0));
         // Python: norm.cdf(-3) = 0.001349898031630093
-        assert!((normal_cdf(-3.0) - 0.001349898031630093).abs() < 1e-7);
+        assert!((normal_cdf(-3.0) - 0.001349898031630093).abs() < 1e-14);
         // Python: norm.cdf(3) = 0.9986501019683699
-        assert!((normal_cdf(3.0) - 0.9986501019683699).abs() < 1e-7);
+        assert!((normal_cdf(3.0) - 0.9986501019683699).abs() < 1e-14);
         // Python: norm.cdf(-1) = 0.15865525393145707
-        assert!((normal_cdf(-1.0) - 0.15865525393145707).abs() < 1e-7);
+        assert!((normal_cdf(-1.0) - 0.15865525393145707).abs() < 1e-14);
         // Python: norm.cdf(1) = 0.8413447460685429
-        assert!((normal_cdf(1.0) - 0.8413447460685429).abs() < 1e-7);
+        assert!((normal_cdf(1.0) - 0.8413447460685429).abs() < 1e-14);
         // Python: norm.cdf(-2) = 0.022750131948179198
-        assert!((normal_cdf(-2.0) - 0.022750131948179198).abs() < 1e-7);
+        assert!((normal_cdf(-2.0) - 0.022750131948179198).abs() < 1e-14);
         // Python: norm.cdf(2) = 0.9772498680518208
-        assert!((normal_cdf(2.0) - 0.9772498680518208).abs() < 1e-7);
+        assert!((normal_cdf(2.0) - 0.9772498680518208).abs() < 1e-14);
     }
 
     // ========================================================================
@@ -632,33 +601,32 @@ mod tests {
     // ========================================================================
 
     #[test]
-    fn test_wilcoxon_exact_pmf_n1() {
-        let pmf = wilcoxon_exact_pmf(1);
-        // R+ ∈ {0, 1}, 各概率 0.5
-        assert_eq!(pmf.len(), 2);
-        assert!((pmf[0] - 0.5).abs() < 1e-14);
-        assert!((pmf[1] - 0.5).abs() < 1e-14);
+    fn test_wilcoxon_exact_p_n1() {
+        // n=1, ranks=[1], stat=1: P(R+ >= 1) = 0.5
+        let p = wilcoxon_exact_p(&[1.0], 1.0);
+        assert!((p - 0.5).abs() < 1e-14);
+        // stat=0: P(R+ >= 0) = 1.0
+        let p0 = wilcoxon_exact_p(&[1.0], 0.0);
+        assert!((p0 - 1.0).abs() < 1e-14);
     }
 
     #[test]
-    fn test_wilcoxon_exact_pmf_n3() {
-        let pmf = wilcoxon_exact_pmf(3);
-        // R+ ∈ {0,1,...,6}, 8 种组合
-        assert_eq!(pmf.len(), 7);
-        let sum: f64 = pmf.iter().sum();
-        assert!((sum - 1.0).abs() < 1e-14, "PMF sum = {sum}");
-        // P(R+=0) = 1/8, P(R+=6) = 1/8
-        assert!((pmf[0] - 0.125).abs() < 1e-14);
-        assert!((pmf[6] - 0.125).abs() < 1e-14);
+    fn test_wilcoxon_exact_p_n3() {
+        // ranks=[1,2,3], total=6
+        // P(R+=0) = 1/8, P(R+=6) = 1/8, sum = 1.0
+        let ranks = vec![1.0, 2.0, 3.0];
+        let p6 = wilcoxon_exact_p(&ranks, 6.0); // P(R+ >= 6) = 1/8
+        assert!((p6 - 0.125).abs() < 1e-14);
+        let p0 = wilcoxon_exact_p(&ranks, 0.0); // P(R+ >= 0) = 1.0
+        assert!((p0 - 1.0).abs() < 1e-14);
     }
 
     #[test]
-    fn test_wilcoxon_exact_pmf_n5() {
-        let pmf = wilcoxon_exact_pmf(5);
-        // R+ ∈ {0,...,15}, 32 种组合
-        assert_eq!(pmf.len(), 16);
-        let sum: f64 = pmf.iter().sum();
-        assert!((sum - 1.0).abs() < 1e-14, "PMF sum = {sum}");
+    fn test_wilcoxon_exact_p_n5_sum() {
+        // ranks=[1,2,3,4,5], 2^5=32 种分配，概率和 = 1.0
+        let ranks = vec![1.0, 2.0, 3.0, 4.0, 5.0];
+        let p0 = wilcoxon_exact_p(&ranks, 0.0);
+        assert!((p0 - 1.0).abs() < 1e-14, "P(R+ >= 0) = {p0}");
     }
 
     #[test]
@@ -680,16 +648,13 @@ mod tests {
 
     #[test]
     fn test_exact_small_n_accuracy() {
-        // n=4, diffs = [1, -2, 3, 4]: R+ ranked by |d|: 1(r1), 2(r2), 3(r3), 4(r4)
-        // signs: +, -, +, +  → R+ = 1 + 3 + 4 = 8
-        // P(R+ >= 8) via exact = sum pmf[8..10] for n=4 (max=10)
+        // n=4, diffs = [1, -2, 3, 4]: R+ = 1 + 3 + 4 = 8
+        // P(R+ >= 8) via exact
         let diff = vec![1.0, -2.0, 3.0, 4.0];
         let p = wilcoxon_signed_rank_test(&diff, StudyDirection::Minimize);
-        // Verify it's a valid p-value computed exactly
         assert!(p > 0.0 && p < 1.0, "p should be in (0,1), got {p}");
-        // For exact: should not be affected by normal approximation bias
-        let pmf = wilcoxon_exact_pmf(4);
-        let expected_p: f64 = pmf[8..].iter().sum();
-        assert!((p - expected_p).abs() < 1e-10, "expected {expected_p}, got {p}");
+        // 直接计算：ranks=[1,2,3,4]，取值 8 需要 {1,3,4} 或 {2,3,4}=9, 或 {1,2,3,4}=10
+        // 精确 p 应为 P(R+ >= 8) = (P(8) + P(9) + P(10)) = 3/16 = 0.1875
+        assert!((p - 0.1875).abs() < 1e-10, "expected 0.1875, got {p}");
     }
 }

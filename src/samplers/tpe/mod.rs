@@ -1,6 +1,6 @@
-mod parzen_estimator;
+pub mod parzen_estimator;
 mod sampler;
-mod truncnorm;
+pub mod truncnorm;
 
 pub use sampler::{
     TpeSampler, TpeSamplerBuilder, ConstraintsFn, GammaFn, WeightsFn,

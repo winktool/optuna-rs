@@ -236,9 +236,6 @@ pub fn crowding_distance(trials: &[&FrozenTrial], directions: &[StudyDirection])
     if n == 0 {
         return vec![];
     }
-    if n <= 2 {
-        return vec![f64::INFINITY; n];
-    }
 
     let n_objectives = directions.len();
     let mut distances = vec![0.0_f64; n];
@@ -252,38 +249,35 @@ pub fn crowding_distance(trials: &[&FrozenTrial], directions: &[StudyDirection])
             va.partial_cmp(&vb).unwrap_or(std::cmp::Ordering::Equal)
         });
 
-        // Boundary solutions get infinity
-        distances[indices[0]] = f64::INFINITY;
-        distances[indices[n - 1]] = f64::INFINITY;
+        // Build padded values array: [-inf, v_sorted[0], ..., v_sorted[n-1], +inf]
+        // Matching Python's sentinel padding approach.
+        let mut vs: Vec<f64> = Vec::with_capacity(n + 2);
+        vs.push(f64::NEG_INFINITY);
+        for &idx in &indices {
+            vs.push(trials[idx].values.as_ref().map(|v| v[m]).unwrap_or(0.0));
+        }
+        vs.push(f64::INFINITY);
 
-        let f_min = trials[indices[0]]
-            .values
-            .as_ref()
-            .map(|v| v[m])
-            .unwrap_or(0.0);
-        let f_max = trials[indices[n - 1]]
-            .values
-            .as_ref()
-            .map(|v| v[m])
-            .unwrap_or(0.0);
-        let range = f_max - f_min;
-
-        if range < f64::EPSILON {
+        // If all values are the same, skip this dimension (matching Python).
+        if vs[1] == vs[n] {
             continue;
         }
 
-        for i in 1..(n - 1) {
-            let prev_val = trials[indices[i - 1]]
-                .values
-                .as_ref()
-                .map(|v| v[m])
-                .unwrap_or(0.0);
-            let next_val = trials[indices[i + 1]]
-                .values
-                .as_ref()
-                .map(|v| v[m])
-                .unwrap_or(0.0);
-            distances[indices[i]] += (next_val - prev_val) / range;
+        // Smallest finite value and largest finite value (matching Python).
+        let v_min = vs.iter().copied().find(|&x| x != f64::NEG_INFINITY).unwrap_or(0.0);
+        let v_max = vs.iter().rev().copied().find(|&x| x != f64::INFINITY).unwrap_or(0.0);
+        let width = v_max - v_min;
+        let width = if width <= 0.0 { 1.0 } else { width };
+
+        for j in 0..n {
+            // Matching Python: gap = 0 if vs[j] == vs[j+2] else vs[j+2] - vs[j]
+            // This handles inf - inf = 0 and -inf - (-inf) = 0 correctly.
+            let gap = if vs[j] == vs[j + 2] {
+                0.0
+            } else {
+                vs[j + 2] - vs[j]
+            };
+            distances[indices[j]] += gap / width;
         }
     }
 
@@ -664,13 +658,15 @@ fn solve_hssp_2d(
 
     for _ in 0..subset_size {
         // 计算每个点的超体积贡献
+        // 使用 fold 模拟 np.argmax 的行为：相等时取第一个（即 >，而非 >=）。
         let (max_pos, _) = sorted_vals
             .iter()
             .zip(rect_diags.iter())
             .enumerate()
             .map(|(i, (v, r))| (i, (r[0] - v[0]) * (r[1] - v[1])))
-            .max_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal))
-            .unwrap();
+            .fold((0, f64::NEG_INFINITY), |(bi, bv), (i, v)| {
+                if v > bv { (i, v) } else { (bi, bv) }
+            });
 
         selected.push(indices[local_idx[max_pos]]);
         let chosen_val = sorted_vals[max_pos];
@@ -781,13 +777,19 @@ pub fn solve_hssp(
     let mut active: Vec<bool> = vec![true; n_unique];
 
     for _ in 0..subset_size {
-        // 选择贡献最大的点
+        // 选择贡献最大的点（对齐 Python np.argmax: 相等时取第一个）
         let best = (0..n_unique)
             .filter(|&i| active[i])
-            .max_by(|&a, &b| {
-                contribs[a].partial_cmp(&contribs[b]).unwrap_or(std::cmp::Ordering::Equal)
+            .fold(None::<(usize, f64)>, |acc, i| {
+                let v = contribs[i];
+                match acc {
+                    None => Some((i, v)),
+                    Some((_, bv)) if v > bv => Some((i, v)),
+                    _ => acc,
+                }
             })
-            .unwrap();
+            .unwrap()
+            .0;
 
         selected_indices.push(unique_idx[best]);
         selected_vecs.push(unique_vals[best].clone());
@@ -825,8 +827,8 @@ pub fn solve_hssp(
 
 /// 计算非支配空间的盒子分解边界。
 ///
-/// 对应 Python `optuna._hypervolume.box_decomposition.get_non_dominated_box_bounds()`。
-/// 仅支持 2D/3D（高维会导致指数级复杂度）。
+/// 精确对齐 Python `optuna._hypervolume.box_decomposition.get_non_dominated_box_bounds()`。
+/// 使用 Lacour17 算法 (Algorithm 2) 对任意维度进行正确的非重叠盒子分解。
 ///
 /// # 参数
 /// * `loss_vals` - Pareto 前沿点的损失值 (N × M)
@@ -845,89 +847,245 @@ pub fn get_non_dominated_box_bounds(
         return (vec![], vec![]);
     }
 
-    // 2D 特化：扫描线分解
-    if m == 2 {
-        return box_decomp_2d(loss_vals, ref_point);
-    }
-
-    // 3D：使用分治分解
-    if m == 3 {
-        return box_decomp_3d(loss_vals, ref_point);
-    }
-
-    // m > 3：简单盒子（每个点一个盒子到参考点，可能有重叠）
-    let lower_bounds: Vec<Vec<f64>> = loss_vals.to_vec();
-    let upper_bounds: Vec<Vec<f64>> = vec![ref_point.to_vec(); n];
-    (lower_bounds, upper_bounds)
-}
-
-/// 2D 非支配盒子分解。
-fn box_decomp_2d(loss_vals: &[Vec<f64>], ref_point: &[f64]) -> (Vec<Vec<f64>>, Vec<Vec<f64>>) {
-    let mut sorted: Vec<Vec<f64>> = loss_vals.to_vec();
-    sorted.sort_by(|a, b| a[0].partial_cmp(&b[0]).unwrap_or(std::cmp::Ordering::Equal));
-
-    let n = sorted.len();
-    let mut lower = Vec::with_capacity(n + 1);
-    let mut upper = Vec::with_capacity(n + 1);
-
-    // 第一个盒子: (-inf, sorted[0][1]) 到 (sorted[0][0], ref_point[1])
-    lower.push(vec![f64::NEG_INFINITY, sorted[0][1]]);
-    upper.push(vec![sorted[0][0], ref_point[1]]);
-
-    for i in 1..n {
-        lower.push(vec![sorted[i - 1][0], sorted[i][1]]);
-        upper.push(vec![sorted[i][0], ref_point[1]]);
-    }
-
-    // 最后一个盒子
-    lower.push(vec![sorted[n - 1][0], f64::NEG_INFINITY]);
-    upper.push(vec![ref_point[0], sorted[n - 1][1]]);
-
-    (lower, upper)
-}
-
-/// 3D 非支配盒子分解（对应 Python Lacour17 算法的简化版）。
-fn box_decomp_3d(loss_vals: &[Vec<f64>], ref_point: &[f64]) -> (Vec<Vec<f64>>, Vec<Vec<f64>>) {
-    let mut sorted: Vec<Vec<f64>> = loss_vals.to_vec();
-    sorted.sort_by(|a, b| {
-        a[0].partial_cmp(&b[0])
-            .unwrap_or(std::cmp::Ordering::Equal)
-            .then_with(|| a[1].partial_cmp(&b[1]).unwrap_or(std::cmp::Ordering::Equal))
+    // 去重并按字典序排序（对齐 Python np.unique）
+    let mut unique_sorted = loss_vals.to_vec();
+    unique_sorted.sort_by(|a, b| {
+        for d in 0..m {
+            match a[d].partial_cmp(&b[d]) {
+                Some(std::cmp::Ordering::Equal) => continue,
+                Some(ord) => return ord,
+                None => return std::cmp::Ordering::Equal,
+            }
+        }
+        std::cmp::Ordering::Equal
     });
+    unique_sorted.dedup();
 
-    let n = sorted.len();
-    let mut lower = Vec::new();
-    let mut upper = Vec::new();
+    // 取 Pareto 前沿
+    let pareto_mask = is_pareto_front_vals(&unique_sorted);
+    let sorted_pareto_sols: Vec<Vec<f64>> = unique_sorted
+        .into_iter()
+        .zip(pareto_mask.iter())
+        .filter(|&(_, on)| *on)
+        .map(|(v, _)| v)
+        .collect();
 
-    // 对每对相邻点生成盒子
+    lacour17_non_dominated_box_bounds(&sorted_pareto_sols, ref_point)
+}
+
+/// Pareto 前沿检测（最小化方向，纯数值版本）。
+fn is_pareto_front_vals(vals: &[Vec<f64>]) -> Vec<bool> {
+    let n = vals.len();
+    let mut on_front = vec![true; n];
     for i in 0..n {
-        let p = &sorted[i];
-        // 该点自身到参考点的盒子
-        lower.push(p.clone());
-        upper.push(ref_point.to_vec());
+        if !on_front[i] { continue; }
+        for j in 0..n {
+            if i == j || !on_front[j] { continue; }
+            let mut all_le = true;
+            let mut any_lt = false;
+            for d in 0..vals[i].len() {
+                if vals[j][d] > vals[i][d] { all_le = false; break; }
+                if vals[j][d] < vals[i][d] { any_lt = true; }
+            }
+            if all_le && any_lt { on_front[i] = false; break; }
+        }
+    }
+    on_front
+}
+
+/// Lacour17 Algorithm 2: 计算上界集 U(N) 及其定义点。
+///
+/// 对齐 Python `_get_upper_bound_set()`。
+/// `sorted_pareto_sols` 必须按第一个目标排好序。
+///
+/// 返回 (upper_bound_set, def_points)：
+///   upper_bound_set: Vec<Vec<f64>> (n_bounds × m)
+///   def_points: Vec<Vec<Vec<f64>>> (n_bounds × m × m)
+fn lacour17_upper_bound_set(
+    sorted_pareto_sols: &[Vec<f64>],
+    ref_point: &[f64],
+) -> (Vec<Vec<f64>>, Vec<Vec<Vec<f64>>>) {
+    let m = ref_point.len();
+
+    // skip_ineq_judge[j][k] = true iff (j==k || k==0)
+    // 对齐 Python: skip = eye(m) | col_0_all_true
+    let mut skip = vec![vec![false; m]; m];
+    for j in 0..m {
+        skip[j][j] = true; // diagonal
+        skip[j][0] = true; // column 0
     }
 
-    // 移除被其他盒子包含的盒子
-    let mut keep = vec![true; n];
-    for i in 0..n {
-        if !keep[i] {
+    // 初始化: ubs = [ref_point], dps = full(-inf) with diagonal = ref_point
+    let mut ubs = vec![ref_point.to_vec()];
+    let mut dps = vec![vec![vec![f64::NEG_INFINITY; m]; m]];
+    for j in 0..m {
+        dps[0][j][j] = ref_point[j];
+    }
+
+    for sol in sorted_pareto_sols {
+        // is_dominated[i] = all(sol[d] < ubs[i][d], for d in 0..m)
+        let n_ubs = ubs.len();
+        let is_dominated: Vec<bool> = (0..n_ubs)
+            .map(|i| (0..m).all(|d| sol[d] < ubs[i][d]))
+            .collect();
+
+        if !is_dominated.iter().any(|&x| x) {
             continue;
         }
-        for j in 0..n {
-            if i == j || !keep[j] {
-                continue;
+
+        let mut new_ubs = Vec::new();
+        let mut new_dps = Vec::new();
+
+        // 保留未被支配的 ubs
+        for i in 0..n_ubs {
+            if !is_dominated[i] {
+                new_ubs.push(ubs[i].clone());
+                new_dps.push(dps[i].clone());
             }
-            // 如果盒子 j 被盒子 i 包含
-            if (0..3).all(|d| lower[i][d] <= lower[j][d] && upper[j][d] <= upper[i][d]) {
-                keep[j] = false;
+        }
+
+        // 对每个被支配的 ubs[i]，更新维度
+        for i in 0..n_ubs {
+            if !is_dominated[i] { continue; }
+
+            // update[j] = sol[j] >= max_{k: !skip[j][k]} dps[i][k][j]
+            for j in 0..m {
+                let max_non_skip = (0..m)
+                    .filter(|&k| !skip[j][k])
+                    .map(|k| dps[i][k][j])
+                    .fold(f64::NEG_INFINITY, f64::max);
+
+                if sol[j] >= max_non_skip {
+                    // 生成新的 ubs 和 dps
+                    let mut new_u = ubs[i].clone();
+                    new_u[j] = sol[j];
+
+                    let mut new_d = dps[i].clone();
+                    new_d[j] = sol.clone();
+
+                    new_ubs.push(new_u);
+                    new_dps.push(new_d);
+                }
             }
+        }
+
+        ubs = new_ubs;
+        dps = new_dps;
+    }
+
+    (ubs, dps)
+}
+
+/// Lacour17 Eq. (2): 从上界集和定义点计算盒子边界。
+///
+/// 对齐 Python `_get_box_bounds()`。
+/// 返回 (lower_bounds, upper_bounds)。
+fn lacour17_box_bounds(
+    ubs: &[Vec<f64>],
+    dps: &[Vec<Vec<f64>>],
+    ref_point: &[f64],
+) -> (Vec<Vec<f64>>, Vec<Vec<f64>>) {
+    let n_bounds = ubs.len();
+    let m = ref_point.len();
+    if n_bounds == 0 || m < 2 {
+        return (vec![], vec![]);
+    }
+
+    let mut lower = vec![vec![0.0; m]; n_bounds];
+    let mut upper = vec![vec![0.0; m]; n_bounds];
+
+    for i in 0..n_bounds {
+        // 维度 0: lower = dps[i][0][0], upper = ref_point[0]
+        lower[i][0] = dps[i][0][0];
+        upper[i][0] = ref_point[0];
+
+        // 维度 1..m: maximum.accumulate 沿 axis=-2，取 diag 偏移
+        // bounds[0, :, j] = max(dps[i][0..j][j]) for j >= 1
+        // bounds[1, :, j] = ubs[i][j]
+        for j in 1..m {
+            // np.maximum.accumulate(dps, axis=-2)[:, j-1, j]
+            // = max(dps[i][0][j], dps[i][1][j], ..., dps[i][j-1][j])
+            let mut acc_max = f64::NEG_INFINITY;
+            for k in 0..j {
+                acc_max = acc_max.max(dps[i][k][j]);
+            }
+            lower[i][j] = acc_max;
+            upper[i][j] = ubs[i][j];
         }
     }
 
-    let lower: Vec<Vec<f64>> = lower.into_iter().zip(keep.iter()).filter(|(_, k)| **k).map(|(v, _)| v).collect();
-    let upper: Vec<Vec<f64>> = upper.into_iter().zip(keep.iter()).filter(|(_, k)| **k).map(|(v, _)| v).collect();
+    // 移除空盒子（upper[d] <= lower[d] 的任何维度）
+    let mut result_lower = Vec::new();
+    let mut result_upper = Vec::new();
+    for i in 0..n_bounds {
+        let empty = (0..m).any(|d| upper[i][d] <= lower[i][d]);
+        if !empty {
+            result_lower.push(lower[i].clone());
+            result_upper.push(upper[i].clone());
+        }
+    }
 
-    (lower, upper)
+    (result_lower, result_upper)
+}
+
+/// 完整的 Lacour17 非支配盒子分解。
+///
+/// 精确对齐 Python `_get_non_dominated_box_bounds()`。
+fn lacour17_non_dominated_box_bounds(
+    sorted_pareto_sols: &[Vec<f64>],
+    ref_point: &[f64],
+) -> (Vec<Vec<f64>>, Vec<Vec<f64>>) {
+    let m = ref_point.len();
+    if sorted_pareto_sols.is_empty() || m == 0 {
+        return (vec![], vec![]);
+    }
+
+    // Step 1: 对原始 Pareto 解计算上界集，然后取负
+    let (ubs, _) = lacour17_upper_bound_set(sorted_pareto_sols, ref_point);
+    let neg_ubs: Vec<Vec<f64>> = ubs.iter()
+        .map(|u| u.iter().map(|&v| -v).collect())
+        .collect();
+
+    // Step 2: 对取负后的上界集去重排序，并取 Pareto 前沿
+    let mut sorted_neg_ubs = neg_ubs;
+    sorted_neg_ubs.sort_by(|a, b| {
+        for d in 0..m {
+            match a[d].partial_cmp(&b[d]) {
+                Some(std::cmp::Ordering::Equal) => continue,
+                Some(ord) => return ord,
+                None => return std::cmp::Ordering::Equal,
+            }
+        }
+        std::cmp::Ordering::Equal
+    });
+    sorted_neg_ubs.dedup();
+
+    let pareto_mask = is_pareto_front_vals(&sorted_neg_ubs);
+    let neg_pareto: Vec<Vec<f64>> = sorted_neg_ubs
+        .into_iter()
+        .zip(pareto_mask.iter())
+        .filter(|&(_, on)| *on)
+        .map(|(v, _)| v)
+        .collect();
+
+    // Step 3: 用取负后的 Pareto 点作为输入，以 +∞ 为参考点，再次计算上界集
+    let inf_ref: Vec<f64> = vec![f64::INFINITY; m];
+    let (neg_lower_set, neg_def_points) = lacour17_upper_bound_set(&neg_pareto, &inf_ref);
+
+    // Step 4: 计算盒子边界并取负翻转
+    let (neg_box_lower, neg_box_upper) = lacour17_box_bounds(
+        &neg_lower_set, &neg_def_points, &inf_ref,
+    );
+
+    // 取负翻转: box_upper = -neg_box_lower, box_lower = -neg_box_upper
+    let box_lower: Vec<Vec<f64>> = neg_box_upper.iter()
+        .map(|v| v.iter().map(|&x| -x).collect())
+        .collect();
+    let box_upper: Vec<Vec<f64>> = neg_box_lower.iter()
+        .map(|v| v.iter().map(|&x| -x).collect())
+        .collect();
+
+    (box_lower, box_upper)
 }
 
 /// Get the Pareto-optimal trials from a list of complete trials.

@@ -1,0 +1,35 @@
+{
+  "uniform_p0.0_swap_ratio": 1.0,
+  "uniform_p0.25_swap_ratio": 0.750344,
+  "uniform_p0.5_swap_ratio": 0.498808,
+  "uniform_p0.75_swap_ratio": 0.251124,
+  "uniform_p1.0_swap_ratio": 0.0,
+  "blx_mean": 0.49909072280230904,
+  "blx_std": 0.23072280238144863,
+  "blx_expected_low": 0.1,
+  "blx_expected_high": 0.8999999999999999,
+  "sbx_eta2_mean": 0.5000878337466144,
+  "sbx_eta2_std": 0.22217779698717668,
+  "sbx_eta20_mean": 0.5004340414283166,
+  "sbx_eta20_std": 0.20084748459026253,
+  "spx_mean_x": 0.5007571354074766,
+  "spx_mean_y": 0.40060006924767894,
+  "spx_std_x": 0.16273627266443716,
+  "spx_std_y": 0.2160529776458788,
+  "spx_centroid": [
+    0.5,
+    0.39999999999999997
+  ],
+  "undx_mean_x": 0.5001901319615969,
+  "undx_mean_y": 0.5002031561088977,
+  "undx_std_x": 0.10063766071964177,
+  "undx_std_y": 0.10054389603869933,
+  "undx_midpoint": [
+    0.5,
+    0.5
+  ],
+  "vsbx_eta20_mean_x": 0.5015675422594248,
+  "vsbx_eta20_mean_y": 0.500466501371486,
+  "vsbx_eta20_std_x": 0.20067869656949983,
+  "vsbx_eta20_std_y": 0.2007355079399842
+}

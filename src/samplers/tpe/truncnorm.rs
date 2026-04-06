@@ -16,9 +16,20 @@ fn norm_logpdf(x: f64) -> f64 {
     -0.5 * x * x - LOG_SQRT_2PI
 }
 
-/// Standard normal CDF: Phi(x) = 0.5 * (1 + erf(x / sqrt(2)))
+/// Standard normal CDF: Phi(x), aligned with Python `_ndtr_single`.
+/// Uses erfc for tails to avoid catastrophic cancellation.
 fn ndtr(x: f64) -> f64 {
-    0.5 + 0.5 * libm::erf(x * FRAC_1_SQRT_2)
+    let t = x * FRAC_1_SQRT_2;
+    if t < -FRAC_1_SQRT_2 {
+        // Left tail: use erfc for precision
+        0.5 * libm::erfc(-t)
+    } else if t < FRAC_1_SQRT_2 {
+        // Central region
+        0.5 + 0.5 * libm::erf(t)
+    } else {
+        // Right tail: use erfc for precision
+        1.0 - 0.5 * libm::erfc(t)
+    }
 }
 
 /// Log of standard normal CDF, computed stably.
@@ -39,10 +50,26 @@ fn log_ndtr(a: f64) -> f64 {
             v.ln()
         }
     } else {
-        // Asymptotic expansion for very negative a:
-        // log Phi(a) ≈ -a^2/2 - ln(sqrt(2pi)) - ln(-a) + log(1 - 1/a^2)
-        let a2 = a * a;
-        -0.5 * a2 - LOG_SQRT_2PI - (-a).ln() + (-1.0 / a2).ln_1p()
+        // Asymptotic series for very negative a (aligned with Python _log_ndtr_single):
+        // log Phi(a) = -a^2/2 - ln(-a) - 0.5*ln(2*pi) + ln(series)
+        // where series = 1 - 1/a^2 + 1*3/a^4 - 1*3*5/a^6 + ...
+        let log_lhs = -0.5 * a * a - (-a).ln() - LOG_SQRT_2PI;
+        let denom_cons = 1.0 / (a * a);
+        let mut rhs = 1.0;
+        let mut last_total = 0.0_f64;
+        let mut sign = 1.0;
+        let mut denom_factor = 1.0;
+        let mut numerator = 1.0;
+        let mut i = 0;
+        while (last_total - rhs).abs() > f64::EPSILON {
+            i += 1;
+            last_total = rhs;
+            sign = -sign;
+            denom_factor *= denom_cons;
+            numerator *= (2 * i - 1) as f64;
+            rhs += sign * numerator * denom_factor;
+        }
+        log_lhs + rhs.ln()
     }
 }
 
@@ -78,51 +105,49 @@ pub fn log_gauss_mass(a: f64, b: f64) -> f64 {
 }
 
 /// Inverse of log_ndtr: find x such that log(Phi(x)) = log_p.
-/// Uses Newton's method.
+/// Uses Newton's method. Aligned with Python `_ndtri_exp`.
 fn ndtri_exp(log_p: f64) -> f64 {
-    if log_p > -EPS {
-        return 8.2; // saturated near log(1) = 0
-    }
     if log_p < -1e15 {
         return -100.0;
     }
 
-    // Initial guess using inverse normal approximation.
-    // For log_p close to 0 (p ~ 1), use right-tail approximation.
-    // For very negative log_p, use: x ≈ -sqrt(-2 * log_p)
-    let mut x = if log_p < -5.0 {
-        // Deep left tail: Phi(x) ~ exp(-x^2/2) / (|x| * sqrt(2pi))
-        // log(Phi(x)) ~ -x^2/2 - ln(|x|) - ln(sqrt(2pi))
-        // Approximate: x ~ -sqrt(-2 * log_p)
-        -(-2.0 * log_p - LOG_SQRT_2PI).sqrt()
+    // For y close to zero, flip sign for numerical stability (Python: flipped = y > -1e-2).
+    // If exp(y) > 0.5 (y > -ln(2) ≈ -0.693), x is positive.
+    // We compute z = log(1 - exp(y)) = log(-expm1(y)), solve for positive x, then negate.
+    let flipped = log_p > -1e-2;
+    let z = if flipped {
+        (-log_p.exp_m1()).ln() // log(-expm1(log_p))
     } else {
-        // Moderate region: use logistic approximation
-        // Phi(x) ≈ 1/(1 + exp(-x * sqrt(pi/8)))
-        let c = (PI / 8.0).sqrt();
-        let p = log_p.exp();
-        if p > 0.0 && p < 1.0 {
-            (p / (1.0 - p)).ln() / c
-        } else {
-            -6.0
-        }
+        log_p
     };
 
-    // Newton iterations: f(x) = log_ndtr(x) - log_p
-    // f'(x) = phi(x) / Phi(x) = exp(norm_logpdf(x) - log_ndtr(x))
+    // Initial guess.
+    // Python: _ndtri_exp_approx_C = sqrt(3) / pi
+    let c = 3.0_f64.sqrt() / PI;
+    let mut x = if z < -5.0 {
+        // Deep left tail: x ≈ -sqrt(-2 * (z + LOG_SQRT_2PI))
+        // Aligned with Python: x = -np.sqrt(-2.0 * (z + _norm_pdf_logC))
+        -(-2.0 * (z + LOG_SQRT_2PI)).sqrt()
+    } else {
+        // Moderate region: logistic approximation
+        // x ≈ -sqrt(3)/pi * log(expm1(-z))
+        -c * (-z).exp_m1().ln()
+    };
+
+    // Newton iterations: f(x) = log_ndtr(x) - z
+    // dx = f(x) * exp(log_ndtr(x) - norm_logpdf(x))
+    // Convergence: relative |dx| < 1e-8 * |x| (aligned with Python rtol=1e-8)
     for _ in 0..100 {
-        let f = log_ndtr(x) - log_p;
-        if f.abs() < 1e-12 {
+        let lnx = log_ndtr(x);
+        let lnpdf = norm_logpdf(x);
+        let dx = (lnx - z) * (lnx - lnpdf).exp();
+        x -= dx;
+        if dx.abs() < 1e-8 * x.abs() {
             break;
         }
-        let log_deriv = norm_logpdf(x) - log_ndtr(x);
-        let deriv = log_deriv.exp();
-        if deriv < 1e-300 {
-            break;
-        }
-        let step = f / deriv;
-        x -= step.clamp(-2.0, 2.0);
     }
-    x
+
+    if flipped { -x } else { x }
 }
 
 /// PPF (quantile function) of the standard truncated normal on [a, b].
@@ -177,7 +202,7 @@ pub fn rvs(
         let b_std = (b[i] - loc[i]) / scale[i];
         let q: f64 = rng.random();
         let x = ppf(q, a_std, b_std) * scale[i] + loc[i];
-        result.push(x.clamp(a[i], b[i]));
+        result.push(x);
     }
     result
 }

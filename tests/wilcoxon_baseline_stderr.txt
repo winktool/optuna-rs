@@ -1,0 +1,6 @@
+scipy version: 1.17.0
+  exact_all_positive_minimize: auto=3.125000000000000e-02, exact=3.125000000000000e-02, approx=2.155722339153768e-02 → exact
+  exact_all_positive_maximize: auto=1.000000000000000e+00, exact=1.000000000000000e+00, approx=9.784427766084624e-01 → exact
+  exact_n10_alternating: auto=6.152343750000000e-01, exact=6.152343750000000e-01, approx=6.005703250019752e-01 → exact
+  boundary_n50_no_ties: auto=2.560546013175014e-05, exact=2.560546013175014e-05, approx=5.107137837546047e-05 → exact
+  boundary_n25_no_ties: auto=1.392424106597900e-03, exact=1.392424106597900e-03, approx=1.910988407533312e-03 → exact

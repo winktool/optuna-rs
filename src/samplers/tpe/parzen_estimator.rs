@@ -252,10 +252,12 @@ impl ParzenEstimator {
         let mut mus: Vec<f64> = obs.to_vec();
 
         // Apply log transform.
+        // For log distributions, low > 0 and all observations > 0 are guaranteed by
+        // distribution validation, so no clamping is needed (matching Python's np.log).
         if log {
-            mus = mus.iter().map(|&v| v.max(EPS).ln()).collect();
-            low = low.max(EPS).ln();
-            high = high.max(EPS).ln();
+            mus = mus.iter().map(|&v| v.ln()).collect();
+            low = low.ln();
+            high = high.ln();
         }
 
         // Compute sigmas.
@@ -502,7 +504,7 @@ impl ParzenEstimator {
                             high - st / 2.0
                         };
                         for s in &mut samples {
-                            *s = ((*s - orig_low) / st).round() * st + orig_low;
+                            *s = crate::search_space::round_ties_even((*s - orig_low) / st) * st + orig_low;
                             *s = s.clamp(orig_low, orig_high);
                         }
                     }
@@ -573,8 +575,8 @@ impl ParzenEstimator {
                                 if *log {
                                     // 离散 log-normal: 原始空间 [x-step/2, x+step/2]
                                     // 映射到 log 空间 [ln(x-step/2), ln(x+step/2)]
-                                    let a_log = (x - st / 2.0).max(EPS).ln();
-                                    let b_log = (x + st / 2.0).max(EPS).ln();
+                                    let a_log = (x - st / 2.0).ln();
+                                    let b_log = (x + st / 2.0).ln();
                                     let a_norm = (a_log - mus[k]) / sigmas[k];
                                     let b_norm = (b_log - mus[k]) / sigmas[k];
                                     let mass = truncnorm::log_gauss_mass(a_norm, b_norm);
@@ -592,7 +594,7 @@ impl ParzenEstimator {
                                     mass - total
                                 }
                             } else {
-                                let x_val = if *log { x.max(EPS).ln() } else { x };
+                                let x_val = if *log { x.ln() } else { x };
                                 truncnorm::logpdf(x_val, *low, *high, mus[k], sigmas[k])
                             };
                             weighted_log_pdf[si][k] += lp;
@@ -609,8 +611,8 @@ impl ParzenEstimator {
                             let w = cat_weights[k]
                                 .get(idx)
                                 .copied()
-                                .unwrap_or(EPS);
-                            weighted_log_pdf[si][k] += w.max(EPS).ln();
+                                .unwrap_or(0.0);
+                            weighted_log_pdf[si][k] += w.ln();
                         }
                     }
                 }
@@ -618,10 +620,12 @@ impl ParzenEstimator {
         }
 
         // Add log mixture weights and logsumexp over kernels.
+        // Use ln() directly (matching Python's np.log) — zero weights become -inf,
+        // which logsumexp handles correctly.
         let mut result = Vec::with_capacity(n_samples);
         for row in &mut weighted_log_pdf {
             for (k, cell) in row.iter_mut().enumerate() {
-                *cell += self.weights[k].max(EPS).ln();
+                *cell += self.weights[k].ln();
             }
             result.push(logsumexp(row));
         }
@@ -645,6 +649,32 @@ impl ParzenEstimator {
             indices.push(idx);
         }
         indices
+    }
+
+    /// Get mixture weights (for cross-validation tests).
+    pub fn weights(&self) -> &[f64] {
+        &self.weights
+    }
+
+    /// Get numerical kernel mus/sigmas/low/high for a parameter (for cross-validation tests).
+    /// Returns None if the parameter is categorical.
+    pub fn numerical_kernels(&self, param: &str) -> Option<(Vec<f64>, Vec<f64>, f64, f64)> {
+        let idx = self.param_names.iter().position(|n| n == param)?;
+        match &self.param_dists[idx] {
+            ParamKernels::Numerical { mus, sigmas, low, high, .. } => {
+                Some((mus.clone(), sigmas.clone(), *low, *high))
+            }
+            _ => None,
+        }
+    }
+
+    /// Get categorical kernel weights for a parameter (for cross-validation tests).
+    pub fn categorical_kernels(&self, param: &str) -> Option<Vec<Vec<f64>>> {
+        let idx = self.param_names.iter().position(|n| n == param)?;
+        match &self.param_dists[idx] {
+            ParamKernels::Categorical { cat_weights, .. } => Some(cat_weights.clone()),
+            _ => None,
+        }
     }
 }
 

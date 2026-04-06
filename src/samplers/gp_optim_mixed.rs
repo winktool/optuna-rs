@@ -18,7 +18,7 @@ use super::qmc::sobol_point_pub;
 /// 搜索空间结构化信息 — 区分连续/离散参数。
 ///
 /// 对齐 Python `SearchSpace.continuous_indices` / `discrete_indices`。
-pub(crate) struct SearchSpaceInfo {
+pub struct SearchSpaceInfo {
     /// 连续参数索引 (FloatDistribution 无 step)
     pub continuous_indices: Vec<usize>,
     /// 离散参数索引 (Int / Categorical / Float+step)
@@ -32,7 +32,7 @@ pub(crate) struct SearchSpaceInfo {
 }
 
 /// 从搜索空间构建 SearchSpaceInfo。
-pub(crate) fn build_search_space_info(
+pub fn build_search_space_info(
     search_space: &indexmap::IndexMap<String, crate::distributions::Distribution>,
     param_names: &[String],
 ) -> SearchSpaceInfo {
@@ -297,19 +297,23 @@ fn gradient_ascent_continuous(
     let m = 10; // L-BFGS memory
     let h = 1e-5; // finite diff step
 
+    // 预提取连续参数的 lengthscale — 对齐 Python:
+    // `lengthscales = acqf.length_scales[continuous_indices]`
+    let cont_ls: Vec<f64> = continuous_indices.iter().map(|&idx| lengthscales[idx]).collect();
+
     // 提取连续参数并预条件化: z = x / l
     let mut z: Vec<f64> = (0..n_cont).map(|ci| {
-        x[continuous_indices[ci]] / lengthscales[ci]
+        x[continuous_indices[ci]] / cont_ls[ci]
     }).collect();
     let bounds: Vec<(f64, f64)> = (0..n_cont).map(|ci| {
-        (0.0, 1.0 / lengthscales[ci])
+        (0.0, 1.0 / cont_ls[ci])
     }).collect();
 
     // 负采集函数 (因为 L-BFGS 做最小化)
     let neg_acqf = |z_vals: &[f64]| -> f64 {
         let mut x_copy = x.clone();
         for (ci, &zi) in z_vals.iter().enumerate() {
-            x_copy[continuous_indices[ci]] = zi * lengthscales[ci];
+            x_copy[continuous_indices[ci]] = zi * cont_ls[ci];
         }
         -eval_acqf(&x_copy)
     };
@@ -417,7 +421,7 @@ fn gradient_ascent_continuous(
     // 反变换回 x 空间
     let mut x_new = x.clone();
     for (ci, &zi) in z.iter().enumerate() {
-        x_new[continuous_indices[ci]] = (zi * lengthscales[ci]).clamp(0.0, 1.0);
+        x_new[continuous_indices[ci]] = (zi * cont_ls[ci]).clamp(0.0, 1.0);
     }
     let fval_new = eval_acqf(&x_new);
 
@@ -757,7 +761,7 @@ fn local_search_mixed(
 /// 2. 批量评估 → 轮盘赌选择 n_local_search 个起点
 /// 3. 交替连续/离散局部搜索
 /// 4. 返回最优候选
-pub(crate) fn optimize_acqf_mixed(
+pub fn optimize_acqf_mixed(
     eval_acqf: &dyn Fn(&[f64]) -> f64,
     ss_info: &SearchSpaceInfo,
     warmstart: &[Vec<f64>],

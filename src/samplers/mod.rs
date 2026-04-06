@@ -1,19 +1,18 @@
 mod brute_force;
-mod cmaes;
+pub mod cmaes;
 pub mod ga;
-pub(crate) mod gp;
-pub(crate) mod gp_lbfgsb;
-pub(crate) mod gp_optim_mixed;
+pub mod gp;
+pub mod gp_optim_mixed;
 mod grid;
 pub mod nsgaii;
 pub mod nsgaiii;
 mod partial_fixed;
 pub mod qmc;
 pub(crate) mod random;
-mod tpe;
+pub mod tpe;
 
 pub use brute_force::BruteForceSampler;
-pub use cmaes::{CmaEsSampler, CmaEsSamplerBuilder};
+pub use cmaes::{CmaEsSampler, CmaEsSamplerBuilder, CmaState};
 pub use gp::GpSampler;
 pub use grid::GridSampler;
 pub use nsgaii::{NSGAIISampler, NSGAIISamplerBuilder};
@@ -73,7 +72,10 @@ pub trait Sampler: Send + Sync {
     ) -> Result<f64>;
 
     /// Called before a trial starts (optional hook).
-    fn before_trial(&self, _trials: &[FrozenTrial]) {}
+    ///
+    /// 对齐 Python `BaseSampler.before_trial(study, trial)`:
+    /// 接收 trial_id 和 storage 引用，允许采样器设置 system_attrs（如 GridSampler 的 grid_id）。
+    fn before_trial(&self, _trials: &[FrozenTrial], _trial_id: i64, _storage: &dyn crate::storage::Storage) {}
 
     /// Called after a trial finishes (optional hook).
     fn after_trial(
@@ -173,7 +175,8 @@ mod tests {
     #[test]
     fn test_default_hooks_no_panic() {
         let s = DummySampler;
-        s.before_trial(&[]);
+        let storage = crate::storage::InMemoryStorage::new();
+        s.before_trial(&[], 0, &storage);
         let trial = make_trial();
         s.after_trial(&[], &trial, TrialState::Complete, Some(&[1.0]));
     }

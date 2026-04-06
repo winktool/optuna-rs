@@ -113,8 +113,8 @@ impl Sampler for PartialFixedSampler {
             .sample_independent(trials, trial, param_name, distribution)
     }
 
-    fn before_trial(&self, trials: &[FrozenTrial]) {
-        self.base_sampler.before_trial(trials);
+    fn before_trial(&self, trials: &[FrozenTrial], trial_id: i64, storage: &dyn crate::storage::Storage) {
+        self.base_sampler.before_trial(trials, trial_id, storage);
     }
 
     fn after_trial(

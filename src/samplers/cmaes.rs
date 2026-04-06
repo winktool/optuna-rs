@@ -73,57 +73,122 @@ impl std::fmt::Debug for CmaEsSampler {
 ///
 /// 可序列化/反序列化，支持持久化到 storage system_attrs。
 /// 对应 Python `cmaes.CMA` 对象的 pickle 序列化。
+///
+/// 对齐 Python cmaes 库: 使用 Active CMA-ES (包含负权重)。
+
+// Serde default functions for LR adaptation fields
+fn default_lr_alpha() -> f64 { 1.4 }
+fn default_lr_beta_mean() -> f64 { 0.1 }
+fn default_lr_beta_sigma() -> f64 { 0.03 }
+fn default_lr_gamma() -> f64 { 0.1 }
+fn default_lr_eta() -> f64 { 1.0 }
+// Serde default functions for termination criteria
+fn default_tolx_unset() -> f64 { -1.0 }
+fn default_tolxup() -> f64 { 1e4 }
+fn default_tolfun() -> f64 { 1e-12 }
+fn default_tolconditioncov() -> f64 { 1e14 }
+
 #[derive(Serialize, Deserialize)]
-struct CmaState {
-    mean: Vec<f64>,
-    sigma: f64,
-    n: usize,
+pub struct CmaState {
+    pub mean: Vec<f64>,
+    pub sigma: f64,
+    pub n: usize,
     // Covariance matrix (n x n)
-    c: Vec<Vec<f64>>,
+    pub c: Vec<Vec<f64>>,
     // Evolution paths
-    p_sigma: Vec<f64>,
-    p_c: Vec<f64>,
+    pub p_sigma: Vec<f64>,
+    pub p_c: Vec<f64>,
     // Eigen decomposition cache
-    eigenvalues: Vec<f64>,
-    b: Vec<Vec<f64>>,
+    pub eigenvalues: Vec<f64>,
+    pub b: Vec<Vec<f64>>,
     // Strategy parameters
-    lambda: usize,
-    mu: usize,
-    weights: Vec<f64>,
-    mu_eff: f64,
-    c_sigma: f64,
-    d_sigma: f64,
-    c_c: f64,
-    c1: f64,
-    c_mu: f64,
-    chi_n: f64,
+    pub lambda: usize,
+    pub mu: usize,
+    /// 对齐 Python cmaes: ALL lambda weights (positive + negative).
+    /// weights[0..mu] are positive and sum to 1.0.
+    /// weights[mu..lambda] are negative and sum to -min_alpha.
+    pub weights: Vec<f64>,
+    pub mu_eff: f64,
+    /// 对齐 Python: mu_eff_minus (eq.49)
+    #[serde(default)]
+    pub mu_eff_minus: f64,
+    pub c_sigma: f64,
+    pub d_sigma: f64,
+    pub c_c: f64,
+    pub c1: f64,
+    pub c_mu: f64,
+    pub chi_n: f64,
+    /// 对齐 Python cmaes: Learning rate adaptation state.
+    #[serde(default)]
+    pub lr_adapt: bool,
+    #[serde(default = "default_lr_alpha")]
+    pub lr_alpha: f64,
+    #[serde(default = "default_lr_beta_mean")]
+    pub lr_beta_mean: f64,
+    #[serde(default = "default_lr_beta_sigma")]
+    pub lr_beta_sigma: f64,
+    #[serde(default = "default_lr_gamma")]
+    pub lr_gamma: f64,
+    #[serde(default)]
+    pub lr_e_mean: Vec<f64>,
+    #[serde(default)]
+    pub lr_e_sigma: Vec<f64>,
+    #[serde(default)]
+    pub lr_v_mean: f64,
+    #[serde(default)]
+    pub lr_v_sigma: f64,
+    #[serde(default = "default_lr_eta")]
+    pub lr_eta_mean: f64,
+    #[serde(default = "default_lr_eta")]
+    pub lr_eta_sigma: f64,
+    /// 对齐 Python cmaes: Termination criteria
+    #[serde(default = "default_tolx_unset")]
+    pub tolx: f64,
+    #[serde(default = "default_tolxup")]
+    pub tolxup: f64,
+    #[serde(default = "default_tolfun")]
+    pub tolfun: f64,
+    #[serde(default = "default_tolconditioncov")]
+    pub tolconditioncov: f64,
+    #[serde(default)]
+    pub funhist_term: usize,
+    #[serde(default)]
+    pub funhist_values: Vec<f64>,
     // Generation tracking
-    generation: usize,
+    pub generation: usize,
     // Pending candidates from current ask batch
-    pending: Vec<Vec<f64>>,
-    pending_idx: usize,
+    pub pending: Vec<Vec<f64>>,
+    pub pending_idx: usize,
     // Collected (params, value) pairs for current generation
-    results: Vec<(Vec<f64>, f64)>,
+    pub results: Vec<(Vec<f64>, f64)>,
     // Param names in order
-    param_names: Vec<String>,
+    pub param_names: Vec<String>,
 }
 
 #[allow(clippy::needless_range_loop)]
 impl CmaState {
-    fn new(mean: Vec<f64>, sigma: f64, lambda: usize, param_names: Vec<String>) -> Self {
+    pub fn new(mean: Vec<f64>, sigma: f64, lambda: usize, param_names: Vec<String>) -> Self {
         let n = mean.len();
         let mu = lambda / 2;
 
-        // Compute recombination weights
-        let mut weights: Vec<f64> = (0..mu)
+        // 对齐 Python cmaes (eq.49): 计算 ALL lambda 个 weights_prime
+        let weights_prime: Vec<f64> = (0..lambda)
             .map(|i| ((lambda as f64 + 1.0) / 2.0).ln() - ((i + 1) as f64).ln())
             .collect();
-        let w_sum: f64 = weights.iter().sum();
-        for w in &mut weights {
-            *w /= w_sum;
-        }
 
-        let mu_eff: f64 = 1.0 / weights.iter().map(|w| w * w).sum::<f64>();
+        // mu_eff from positive (top-mu) raw weights (eq.49)
+        let pos_sum_raw: f64 = weights_prime[..mu].iter().sum();
+        let pos_sq_sum_raw: f64 = weights_prime[..mu].iter().map(|w| w * w).sum();
+        let mu_eff: f64 = pos_sum_raw * pos_sum_raw / pos_sq_sum_raw;
+
+        // mu_eff_minus from negative (bottom) raw weights (eq.49)
+        let neg_sum_raw: f64 = weights_prime[mu..].iter().sum();
+        let neg_sq_sum_raw: f64 = weights_prime[mu..].iter().map(|w| w * w).sum();
+        let mu_eff_minus: f64 = if neg_sq_sum_raw.abs() > 1e-300 {
+            neg_sum_raw * neg_sum_raw / neg_sq_sum_raw
+        } else {
+            0.0
+        };
 
         // Adaptation parameters
         let c_sigma = (mu_eff + 2.0) / (n as f64 + mu_eff + 5.0);
@@ -131,12 +196,40 @@ impl CmaState {
             + 2.0 * (((mu_eff - 1.0) / (n as f64 + 1.0)).sqrt() - 1.0).max(0.0)
             + c_sigma;
         let c_c = (4.0 + mu_eff / n as f64) / (n as f64 + 4.0 + 2.0 * mu_eff / n as f64);
-        let c1 = 2.0 / ((n as f64 + 1.3).powi(2) + mu_eff);
-        let c_mu = (2.0 * (mu_eff - 2.0 + 1.0 / mu_eff)
-            / ((n as f64 + 2.0).powi(2) + mu_eff))
-            .min(1.0 - c1);
+
+        // 对齐 Python: alpha_cov = 2
+        let alpha_cov = 2.0;
+        let c1 = alpha_cov / ((n as f64 + 1.3).powi(2) + mu_eff);
+        // 对齐 Python: min(1 - c1 - 1e-8, ...)
+        let c_mu = (alpha_cov * (mu_eff - 2.0 + 1.0 / mu_eff)
+            / ((n as f64 + 2.0).powi(2) + alpha_cov * mu_eff / 2.0))
+            .min(1.0 - c1 - 1e-8);
+
         let chi_n =
             (n as f64).sqrt() * (1.0 - 1.0 / (4.0 * n as f64) + 1.0 / (21.0 * (n as f64).powi(2)));
+
+        // 对齐 Python (eqs.50-52): min_alpha for negative weight scaling
+        let min_alpha = if c_mu > 0.0 {
+            (1.0 + c1 / c_mu)
+                .min(1.0 + (2.0 * mu_eff_minus) / (mu_eff + 2.0))
+                .min((1.0 - c1 - c_mu) / (n as f64 * c_mu))
+        } else {
+            1.0
+        };
+
+        // 对齐 Python (eq.53): normalize positive/negative weights separately
+        let positive_sum: f64 = weights_prime.iter().filter(|&&w| w > 0.0).sum();
+        let negative_sum: f64 = weights_prime.iter().filter(|&&w| w < 0.0).map(|w| w.abs()).sum();
+
+        let weights: Vec<f64> = weights_prime.iter().map(|&w| {
+            if w >= 0.0 {
+                w / positive_sum
+            } else if negative_sum > 0.0 {
+                min_alpha / negative_sum * w
+            } else {
+                0.0
+            }
+        }).collect();
 
         // Identity covariance matrix
         let mut c = vec![vec![0.0; n]; n];
@@ -149,6 +242,9 @@ impl CmaState {
         for i in 0..n {
             b[i][i] = 1.0;
         }
+
+        // 对齐 Python: funhist_term = 10 + ceil(30 * n / lambda)
+        let funhist_term = 10 + (30.0 * n as f64 / lambda as f64).ceil() as usize;
 
         Self {
             mean,
@@ -163,12 +259,32 @@ impl CmaState {
             mu,
             weights,
             mu_eff,
+            mu_eff_minus,
             c_sigma,
             d_sigma,
             c_c,
             c1,
             c_mu,
             chi_n,
+            // LR adaptation — initialized to defaults, enabled via set_lr_adapt()
+            lr_adapt: false,
+            lr_alpha: 1.4,
+            lr_beta_mean: 0.1,
+            lr_beta_sigma: 0.03,
+            lr_gamma: 0.1,
+            lr_e_mean: vec![0.0; n],
+            lr_e_sigma: vec![0.0; n * n],
+            lr_v_mean: 0.0,
+            lr_v_sigma: 0.0,
+            lr_eta_mean: 1.0,
+            lr_eta_sigma: 1.0,
+            // Termination criteria — 对齐 Python cmaes
+            tolx: 1e-12 * sigma,
+            tolxup: 1e4,
+            tolfun: 1e-12,
+            tolconditioncov: 1e14,
+            funhist_term,
+            funhist_values: vec![0.0; funhist_term * 2],
             generation: 0,
             pending: Vec::new(),
             pending_idx: 0,
@@ -257,7 +373,7 @@ impl CmaState {
     }
 
     /// Record a result and update if generation is complete.
-    fn tell(&mut self, params: Vec<f64>, value: f64) {
+    pub fn tell(&mut self, params: Vec<f64>, value: f64) {
         self.results.push((params, value));
 
         if self.results.len() >= self.lambda {
@@ -266,139 +382,367 @@ impl CmaState {
     }
 
     /// Perform the CMA-ES update step.
+    /// 对齐 Python cmaes.CMA.tell(): Active CMA-ES with negative weights.
     fn update(&mut self) {
+        // 对齐 Python: generation 在 tell() 开头递增
+        self.generation += 1;
+
         // Sort by objective value (ascending = minimize)
         self.results
             .sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
 
-        let old_mean = self.mean.clone();
-
-        // Update mean
-        self.mean = vec![0.0; self.n];
-        for i in 0..self.mu {
-            for j in 0..self.n {
-                self.mean[j] += self.weights[i] * self.results[i].0[j];
+        // 对齐 Python: store funhist_values (best and worst per generation)
+        if self.funhist_term > 0 && !self.funhist_values.is_empty() {
+            let idx = 2 * (self.generation % self.funhist_term);
+            if idx + 1 < self.funhist_values.len() {
+                self.funhist_values[idx] = self.results[0].1;
+                self.funhist_values[idx + 1] = self.results[self.results.len() - 1].1;
             }
         }
 
-        // Compute mean displacement
-        let mut mean_diff = vec![0.0; self.n];
-        for i in 0..self.n {
-            mean_diff[i] = (self.mean[i] - old_mean[i]) / self.sigma;
+        let old_mean = self.mean.clone();
+
+        // 对齐 Python: save old values for lr_adaptation BEFORE standard update
+        let old_sigma = self.sigma;
+        let old_sigma_c: Option<(Vec<Vec<f64>>, Vec<Vec<f64>>)> = if self.lr_adapt {
+            // old_Sigma = sigma^2 * C
+            let n = self.n;
+            let mut old_sigma_mat = vec![vec![0.0; n]; n];
+            for i in 0..n {
+                for j in 0..n {
+                    old_sigma_mat[i][j] = self.sigma * self.sigma * self.c[i][j];
+                }
+            }
+            // old_invsqrtC = B * D^{-1} * B^T
+            let old_invsqrt_c = self.compute_c_invsqrt();
+            Some((old_sigma_mat, old_invsqrt_c))
+        } else {
+            None
+        };
+
+        // 对齐 Python: y_k = (x_k - mean) / sigma for ALL lambda solutions
+        let y_k: Vec<Vec<f64>> = self.results.iter()
+            .map(|(x, _)| {
+                (0..self.n).map(|j| (x[j] - old_mean[j]) / self.sigma).collect()
+            })
+            .collect();
+
+        // 对齐 Python (eq.41): y_w = sum(weights[:mu] * y_k[:mu])
+        let mut y_w = vec![0.0; self.n];
+        for i in 0..self.mu {
+            for j in 0..self.n {
+                y_w[j] += self.weights[i] * y_k[i][j];
+            }
         }
 
-        // Compute C^(-1/2) * mean_diff for p_sigma update
-        let invsqrt_c_diff = self.invsqrt_c_times(&mean_diff);
+        // Update mean: mean += cm * sigma * y_w (cm = 1)
+        for j in 0..self.n {
+            self.mean[j] = old_mean[j] + self.sigma * y_w[j];
+        }
+
+        // Compute C^(-1/2) for p_sigma update and w_io
+        // 对齐 Python: 使用更新前的 B, D 计算 C^{-1/2}
+        let c_invsqrt = self.compute_c_invsqrt();
+
+        // C^(-1/2) * y_w
+        let invsqrt_c_yw = self.mat_vec_mul(&c_invsqrt, &y_w);
 
         // Update evolution path p_sigma
         let cs_comp = (self.c_sigma * (2.0 - self.c_sigma) * self.mu_eff).sqrt();
         for i in 0..self.n {
             self.p_sigma[i] =
-                (1.0 - self.c_sigma) * self.p_sigma[i] + cs_comp * invsqrt_c_diff[i];
+                (1.0 - self.c_sigma) * self.p_sigma[i] + cs_comp * invsqrt_c_yw[i];
         }
 
         // h_sigma: indicator for p_sigma length
         let ps_norm: f64 = self.p_sigma.iter().map(|v| v * v).sum::<f64>().sqrt();
-        let threshold = (1.0 - (1.0 - self.c_sigma).powi(2 * (self.generation as i32 + 1)))
-            .sqrt()
-            * (1.4 + 2.0 / (self.n as f64 + 1.0))
-            * self.chi_n;
-        let h_sigma = if ps_norm < threshold { 1.0 } else { 0.0 };
 
-        // Update evolution path p_c
+        // 对齐 Python: sigma update
+        self.sigma *= ((self.c_sigma / self.d_sigma) * (ps_norm / self.chi_n - 1.0)).exp();
+        self.sigma = self.sigma.min(1e32); // 对齐 Python: _SIGMA_MAX = 1e32
+
+        // 对齐 Python: h_sigma 使用已递增的 generation (= self._g + 1)
+        let h_sigma_cond_left = ps_norm
+            / (1.0 - (1.0 - self.c_sigma).powi(2 * (self.generation as i32 + 1))).sqrt();
+        let h_sigma_cond_right = (1.4 + 2.0 / (self.n as f64 + 1.0)) * self.chi_n;
+        let h_sigma = if h_sigma_cond_left < h_sigma_cond_right { 1.0 } else { 0.0 };
+
+        // Update evolution path p_c (eq.45)
         let cc_comp = (self.c_c * (2.0 - self.c_c) * self.mu_eff).sqrt();
         for i in 0..self.n {
             self.p_c[i] =
-                (1.0 - self.c_c) * self.p_c[i] + h_sigma * cc_comp * mean_diff[i];
+                (1.0 - self.c_c) * self.p_c[i] + h_sigma * cc_comp * y_w[i];
         }
 
-        // Update covariance matrix
-        let delta_h = (1.0 - h_sigma) * self.c_c * (2.0 - self.c_c);
+        // 对齐 Python (eq.46): w_io — adapt negative weights
+        // w_io = weights * where(weights >= 0, 1, n / (||C^{-1/2} y_k||^2 + EPS))
+        let w_io: Vec<f64> = {
+            let n_results = self.results.len().min(self.lambda);
+            (0..n_results).map(|k| {
+                if self.weights.get(k).copied().unwrap_or(0.0) >= 0.0 {
+                    self.weights[k]
+                } else {
+                    // Compute ||C^{-1/2} * y_k[k]||^2
+                    let c_inv_yk = self.mat_vec_mul(&c_invsqrt, &y_k[k]);
+                    let norm_sq: f64 = c_inv_yk.iter().map(|v| v * v).sum();
+                    self.weights[k] * self.n as f64 / (norm_sq + 1e-8)
+                }
+            }).collect()
+        };
+
+        // 对齐 Python (eq.47): covariance matrix update
+        let delta_h_sigma = (1.0 - h_sigma) * self.c_c * (2.0 - self.c_c);
+        let w_sum: f64 = self.weights[..self.results.len().min(self.lambda)].iter().sum();
+
         for i in 0..self.n {
             for j in 0..self.n {
+                // rank-one update
                 let rank_one = self.p_c[i] * self.p_c[j];
+
+                // rank-mu update using w_io and ALL lambda y_k
                 let mut rank_mu = 0.0;
-                for k in 0..self.mu {
-                    let yi = (self.results[k].0[i] - old_mean[i]) / self.sigma;
-                    let yj = (self.results[k].0[j] - old_mean[j]) / self.sigma;
-                    rank_mu += self.weights[k] * yi * yj;
+                let n_results = self.results.len().min(self.lambda);
+                for k in 0..n_results {
+                    rank_mu += w_io[k] * y_k[k][i] * y_k[k][j];
                 }
 
-                self.c[i][j] = (1.0 - self.c1 - self.c_mu + delta_h * self.c1)
+                // 对齐 Python: (1 + c1*delta_h - c1 - cmu*sum(weights)) * C
+                self.c[i][j] = (1.0 + self.c1 * delta_h_sigma - self.c1 - self.c_mu * w_sum)
                     * self.c[i][j]
                     + self.c1 * rank_one
                     + self.c_mu * rank_mu;
             }
         }
 
-        // Update sigma
-        let sigma_factor = (ps_norm / self.chi_n - 1.0) * self.c_sigma / self.d_sigma;
-        self.sigma *= (sigma_factor).exp();
-        // Clamp sigma to reasonable range
-        self.sigma = self.sigma.clamp(1e-20, 1e10);
+        // 对齐 Python: LR adaptation (https://arxiv.org/abs/2304.03473)
+        if self.lr_adapt {
+            if let Some((old_sigma_mat, old_invsqrt_c)) = old_sigma_c {
+                self.lr_adaptation(&old_mean, old_sigma, &old_sigma_mat, &old_invsqrt_c);
+            }
+        }
 
         // Update eigen decomposition
         self.update_eigen();
 
-        self.generation += 1;
         self.results.clear();
         self.pending.clear();
         self.pending_idx = 0;
     }
 
-    /// Compute C^(-1/2) * v using eigen decomposition.
-    fn invsqrt_c_times(&self, v: &[f64]) -> Vec<f64> {
-        // C^(-1/2) = B * D^(-1) * B^T
-        // First: B^T * v
-        let mut bt_v = vec![0.0; self.n];
-        for i in 0..self.n {
-            for j in 0..self.n {
-                bt_v[i] += self.b[j][i] * v[j];
-            }
-        }
-        // D^(-1) * (B^T * v)
-        for i in 0..self.n {
-            let ev = self.eigenvalues[i].max(1e-20);
-            bt_v[i] /= ev.sqrt();
-        }
-        // B * result
-        let mut result = vec![0.0; self.n];
-        for i in 0..self.n {
-            for j in 0..self.n {
-                result[i] += self.b[i][j] * bt_v[j];
+    /// Compute C^(-1/2) matrix using eigen decomposition.
+    /// Returns n x n matrix: B * D^(-1) * B^T
+    fn compute_c_invsqrt(&self) -> Vec<Vec<f64>> {
+        let n = self.n;
+        let mut result = vec![vec![0.0; n]; n];
+        for i in 0..n {
+            for j in 0..n {
+                let mut sum = 0.0;
+                for k in 0..n {
+                    let d_inv = 1.0 / self.eigenvalues[k].max(1e-20).sqrt();
+                    sum += self.b[i][k] * d_inv * self.b[j][k];
+                }
+                result[i][j] = sum;
             }
         }
         result
     }
 
-    /// Update eigen decomposition of C using Jacobi iteration.
-    ///
-    /// 对齐 Python cmaes 库: 使用可靠的特征分解算法。
-    /// 改进: 迭代上限与维度成正比，使用 in-place 旋转避免分配。
-    fn update_eigen(&mut self) {
+    /// Matrix-vector multiply: result = mat * v
+    fn mat_vec_mul(&self, mat: &[Vec<f64>], v: &[f64]) -> Vec<f64> {
+        let n = v.len();
+        let mut result = vec![0.0; n];
+        for i in 0..n {
+            for j in 0..n {
+                result[i] += mat[i][j] * v[j];
+            }
+        }
+        result
+    }
+
+    /// Enable learning rate adaptation.
+    pub fn set_lr_adapt(&mut self, enabled: bool) {
+        self.lr_adapt = enabled;
+    }
+
+    /// 对齐 Python cmaes.CMA._lr_adaptation()
+    /// Learning rate adaptation: https://arxiv.org/abs/2304.03473
+    fn lr_adaptation(
+        &mut self,
+        old_mean: &[f64],
+        old_sigma: f64,
+        old_sigma_mat: &[Vec<f64>],  // old_Sigma = sigma^2 * C (before update)
+        old_invsqrt_c: &[Vec<f64>],  // old C^{-1/2} (before update)
+    ) {
         let n = self.n;
+
+        // calculate one-step difference of the parameters
+        // Deltamean = self.mean - old_mean (n x 1 column vector)
+        let delta_mean: Vec<f64> = (0..n).map(|i| self.mean[i] - old_mean[i]).collect();
+
+        // Sigma = sigma^2 * C (after update)
+        let mut sigma_mat = vec![vec![0.0; n]; n];
+        for i in 0..n {
+            for j in 0..n {
+                sigma_mat[i][j] = self.sigma * self.sigma * self.c[i][j];
+            }
+        }
+
+        // DeltaSigma = Sigma - old_Sigma
+        let mut delta_sigma_mat = vec![vec![0.0; n]; n];
+        for i in 0..n {
+            for j in 0..n {
+                delta_sigma_mat[i][j] = sigma_mat[i][j] - old_sigma_mat[i][j];
+            }
+        }
+
+        // local coordinate
+        // old_inv_sqrtSigma = old_invsqrtC / old_sigma
+        // locDeltamean = old_inv_sqrtSigma @ Deltamean
+        let mut loc_delta_mean = vec![0.0; n];
+        for i in 0..n {
+            for j in 0..n {
+                loc_delta_mean[i] += (old_invsqrt_c[i][j] / old_sigma) * delta_mean[j];
+            }
+        }
+
+        // locDeltaSigma = (old_inv_sqrtSigma @ DeltaSigma @ old_inv_sqrtSigma).reshape(n*n) / sqrt(2)
+        // First: temp = DeltaSigma @ old_inv_sqrtSigma
+        let mut temp = vec![vec![0.0; n]; n];
+        for i in 0..n {
+            for j in 0..n {
+                for k in 0..n {
+                    temp[i][j] += delta_sigma_mat[i][k] * (old_invsqrt_c[j][k] / old_sigma);
+                    // Note: old_inv_sqrtSigma^T = old_inv_sqrtSigma (symmetric)
+                    // so old_inv_sqrtSigma[k][j] = old_invsqrt_c[k][j]/old_sigma
+                    // but .dot(old_inv_sqrtSigma) means multiply on right by the matrix
+                    // Python: old_inv_sqrtSigma.dot(DeltaSigma.dot(old_inv_sqrtSigma))
+                }
+            }
+        }
+        // Actually re-do this properly:
+        // result = old_inv_sqrtSigma @ DeltaSigma @ old_inv_sqrtSigma
+        // Step 1: mid = DeltaSigma @ old_inv_sqrtSigma (n x n)
+        let mut mid = vec![vec![0.0; n]; n];
+        for i in 0..n {
+            for j in 0..n {
+                let mut s = 0.0;
+                for k in 0..n {
+                    s += delta_sigma_mat[i][k] * old_invsqrt_c[k][j] / old_sigma;
+                }
+                mid[i][j] = s;
+            }
+        }
+        // Step 2: result = old_inv_sqrtSigma @ mid (n x n)
+        let mut loc_delta_sigma_mat = vec![vec![0.0; n]; n];
+        for i in 0..n {
+            for j in 0..n {
+                let mut s = 0.0;
+                for k in 0..n {
+                    s += (old_invsqrt_c[i][k] / old_sigma) * mid[k][j];
+                }
+                loc_delta_sigma_mat[i][j] = s;
+            }
+        }
+        // Reshape to (n*n) column vector / sqrt(2)
+        let sqrt2 = 2.0_f64.sqrt();
+        let mut loc_delta_sigma = vec![0.0; n * n];
+        for i in 0..n {
+            for j in 0..n {
+                loc_delta_sigma[i * n + j] = loc_delta_sigma_mat[i][j] / sqrt2;
+            }
+        }
+
+        // moving average E and V
+        let beta_m = self.lr_beta_mean;
+        let beta_s = self.lr_beta_sigma;
+
+        for i in 0..n {
+            self.lr_e_mean[i] = (1.0 - beta_m) * self.lr_e_mean[i] + beta_m * loc_delta_mean[i];
+        }
+        for i in 0..(n * n) {
+            self.lr_e_sigma[i] = (1.0 - beta_s) * self.lr_e_sigma[i] + beta_s * loc_delta_sigma[i];
+        }
+
+        let norm_loc_delta_mean_sq: f64 = loc_delta_mean.iter().map(|v| v * v).sum();
+        self.lr_v_mean = (1.0 - beta_m) * self.lr_v_mean + beta_m * norm_loc_delta_mean_sq;
+
+        let norm_loc_delta_sigma_sq: f64 = loc_delta_sigma.iter().map(|v| v * v).sum();
+        self.lr_v_sigma = (1.0 - beta_s) * self.lr_v_sigma + beta_s * norm_loc_delta_sigma_sq;
+
+        // estimate SNR
+        let sqnorm_e_mean: f64 = self.lr_e_mean.iter().map(|v| v * v).sum();
+        let hat_snr_mean = (sqnorm_e_mean - (beta_m / (2.0 - beta_m)) * self.lr_v_mean)
+            / (self.lr_v_mean - sqnorm_e_mean);
+
+        let sqnorm_e_sigma: f64 = self.lr_e_sigma.iter().map(|v| v * v).sum();
+        let hat_snr_sigma = (sqnorm_e_sigma - (beta_s / (2.0 - beta_s)) * self.lr_v_sigma)
+            / (self.lr_v_sigma - sqnorm_e_sigma);
+
+        // update learning rate
+        let before_eta_mean = self.lr_eta_mean;
+
+        let relative_snr_mean = ((hat_snr_mean / self.lr_alpha / self.lr_eta_mean) - 1.0)
+            .clamp(-1.0, 1.0);
+        self.lr_eta_mean *= ((self.lr_gamma * self.lr_eta_mean).min(beta_m) * relative_snr_mean).exp();
+
+        let relative_snr_sigma = ((hat_snr_sigma / self.lr_alpha / self.lr_eta_sigma) - 1.0)
+            .clamp(-1.0, 1.0);
+        self.lr_eta_sigma *= ((self.lr_gamma * self.lr_eta_sigma).min(beta_s) * relative_snr_sigma).exp();
+
+        // cap
+        self.lr_eta_mean = self.lr_eta_mean.min(1.0);
+        self.lr_eta_sigma = self.lr_eta_sigma.min(1.0);
+
+        // update parameters
+        // self.mean = old_mean + eta_mean * Deltamean
+        for i in 0..n {
+            self.mean[i] = old_mean[i] + self.lr_eta_mean * delta_mean[i];
+        }
+
+        // Sigma = old_Sigma + eta_Sigma * DeltaSigma
+        let mut new_sigma_mat = vec![vec![0.0; n]; n];
+        for i in 0..n {
+            for j in 0..n {
+                new_sigma_mat[i][j] = old_sigma_mat[i][j] + self.lr_eta_sigma * delta_sigma_mat[i][j];
+            }
+        }
+
+        // decompose Sigma to sigma and C
+        // 对齐 Python: eigs = eigenvalues of new_sigma_mat
+        // sigma = exp(sum(log(eigs)) / (2*n))  [geometric mean of sqrt(eigs)]
+        // C = Sigma / sigma^2
+        let eigs = self.eigenvalues_symmetric(&new_sigma_mat);
+        let log_eig_sum: f64 = eigs.iter().map(|&e| e.max(1e-300).ln()).sum();
+        self.sigma = (log_eig_sum / (2.0 * n as f64)).exp();
+        self.sigma = self.sigma.min(1e32);
+
+        let sigma_sq = self.sigma * self.sigma;
+        for i in 0..n {
+            for j in 0..n {
+                self.c[i][j] = new_sigma_mat[i][j] / sigma_sq;
+            }
+        }
+
+        // step-size correction
+        self.sigma *= before_eta_mean / self.lr_eta_mean;
+    }
+
+    /// Compute eigenvalues of a symmetric matrix using Jacobi iteration.
+    /// Only returns eigenvalues (not eigenvectors).
+    fn eigenvalues_symmetric(&self, mat: &[Vec<f64>]) -> Vec<f64> {
+        let n = mat.len();
+        let mut a: Vec<Vec<f64>> = mat.to_vec();
 
         // Force symmetry
         for i in 0..n {
             for j in (i + 1)..n {
-                let avg = (self.c[i][j] + self.c[j][i]) / 2.0;
-                self.c[i][j] = avg;
-                self.c[j][i] = avg;
+                let avg = (a[i][j] + a[j][i]) / 2.0;
+                a[i][j] = avg;
+                a[j][i] = avg;
             }
         }
 
-        // Jacobi eigenvalue algorithm — 迭代上限与维度成正比
-        let mut a = self.c.clone();
-        let mut v = vec![vec![0.0; n]; n];
-        for i in 0..n {
-            v[i][i] = 1.0;
-        }
-
-        // 对齐 Python: 确保高维矩阵收敛。
-        // 经典 Jacobi 每次旋转消除一个非对角元素，
-        // 需要 O(n²) 次旋转完成一轮 sweep，通常 5-10 轮 sweep 收敛。
-        let max_iter = (10 * n * n).max(100);
-
+        let max_iter = 100 * n * n;
         for _ in 0..max_iter {
             // Find largest off-diagonal element
             let mut max_val = 0.0_f64;
@@ -413,53 +757,306 @@ impl CmaState {
                     }
                 }
             }
-
             if max_val < 1e-15 {
                 break;
             }
 
-            // Compute rotation
             let theta = if (a[p][p] - a[q][q]).abs() < 1e-30 {
                 std::f64::consts::FRAC_PI_4
             } else {
                 0.5 * (2.0 * a[p][q] / (a[p][p] - a[q][q])).atan()
             };
-
             let cos_t = theta.cos();
             let sin_t = theta.sin();
 
-            // In-place rotation of matrix a
+            // Apply rotation
+            let mut new_a = a.clone();
             for i in 0..n {
                 if i != p && i != q {
-                    let aip = a[i][p];
-                    let aiq = a[i][q];
-                    a[i][p] = cos_t * aip + sin_t * aiq;
-                    a[p][i] = a[i][p];
-                    a[i][q] = -sin_t * aip + cos_t * aiq;
-                    a[q][i] = a[i][q];
+                    new_a[i][p] = cos_t * a[i][p] + sin_t * a[i][q];
+                    new_a[p][i] = new_a[i][p];
+                    new_a[i][q] = -sin_t * a[i][p] + cos_t * a[i][q];
+                    new_a[q][i] = new_a[i][q];
                 }
             }
-            let app = a[p][p];
-            let aqq = a[q][q];
-            let apq = a[p][q];
-            a[p][p] = cos_t * cos_t * app + 2.0 * sin_t * cos_t * apq + sin_t * sin_t * aqq;
-            a[q][q] = sin_t * sin_t * app - 2.0 * sin_t * cos_t * apq + cos_t * cos_t * aqq;
-            a[p][q] = 0.0;
-            a[q][p] = 0.0;
+            new_a[p][p] = cos_t * cos_t * a[p][p] + 2.0 * sin_t * cos_t * a[p][q] + sin_t * sin_t * a[q][q];
+            new_a[q][q] = sin_t * sin_t * a[p][p] - 2.0 * sin_t * cos_t * a[p][q] + cos_t * cos_t * a[q][q];
+            new_a[p][q] = 0.0;
+            new_a[q][p] = 0.0;
+            a = new_a;
+        }
 
-            // Apply rotation to eigenvectors (in-place)
-            for i in 0..n {
-                let vip = v[i][p];
-                let viq = v[i][q];
-                v[i][p] = cos_t * vip + sin_t * viq;
-                v[i][q] = -sin_t * vip + cos_t * viq;
+        (0..n).map(|i| a[i][i]).collect()
+    }
+
+    /// 对齐 Python cmaes.CMA.should_stop()
+    /// Returns true when the optimizer should terminate.
+    pub fn should_stop(&self) -> bool {
+        let n = self.n;
+
+        // Stop if the range of function values of the recent generation is below tolfun
+        if self.generation > self.funhist_term && !self.funhist_values.is_empty() {
+            let max_v = self.funhist_values.iter().copied().fold(f64::NEG_INFINITY, f64::max);
+            let min_v = self.funhist_values.iter().copied().fold(f64::INFINITY, f64::min);
+            if max_v - min_v < self.tolfun {
+                return true;
             }
         }
 
-        for i in 0..n {
-            self.eigenvalues[i] = a[i][i].max(1e-20);
+        // Stop if std is smaller than tolx in all coordinates and pc is smaller than tolx
+        let dc: Vec<f64> = (0..n).map(|i| self.c[i][i]).collect();
+        if dc.iter().all(|&d| self.sigma * d < self.tolx)
+            && self.p_c.iter().all(|&p| self.sigma * p < self.tolx)
+        {
+            return true;
         }
-        self.b = v;
+
+        // Stop if detecting divergent behavior
+        let max_d = self.eigenvalues.iter().copied().fold(0.0_f64, f64::max).sqrt();
+        if self.sigma * max_d > self.tolxup {
+            return true;
+        }
+
+        // No effect coordinates
+        let dc_sqrt: Vec<f64> = dc.iter().map(|d| d.sqrt()).collect();
+        if (0..n).any(|i| self.mean[i] == self.mean[i] + 0.2 * self.sigma * dc_sqrt[i]) {
+            return true;
+        }
+
+        // No effect axis
+        if n > 0 {
+            let i = self.generation % n;
+            let d_i = self.eigenvalues[i].max(0.0).sqrt();
+            let step: Vec<f64> = (0..n).map(|j| 0.1 * self.sigma * d_i * self.b[j][i]).collect();
+            if (0..n).all(|j| self.mean[j] == self.mean[j] + step[j]) {
+                return true;
+            }
+        }
+
+        // Stop if condition number exceeds tolconditioncov
+        let max_eig = self.eigenvalues.iter().copied().fold(0.0_f64, f64::max).sqrt();
+        let min_eig = self.eigenvalues.iter().copied().fold(f64::INFINITY, f64::min).sqrt();
+        if min_eig > 0.0 && max_eig / min_eig > self.tolconditioncov {
+            return true;
+        }
+
+        false
+    }
+
+    /// Update eigen decomposition of C.
+    ///
+    /// 对齐 Python cmaes: np.linalg.eigh (LAPACK DSYEV 算法).
+    /// 使用 Householder 三对角化 + implicit QR with Wilkinson shifts.
+    /// 比基础 Jacobi 迭代更鲁棒、更适合大维度和病态矩阵。
+    fn update_eigen(&mut self) {
+        let n = self.n;
+
+        // Force symmetry
+        for i in 0..n {
+            for j in (i + 1)..n {
+                let avg = (self.c[i][j] + self.c[j][i]) / 2.0;
+                self.c[i][j] = avg;
+                self.c[j][i] = avg;
+            }
+        }
+
+        if n == 1 {
+            self.eigenvalues[0] = self.c[0][0].max(1e-20);
+            self.b[0][0] = 1.0;
+            return;
+        }
+
+        // Step 1: Householder tridiagonalization
+        // A = Q^T * T * Q where T is tridiagonal
+        // diag: diagonal of T, offdiag: sub-diagonal of T
+        // q_acc: accumulated orthogonal transformation matrix
+        let mut a = self.c.clone();
+        let mut q_acc = vec![vec![0.0; n]; n];
+        for i in 0..n {
+            q_acc[i][i] = 1.0;
+        }
+
+        for k in 0..(n - 2) {
+            // Compute Householder vector for a[k+1:n, k]
+            let mut x = vec![0.0; n - k - 1];
+            for i in 0..x.len() {
+                x[i] = a[k + 1 + i][k];
+            }
+
+            let x_norm: f64 = x.iter().map(|v| v * v).sum::<f64>().sqrt();
+            if x_norm < 1e-30 {
+                continue;
+            }
+
+            let alpha = if x[0] >= 0.0 { -x_norm } else { x_norm };
+
+            // v = x - alpha * e_1
+            let mut v = x.clone();
+            v[0] -= alpha;
+            let v_norm: f64 = v.iter().map(|vi| vi * vi).sum::<f64>().sqrt();
+            if v_norm < 1e-30 {
+                continue;
+            }
+            for vi in v.iter_mut() {
+                *vi /= v_norm;
+            }
+
+            // Apply Householder: A = (I - 2vv^T) A (I - 2vv^T)
+            // This operates on the submatrix a[k+1:n, k+1:n]
+            // but also affects a[k+1:n, k] and a[k, k+1:n]
+            let m = n - k - 1;
+
+            // Compute p = A_sub * v
+            let mut p = vec![0.0; m];
+            for i in 0..m {
+                for j in 0..m {
+                    p[i] += a[k + 1 + i][k + 1 + j] * v[j];
+                }
+            }
+
+            // Compute K = 2 * (v^T * p)
+            let vp: f64 = v.iter().zip(p.iter()).map(|(vi, pi)| vi * pi).sum();
+            let kk = 2.0 * vp;
+
+            // Compute q = 2*p - K*v
+            let mut q = vec![0.0; m];
+            for i in 0..m {
+                q[i] = 2.0 * p[i] - kk * v[i];
+            }
+
+            // Update submatrix: A_sub = A_sub - v*q^T - q*v^T
+            for i in 0..m {
+                for j in 0..m {
+                    a[k + 1 + i][k + 1 + j] -= v[i] * q[j] + q[i] * v[j];
+                }
+            }
+
+            // Update the k-th column/row
+            a[k][k + 1] = alpha;
+            a[k + 1][k] = alpha;
+            for i in 1..m {
+                a[k + 1 + i][k] = 0.0;
+                a[k][k + 1 + i] = 0.0;
+            }
+
+            // Accumulate Q: Q = Q * (I - 2vv^T) applied to columns k+1:n
+            for i in 0..n {
+                let mut dot = 0.0;
+                for j in 0..m {
+                    dot += q_acc[i][k + 1 + j] * v[j];
+                }
+                for j in 0..m {
+                    q_acc[i][k + 1 + j] -= 2.0 * dot * v[j];
+                }
+            }
+        }
+
+        // Extract tridiagonal elements
+        let mut diag = vec![0.0; n];
+        let mut offdiag = vec![0.0; n]; // offdiag[i] = T[i, i+1] = T[i+1, i]
+        for i in 0..n {
+            diag[i] = a[i][i];
+        }
+        for i in 0..(n - 1) {
+            offdiag[i] = a[i][i + 1];
+        }
+
+        // Step 2: Implicit QR algorithm with Wilkinson shifts
+        // on the tridiagonal matrix T
+        let mut z = q_acc; // eigenvectors will be Q * (QR eigenvectors)
+
+        let max_qr_iter = 30 * n;
+        let mut lo = 0;
+        let mut hi = n - 1;
+
+        let mut iter = 0;
+        while lo < hi && iter < max_qr_iter {
+            iter += 1;
+
+            // Find unreduced block: look for small offdiag elements
+            let mut split = hi;
+            while split > lo {
+                let s = diag[split - 1].abs() + diag[split].abs();
+                let threshold = if s > 0.0 { 1e-14 * s } else { 1e-30 };
+                if offdiag[split - 1].abs() <= threshold {
+                    break;
+                }
+                split -= 1;
+            }
+
+            if split == hi {
+                // Eigenvalue converged at hi
+                hi -= 1;
+                if hi == 0 {
+                    break;
+                }
+                continue;
+            }
+
+            // Find the specific block [split..=hi]
+            lo = split;
+
+            // Wilkinson shift: eigenvalue of bottom-right 2x2 closer to diag[hi]
+            let d = (diag[hi - 1] - diag[hi]) / 2.0;
+            let e2 = offdiag[hi - 1] * offdiag[hi - 1];
+            let shift = diag[hi] - e2 / (d + if d >= 0.0 { 1.0 } else { -1.0 }
+                * (d * d + e2).sqrt());
+
+            // Implicit QR step with Givens rotations
+            let mut g = diag[lo] - shift;
+            let mut s_rot = 1.0;
+            let mut c_rot = 1.0;
+            let mut p_val = 0.0;
+
+            for i in lo..hi {
+                let f = s_rot * offdiag[i];
+                let b = c_rot * offdiag[i];
+
+                // Givens rotation parameters
+                let r = (g * g + f * f).sqrt();
+                c_rot = if r > 0.0 { g / r } else { 1.0 };
+                s_rot = if r > 0.0 { f / r } else { 0.0 };
+
+                if i > lo {
+                    offdiag[i - 1] = r;
+                }
+
+                g = diag[i] - p_val;
+                let rr = (diag[i + 1] - g) * s_rot + 2.0 * c_rot * b;
+                p_val = s_rot * rr;
+                diag[i] = g + p_val;
+                g = c_rot * rr - b;
+
+                // Update eigenvector matrix
+                for k in 0..n {
+                    let zi = z[k][i];
+                    let zi1 = z[k][i + 1];
+                    z[k][i] = c_rot * zi + s_rot * zi1;
+                    z[k][i + 1] = -s_rot * zi + c_rot * zi1;
+                }
+            }
+
+            diag[hi] -= p_val;
+            offdiag[hi - 1] = g;
+            // Note: offdiag[hi] is not part of the active block
+        }
+
+        // Sort eigenvalues in ascending order (matching np.linalg.eigh)
+        let mut idx: Vec<usize> = (0..n).collect();
+        idx.sort_by(|&a, &b| diag[a].partial_cmp(&diag[b]).unwrap_or(std::cmp::Ordering::Equal));
+
+        for (dest, &src) in idx.iter().enumerate() {
+            self.eigenvalues[dest] = diag[src].max(1e-20);
+        }
+
+        // Reorder eigenvectors to match sorted eigenvalues
+        let mut sorted_b = vec![vec![0.0; n]; n];
+        for (dest, &src) in idx.iter().enumerate() {
+            for i in 0..n {
+                sorted_b[i][dest] = z[i][src];
+            }
+        }
+        self.b = sorted_b;
     }
 
     // ── 状态持久化方法 ──────────────────────────────────────────
@@ -583,7 +1180,7 @@ impl CmaEsSampler {
         }
     }
 
-    fn default_popsize(n: usize) -> usize {
+    pub fn default_popsize(n: usize) -> usize {
         (4 + (3.0 * (n as f64).ln()).floor() as usize).max(5)
     }
 
@@ -676,7 +1273,7 @@ impl CmaEsSampler {
     }
 
     /// 计算矩阵行列式（LU 分解法）。
-    fn matrix_det(mat: &[Vec<f64>], n: usize) -> f64 {
+    pub fn matrix_det(mat: &[Vec<f64>], n: usize) -> f64 {
         // Gaussian elimination with partial pivoting
         let mut a: Vec<Vec<f64>> = mat.to_vec();
         let mut det = 1.0;
@@ -914,12 +1511,9 @@ impl Sampler for CmaEsSampler {
                 }
             }
 
-            // Apply learning-rate adaptation
+            // Apply learning-rate adaptation: set flag on CmaState
             if self.lr_adapt {
-                // Reduce c1 and c_mu by factor of n for large dimensionality
-                let n = new_state.n as f64;
-                new_state.c1 /= n.sqrt();
-                new_state.c_mu /= n.sqrt();
+                new_state.set_lr_adapt(true);
             }
 
             *state_guard = Some(new_state);

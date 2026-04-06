@@ -51,7 +51,7 @@ const LOG_SQRT_2PI: f64 = 0.9189385332046727418;
 // ════════════════════════════════════════════════════════════════════════
 
 /// Matern 5/2 核: k(d²) = exp(-√(5d²)) * (5/3 * d² + √(5d²) + 1)
-pub(crate) fn matern52(squared_distance: f64) -> f64 {
+pub fn matern52(squared_distance: f64) -> f64 {
     if squared_distance < 1e-30 {
         return 1.0;
     }
@@ -66,7 +66,7 @@ pub(crate) fn matern52(squared_distance: f64) -> f64 {
 
 /// Cholesky 分解: A = L * L^T，返回下三角矩阵 L
 /// 要求 A 为正定对称矩阵
-pub(crate) fn cholesky(a: &[Vec<f64>]) -> Option<Vec<Vec<f64>>> {
+pub fn cholesky(a: &[Vec<f64>]) -> Option<Vec<Vec<f64>>> {
     let n = a.len();
     let mut l = vec![vec![0.0; n]; n];
 
@@ -94,7 +94,7 @@ pub(crate) fn cholesky(a: &[Vec<f64>]) -> Option<Vec<Vec<f64>>> {
 }
 
 /// 前向替代: L * x = b（L 为下三角）
-pub(crate) fn solve_lower(l: &[Vec<f64>], b: &[f64]) -> Vec<f64> {
+pub fn solve_lower(l: &[Vec<f64>], b: &[f64]) -> Vec<f64> {
     let n = b.len();
     let mut x = vec![0.0; n];
     for i in 0..n {
@@ -108,7 +108,7 @@ pub(crate) fn solve_lower(l: &[Vec<f64>], b: &[f64]) -> Vec<f64> {
 }
 
 /// 后向替代: L^T * x = b（L 为下三角）
-pub(crate) fn solve_upper(l: &[Vec<f64>], b: &[f64]) -> Vec<f64> {
+pub fn solve_upper(l: &[Vec<f64>], b: &[f64]) -> Vec<f64> {
     let n = b.len();
     let mut x = vec![0.0; n];
     for i in (0..n).rev() {
@@ -126,7 +126,7 @@ pub(crate) fn solve_upper(l: &[Vec<f64>], b: &[f64]) -> Vec<f64> {
 // ════════════════════════════════════════════════════════════════════════
 
 /// 高斯过程回归器
-pub(crate) struct GPRegressor {
+pub struct GPRegressor {
     /// 训练输入 [n_points, n_params]（归一化后）
     pub(crate) x_train: Vec<Vec<f64>>,
     /// 训练目标 [n_points]（标准化后）
@@ -146,7 +146,7 @@ pub(crate) struct GPRegressor {
 }
 
 impl GPRegressor {
-    pub(crate) fn new(
+    pub fn new(
         x_train: Vec<Vec<f64>>,
         y_train: Vec<f64>,
         is_categorical: Vec<bool>,
@@ -195,7 +195,7 @@ impl GPRegressor {
     }
 
     /// 训练核矩阵 K(X_train, X_train)
-    pub(crate) fn train_kernel_matrix(&self) -> Vec<Vec<f64>> {
+    pub fn train_kernel_matrix(&self) -> Vec<Vec<f64>> {
         self.kernel_matrix(&self.x_train, &self.x_train)
     }
 
@@ -220,7 +220,7 @@ impl GPRegressor {
     }
 
     /// 后验预测 mean 和 variance
-    pub(crate) fn posterior(&self, x: &[f64]) -> (f64, f64) {
+    pub fn posterior(&self, x: &[f64]) -> (f64, f64) {
         let alpha = match &self.alpha {
             Some(a) => a,
             None => return (0.0, self.kernel_scale),
@@ -270,7 +270,7 @@ impl GPRegressor {
     }
 
     /// 边际对数似然: log p(y | X, θ)
-    pub(crate) fn log_marginal_likelihood(&self) -> f64 {
+    pub fn log_marginal_likelihood(&self) -> f64 {
         let chol_l = match &self.chol_l {
             Some(l) => l,
             None => return f64::NEG_INFINITY,
@@ -316,7 +316,7 @@ pub(crate) struct KernelParamsCache {
 /// - `inverse_squared_lengthscales`: 自定义惩罚 `-(0.1/x + 0.1*x)` ← 鼓励 ≈ 1
 /// - `kernel_scale`: Gamma(concentration=2, rate=1) → `log(x) - x`
 /// - `noise_var`: Gamma(concentration=1.1, rate=30) → `0.1*log(x) - 30*x`
-pub(crate) fn default_log_prior(
+pub fn default_log_prior(
     inverse_squared_lengthscales: &[f64],
     kernel_scale: f64,
     noise_var: f64,
@@ -567,12 +567,12 @@ pub(crate) fn fit_kernel_params(
 // ════════════════════════════════════════════════════════════════════════
 
 /// 标准正态 CDF: Φ(z)
-pub(crate) fn normal_cdf(z: f64) -> f64 {
+pub fn normal_cdf(z: f64) -> f64 {
     0.5 * libm::erfc(-z * std::f64::consts::FRAC_1_SQRT_2)
 }
 
 /// 标准正态 PDF: φ(z)
-pub(crate) fn normal_pdf(z: f64) -> f64 {
+pub fn normal_pdf(z: f64) -> f64 {
     (1.0 / (2.0 * PI).sqrt()) * (-0.5 * z * z).exp()
 }
 
@@ -584,7 +584,7 @@ pub(crate) fn normal_pdf(z: f64) -> f64 {
 ///    使用 erfcx 避免精度丢失。
 ///
 /// logEI = standard_logei(z) + log(σ), 其中 z = (μ - f₀) / σ。
-fn log_ei(mean: f64, var: f64, f0: f64) -> f64 {
+pub fn log_ei(mean: f64, var: f64, f0: f64) -> f64 {
     if var < 1e-30 {
         // 方差为零时，EI 为 max(mean - f0, 0)
         return if mean > f0 { (mean - f0).ln() } else { f64::NEG_INFINITY };
@@ -617,7 +617,7 @@ fn log_ei(mean: f64, var: f64, f0: f64) -> f64 {
 /// 对齐 Python `torch.special.erfcx`。
 /// 对大 x 值保持精度（erfc 趋近 0，但 erfcx 趋近 1/(x√π)）。
 /// 使用 Abramowitz & Stegun 近似。
-fn erfcx(x: f64) -> f64 {
+pub fn erfcx(x: f64) -> f64 {
     // 对于负数大值: erfcx(x) = exp(x²) * erfc(x) ≈ 2*exp(x²) 会爆炸
     // 但在我们的 logEI 尾部分支中 x > 0 (因为 -SQRT_HALF * z > 0 when z < -25)
     if x < 0.0 {
@@ -644,7 +644,7 @@ fn erfcx(x: f64) -> f64 {
 /// - z < -5: 使用渐近展开避免 log(0) 下溢
 ///
 /// 这比 `normal_cdf(z).max(1e-30).ln()` 精确得多。
-fn log_ndtr(z: f64) -> f64 {
+pub fn log_ndtr(z: f64) -> f64 {
     if z > 6.0 {
         // Φ(z) ≈ 1 for z > 6, log Φ(z) ≈ 0
         // 更精确: log Φ(z) = log(1 - Q(z)) ≈ -Q(z) where Q(z) = 1-Φ(z)
@@ -652,23 +652,23 @@ fn log_ndtr(z: f64) -> f64 {
         let log_q = -0.5 * z * z - LOG_SQRT_2PI - z.ln();
         return (-log_q.exp()).ln_1p(); // log(1 - Q(z))
     }
-    if z >= -5.0 {
+    if z >= -26.0 {
         // 直接计算: log(0.5 * erfc(-z/√2))
+        // erfc 对 x ∈ [0, 18.4] (即 z ∈ [-26, ...]) 不会下溢到零
         let cdf = 0.5 * libm::erfc(-z * SQRT_HALF);
         return cdf.ln();
     }
-    // 尾部渐近展开 (z < -5):
-    // log Φ(z) ≈ -z²/2 - log(-z) - log(√(2π)) + log(1 - 1/z² + 3/z⁴ - ...)
-    // 使用 Mills ratio 展开
+    // 尾部渐近展开 (z < -26):
+    // log Φ(z) = -z²/2 - log(√(2π)) - log|z| + log(series)
+    // Φ(z) = φ(z)/|z| * Σ_{k=0}^∞ (-1)^k (2k-1)!! / z^{2k}
+    // 使用 Horner 形式: 1 - 1/z²(1 - 3/z²(1 - 5/z²(1 - 7/z²(1 - 9/z²))))
     let z2 = z * z;
     let log_phi = -0.5 * z2 - LOG_SQRT_2PI;
-    // log erfc(|z|/√2) ≈ log(1/|z|) + log_phi + correction
     let abs_z = -z; // z < 0, abs_z > 0
     let inv_z2 = 1.0 / z2;
-    // Mills ratio: erfc(x)/φ(x) ≈ (1/x) * (1 - 1/x² + 3/x⁴ - 15/x⁶ + ...)
-    // where x = |z|/√2, but we directly compute log Φ(z)
-    log_phi - abs_z.ln() + (1.0 - inv_z2 * (1.0 - 3.0 * inv_z2 * (1.0 - 5.0 * inv_z2))).ln()
-        - (0.5_f64).ln() // log(1/sqrt(2π)) → correction for erfc vs Φ
+    log_phi - abs_z.ln()
+        + (1.0 - inv_z2 * (1.0 - 3.0 * inv_z2 * (1.0 - 5.0 * inv_z2
+            * (1.0 - 7.0 * inv_z2 * (1.0 - 9.0 * inv_z2))))).ln()
 }
 
 // ════════════════════════════════════════════════════════════════════════
@@ -701,10 +701,10 @@ pub(crate) fn sample_from_normal_sobol(dim: usize, n_samples: usize, seed: u64) 
         .collect()
 }
 
-/// 逆误差函数 erfinv(x) 的有理近似。
+/// 逆误差函数 erfinv(x) — 高精度实现。
 ///
 /// 对齐 Python `torch.erfinv` / `scipy.special.erfinv`。
-/// 使用 Winitzki 近似 + 精度修正，适用于 |x| < 1。
+/// 使用 Winitzki 近似作为初始值，加 2 轮 Halley 迭代收敛到机器精度。
 fn erfinv(x: f64) -> f64 {
     if x.abs() >= 1.0 {
         return if x > 0.0 { f64::INFINITY } else { f64::NEG_INFINITY };
@@ -712,12 +712,25 @@ fn erfinv(x: f64) -> f64 {
     if x.abs() < 1e-15 {
         return x; // erfinv(0) = 0
     }
-    // 使用 Abramowitz & Stegun / Winitzki 方法的精确有理近似
+    // Winitzki 初始近似 (max relative error ~0.2%)
     let a = 0.147;
     let ln_part = (1.0 - x * x).ln();
     let b = 2.0 / (PI * a) + 0.5 * ln_part;
     let sign = if x >= 0.0 { 1.0 } else { -1.0 };
-    sign * (((b * b - ln_part / a).sqrt() - b).sqrt())
+    let mut y = sign * (((b * b - ln_part / a).sqrt() - b).sqrt());
+
+    // Halley 迭代精炼: 收敛到机器精度 (~1e-15)
+    // erf'(y) = 2/√π * exp(-y²)
+    let two_over_sqrt_pi = 2.0 / PI.sqrt();
+    for _ in 0..2 {
+        let ey = libm::erf(y);
+        let deriv = two_over_sqrt_pi * (-y * y).exp();
+        if deriv.abs() < 1e-300 { break; } // 避免除零
+        let correction = (ey - x) / deriv;
+        // Halley: y_new = y - correction / (1 + y * correction)
+        y -= correction / (1.0 + y * correction);
+    }
+    y
 }
 
 /// Log Expected Hypervolume Improvement (logEHVI) 计算。
@@ -803,58 +816,68 @@ fn is_pareto_front_min(loss_values: &[Vec<f64>]) -> Vec<bool> {
 }
 
 /// 归一化参数到 [0, 1]
-pub(crate) fn normalize_param(
+pub fn normalize_param(
     value: f64,
     dist: &Distribution,
 ) -> f64 {
     match dist {
         Distribution::FloatDistribution(d) => {
-            let (low, high) = if d.log {
-                (d.low.ln(), d.high.ln())
+            let step = d.step.unwrap_or(0.0);
+            let (raw_low, raw_high) = if d.log {
+                // 对齐 Python: log 空间下先扩展再取 log
+                ((d.low - 0.5 * step).ln(), (d.high + 0.5 * step).ln())
             } else {
-                (d.low, d.high)
+                (d.low - 0.5 * step, d.high + 0.5 * step)
             };
             let v = if d.log { value.ln() } else { value };
-            let range = high - low;
-            if range < 1e-14 { 0.5 } else { (v - low) / range }
+            let range = raw_high - raw_low;
+            if range < 1e-14 { 0.5 } else { (v - raw_low) / range }
         }
         Distribution::IntDistribution(d) => {
-            let (low, high) = if d.log {
-                ((d.low as f64).ln(), (d.high as f64).ln())
+            let step = d.step as f64;
+            let (raw_low, raw_high) = if d.log {
+                ((d.low as f64 - 0.5 * step).ln(), (d.high as f64 + 0.5 * step).ln())
             } else {
-                (d.low as f64, d.high as f64)
+                (d.low as f64 - 0.5 * step, d.high as f64 + 0.5 * step)
             };
             let v = if d.log { (value).ln() } else { value };
-            let range = high - low;
-            if range < 1e-14 { 0.5 } else { (v - low) / range }
+            let range = raw_high - raw_low;
+            if range < 1e-14 { 0.5 } else { (v - raw_low) / range }
         }
         Distribution::CategoricalDistribution(_) => value,
     }
 }
 
 /// 反归一化参数
-pub(crate) fn unnormalize_param(
+///
+/// 对齐 Python `_unnormalize_one_param`:
+/// 使用 step-adjusted bounds: `[low - 0.5*step, high + 0.5*step]`
+pub fn unnormalize_param(
     value: f64,
     dist: &Distribution,
 ) -> f64 {
     match dist {
         Distribution::FloatDistribution(d) => {
-            let (low, high) = if d.log {
-                (d.low.ln(), d.high.ln())
+            let step = d.step.unwrap_or(0.0);
+            let (raw_low, raw_high) = if d.log {
+                ((d.low - 0.5 * step).ln(), (d.high + 0.5 * step).ln())
             } else {
-                (d.low, d.high)
+                (d.low - 0.5 * step, d.high + 0.5 * step)
             };
-            let v = value * (high - low) + low;
-            if d.log { v.exp() } else { v }
+            let v = value * (raw_high - raw_low) + raw_low;
+            let v = if d.log { v.exp() } else { v };
+            v.clamp(d.low, d.high)
         }
         Distribution::IntDistribution(d) => {
-            let (low, high) = if d.log {
-                ((d.low as f64).ln(), (d.high as f64).ln())
+            let step = d.step as f64;
+            let (raw_low, raw_high) = if d.log {
+                ((d.low as f64 - 0.5 * step).ln(), (d.high as f64 + 0.5 * step).ln())
             } else {
-                (d.low as f64, d.high as f64)
+                (d.low as f64 - 0.5 * step, d.high as f64 + 0.5 * step)
             };
-            let v = value * (high - low) + low;
-            if d.log { v.exp().round() } else { v.round() }
+            let v = value * (raw_high - raw_low) + raw_low;
+            let v = if d.log { crate::search_space::round_ties_even(v.exp()) } else { crate::search_space::round_ties_even(v) };
+            v.clamp(d.low as f64, d.high as f64)
         }
         Distribution::CategoricalDistribution(_) => value,
     }
@@ -1410,11 +1433,14 @@ impl GpSampler {
             };
 
             // 提取 GP lengthscales (取各目标的平均)
+            // 对齐 Python: np.mean([gpr.length_scales for gpr in gpr_list], axis=0)
+            // 其中 length_scales = 1/sqrt(inverse_squared_lengthscales)
+            // 正确: mean(1/sqrt(isl))，NOT 1/sqrt(mean(isl))
             let lengthscales: Vec<f64> = (0..n_params).map(|d| {
-                let avg_isl: f64 = gprs_list.iter()
-                    .map(|gpr| gpr.inverse_squared_lengthscales[d])
+                let avg_ls: f64 = gprs_list.iter()
+                    .map(|gpr| 1.0 / gpr.inverse_squared_lengthscales[d].sqrt().max(1e-6))
                     .sum::<f64>() / n_objectives as f64;
-                1.0 / avg_isl.sqrt().max(1e-6)
+                avg_ls
             }).collect();
 
             // 5. 使用 optimize_acqf_mixed 优化

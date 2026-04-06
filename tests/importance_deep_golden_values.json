@@ -1,0 +1,394 @@
+{
+  "weighted_variance": [
+    {
+      "values": [
+        1.0,
+        3.0
+      ],
+      "weights": [
+        0.5,
+        0.5
+      ],
+      "variance": 1.0
+    },
+    {
+      "values": [
+        1.0,
+        2.0,
+        4.0
+      ],
+      "weights": [
+        0.5,
+        0.15,
+        0.35
+      ],
+      "variance": 1.8599999999999999
+    },
+    {
+      "values": [
+        5.0,
+        5.0,
+        5.0
+      ],
+      "weights": [
+        1.0,
+        2.0,
+        3.0
+      ],
+      "variance": 0.0
+    },
+    {
+      "values": [
+        0.0,
+        10.0
+      ],
+      "weights": [
+        0.9,
+        0.1
+      ],
+      "variance": 9.0
+    },
+    {
+      "values": [
+        1.0,
+        2.0,
+        3.0,
+        4.0,
+        5.0
+      ],
+      "weights": [
+        0.2,
+        0.2,
+        0.2,
+        0.2,
+        0.2
+      ],
+      "variance": 2.0
+    }
+  ],
+  "fanova_tree": {
+    "tree_a": {
+      "description": "单特征2叶子: root splits feat=0 at 0.5, leaves=[1.0, 3.0], ss=[[0,1]]",
+      "total_variance": 1.0,
+      "marginal_variance_feat0": 1.0
+    },
+    "tree_b": {
+      "description": "两特征3叶子: root splits feat=0@0.5, right splits feat=1@0.3, leaves=[1,2,4], ss=[[0,1],[0,1]]",
+      "total_variance": 1.8599999999999999,
+      "marginal_variance_feat0": 1.44,
+      "marginal_variance_feat1": 0.21000000000000002,
+      "marginal_variance_feat01": 1.8599999999999999
+    },
+    "tree_c": {
+      "description": "三特征4叶子深度3: root@feat0=0.5, left@feat1=0.4, right@feat2=0.6, leaves=[-1,2,3,5]",
+      "total_variance": 3.8100000000000005,
+      "marginal_variance_feat0": 2.25,
+      "marginal_variance_feat1": 0.54,
+      "marginal_variance_feat2": 0.24
+    }
+  },
+  "scott_parzen_pdf": {
+    "case_uniform": {
+      "counts": [
+        2,
+        2,
+        2,
+        2,
+        2
+      ],
+      "pdf": [
+        0.177731787645806,
+        0.21460217168798035,
+        0.21533208133242726,
+        0.21460217168798035,
+        0.177731787645806
+      ]
+    },
+    "case_peaked": {
+      "counts": [
+        10,
+        1,
+        0,
+        0,
+        0
+      ],
+      "pdf": [
+        0.8092242968238464,
+        0.13623264630936127,
+        0.021543814115380193,
+        0.016992832888341112,
+        0.016006409863070867
+      ]
+    },
+    "case_bimodal": {
+      "counts": [
+        5,
+        0,
+        0,
+        0,
+        5
+      ],
+      "pdf": [
+        0.21920138025507513,
+        0.19617570730128575,
+        0.16924582488727832,
+        0.19617570730128575,
+        0.21920138025507513
+      ]
+    },
+    "case_single_peak": {
+      "counts": [
+        0,
+        0,
+        8,
+        0,
+        0
+      ],
+      "pdf": [
+        0.021342264458371587,
+        0.06754786310701974,
+        0.8222197448692172,
+        0.06754786310701974,
+        0.021342264458371587
+      ]
+    }
+  },
+  "quantile_filter": {
+    "values": [
+      10.0,
+      3.0,
+      7.0,
+      1.0,
+      5.0,
+      2.0,
+      8.0,
+      4.0,
+      6.0,
+      9.0
+    ],
+    "case_minimize_q03": {
+      "quantile": 0.3,
+      "is_lower_better": true,
+      "min_n_top": 2,
+      "top_values": [
+        1.0,
+        2.0,
+        3.0
+      ],
+      "n_top": 3
+    },
+    "case_maximize_q03": {
+      "quantile": 0.3,
+      "is_lower_better": false,
+      "min_n_top": 2,
+      "top_values": [
+        8.0,
+        9.0,
+        10.0
+      ],
+      "n_top": 3
+    },
+    "case_minimize_q01_min3": {
+      "quantile": 0.1,
+      "is_lower_better": true,
+      "min_n_top": 3,
+      "top_values": [
+        1.0,
+        2.0,
+        3.0
+      ],
+      "n_top": 3
+    }
+  },
+  "pearson_divergence": {
+    "case_identical": {
+      "pdf_p": [
+        0.2,
+        0.2,
+        0.2,
+        0.2,
+        0.2
+      ],
+      "pdf_q": [
+        0.2,
+        0.2,
+        0.2,
+        0.2,
+        0.2
+      ],
+      "divergence": 0.0
+    },
+    "case_peaked_vs_uniform": {
+      "pdf_p": [
+        0.8,
+        0.05,
+        0.05,
+        0.05,
+        0.05
+      ],
+      "pdf_q": [
+        0.2,
+        0.2,
+        0.2,
+        0.2,
+        0.2
+      ],
+      "divergence": 2.2499999999887503
+    },
+    "case_bimodal_vs_uniform": {
+      "pdf_p": [
+        0.4,
+        0.05,
+        0.1,
+        0.05,
+        0.4
+      ],
+      "pdf_q": [
+        0.2,
+        0.2,
+        0.2,
+        0.2,
+        0.2
+      ],
+      "divergence": 0.6749999999966249
+    },
+    "case_two_peaked": {
+      "pdf_p": [
+        0.7,
+        0.1,
+        0.1,
+        0.05,
+        0.05
+      ],
+      "pdf_q": [
+        0.1,
+        0.1,
+        0.1,
+        0.1,
+        0.6
+      ],
+      "divergence": 4.129166666629574
+    }
+  },
+  "cardinality": {
+    "case_1d": {
+      "search_space": [
+        [
+          0.0,
+          1.0
+        ]
+      ],
+      "cardinality": 1.0
+    },
+    "case_2d": {
+      "search_space": [
+        [
+          0.0,
+          1.0
+        ],
+        [
+          0.0,
+          2.0
+        ]
+      ],
+      "cardinality": 2.0
+    },
+    "case_3d": {
+      "search_space": [
+        [
+          -1.0,
+          1.0
+        ],
+        [
+          0.0,
+          0.5
+        ],
+        [
+          2.0,
+          5.0
+        ]
+      ],
+      "cardinality": 3.0
+    },
+    "case_zero": {
+      "search_space": [
+        [
+          0.5,
+          0.5
+        ]
+      ],
+      "cardinality": 0.0
+    }
+  },
+  "discretize": {
+    "float_case": {
+      "values": [
+        0.0,
+        0.1,
+        0.2,
+        0.5,
+        0.5,
+        0.7,
+        0.9,
+        1.0,
+        0.3,
+        0.8
+      ],
+      "low": 0.0,
+      "high": 1.0,
+      "n_steps": 5,
+      "counts": [
+        2,
+        2,
+        2,
+        2,
+        2
+      ]
+    },
+    "int_case": {
+      "values": [
+        0,
+        1,
+        1,
+        2,
+        3,
+        3,
+        3,
+        4,
+        4,
+        4
+      ],
+      "low": 0,
+      "high": 4,
+      "n_steps": 5,
+      "counts": [
+        1,
+        2,
+        1,
+        3,
+        3
+      ]
+    }
+  },
+  "split_midpoints": {
+    "tree_b": {
+      "description": "Tree B 的分裂中点和大小",
+      "feat0_midpoints": [
+        0.25,
+        0.75
+      ],
+      "feat0_sizes": [
+        0.5,
+        0.5
+      ],
+      "feat1_midpoints": [
+        0.15,
+        0.65
+      ],
+      "feat1_sizes": [
+        0.3,
+        0.7
+      ]
+    }
+  }
+}

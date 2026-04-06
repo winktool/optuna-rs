@@ -3,4 +3,9 @@ tests/__pycache__/
 .DS_Store
 *.zip
 .pytest_cache/
-.md
+audit_*.md
+.vscode/
+.idea/
+*.log
+LICENSE
+NOTICE

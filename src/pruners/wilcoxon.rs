@@ -227,8 +227,26 @@ pub fn wilcoxon_signed_rank_test(diff_values: &[f64], direction: StudyDirection)
         }
     }
 
-    // 对齐 scipy method='auto': n ≤ 50 使用精确分布（含并列和零值情况）
-    if n <= 50 {
+    // 对齐 scipy method='auto' 行为：
+    // - 无并列秩次，n ≤ 50: 使用精确分布（DP 枚举所有 2^n 种符号分配）
+    // - 有并列秩次且 n ≤ 13: 使用精确分布（等价于 scipy PermutationMethod，2^13=8192 可行）
+    // - 有并列秩次且 n ≥ 14: 使用正态近似（scipy 不再枚举，切换到近似）
+    // - n > 50: 使用正态近似
+    let has_ties = {
+        let mut has = false;
+        let mut i = 0;
+        while i < abs_diffs.len() {
+            let mut j = i + 1;
+            while j < abs_diffs.len() && (abs_diffs[j].0 - abs_diffs[i].0).abs() < 1e-14 {
+                has = true;
+                j += 1;
+            }
+            i = j;
+        }
+        has
+    };
+
+    if n <= 50 && (!has_ties || n <= 13) {
         // 精确分布：DP 枚举所有非零秩次的 2^n_nonzero 种符号分配
         // 零值贡献固定（zsplit），从统计量中减去
         let stat = match direction {

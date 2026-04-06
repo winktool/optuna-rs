@@ -1,0 +1,1081 @@
+{
+  "float_adjust_high": [
+    {
+      "label": "step03",
+      "low": 0.0,
+      "high_input": 1.0,
+      "step": 0.3,
+      "adjusted_high": 0.9,
+      "single": false,
+      "contains": {
+        "0.0": true,
+        "0.9": true,
+        "1.0": false,
+        "0.45": false,
+        "0.3": true,
+        "0.6": true
+      }
+    },
+    {
+      "label": "step025",
+      "low": 0.0,
+      "high_input": 1.0,
+      "step": 0.25,
+      "adjusted_high": 1.0,
+      "single": false,
+      "contains": {
+        "0.0": true,
+        "1.0": true,
+        "0.5": true,
+        "0.25": true
+      }
+    },
+    {
+      "label": "step07",
+      "low": 0.0,
+      "high_input": 1.0,
+      "step": 0.7,
+      "adjusted_high": 0.7,
+      "single": false,
+      "contains": {
+        "0.0": true,
+        "0.7": true,
+        "1.0": false,
+        "0.35": false,
+        "1.4": false
+      }
+    },
+    {
+      "label": "step01",
+      "low": 0.0,
+      "high_input": 1.0,
+      "step": 0.1,
+      "adjusted_high": 1.0,
+      "single": false,
+      "contains": {
+        "0.0": true,
+        "1.0": true,
+        "0.5": true,
+        "0.1": true,
+        "0.2": true
+      }
+    },
+    {
+      "label": "step015",
+      "low": 0.0,
+      "high_input": 1.0,
+      "step": 0.15,
+      "adjusted_high": 0.9,
+      "single": false,
+      "contains": {
+        "0.0": true,
+        "0.9": true,
+        "1.0": false,
+        "0.45": true,
+        "0.15": true,
+        "0.3": true
+      }
+    },
+    {
+      "label": "step04",
+      "low": 0.0,
+      "high_input": 1.0,
+      "step": 0.4,
+      "adjusted_high": 0.8,
+      "single": false,
+      "contains": {
+        "0.0": true,
+        "0.8": true,
+        "1.0": false,
+        "0.4": true
+      }
+    },
+    {
+      "label": "offset_step03",
+      "low": 0.1,
+      "high_input": 0.95,
+      "step": 0.3,
+      "adjusted_high": 0.7,
+      "single": false,
+      "contains": {
+        "0.1": true,
+        "0.7": true,
+        "0.95": false,
+        "0.39999999999999997": true,
+        "0.4": true
+      }
+    },
+    {
+      "label": "offset005_step03",
+      "low": 0.05,
+      "high_input": 1.0,
+      "step": 0.3,
+      "adjusted_high": 0.95,
+      "single": false,
+      "contains": {
+        "0.05": true,
+        "0.95": true,
+        "1.0": false,
+        "0.5": false,
+        "0.35": true,
+        "0.65": true
+      }
+    },
+    {
+      "label": "large_step3",
+      "low": 0.0,
+      "high_input": 10.0,
+      "step": 3.0,
+      "adjusted_high": 9.0,
+      "single": false,
+      "contains": {
+        "0.0": true,
+        "9.0": true,
+        "10.0": false,
+        "4.5": false,
+        "3.0": true,
+        "6.0": true
+      }
+    },
+    {
+      "label": "large_step03",
+      "low": 0.0,
+      "high_input": 10.0,
+      "step": 0.3,
+      "adjusted_high": 9.9,
+      "single": false,
+      "contains": {
+        "0.0": true,
+        "9.9": true,
+        "10.0": false,
+        "4.95": false,
+        "0.3": true,
+        "0.6": true
+      }
+    },
+    {
+      "label": "mid_range_step07",
+      "low": 1.5,
+      "high_input": 5.5,
+      "step": 0.7,
+      "adjusted_high": 5.0,
+      "single": false,
+      "contains": {
+        "1.5": true,
+        "5.0": true,
+        "5.5": false,
+        "3.25": false,
+        "2.2": true,
+        "2.9": true
+      }
+    },
+    {
+      "label": "tiny_range",
+      "low": 0.0,
+      "high_input": 0.1,
+      "step": 0.3,
+      "adjusted_high": 0.0,
+      "single": true,
+      "contains": {
+        "0.0": true,
+        "0.1": false,
+        "0.3": false,
+        "0.6": false
+      }
+    },
+    {
+      "label": "exact_step",
+      "low": 0.0,
+      "high_input": 0.3,
+      "step": 0.3,
+      "adjusted_high": 0.3,
+      "single": false,
+      "contains": {
+        "0.0": true,
+        "0.3": true,
+        "0.15": false,
+        "0.6": false
+      }
+    },
+    {
+      "label": "zero_range",
+      "low": 0.0,
+      "high_input": 0.0,
+      "step": 0.3,
+      "adjusted_high": 0.0,
+      "single": true,
+      "contains": {
+        "0.0": true,
+        "0.3": false,
+        "0.6": false
+      }
+    }
+  ],
+  "float_single": [
+    {
+      "low": 0.0,
+      "high_input": 1.0,
+      "step": 0.3,
+      "adjusted_high": 0.9,
+      "single": false
+    },
+    {
+      "low": 0.0,
+      "high_input": 0.1,
+      "step": 0.3,
+      "adjusted_high": 0.0,
+      "single": true
+    },
+    {
+      "low": 0.0,
+      "high_input": 0.3,
+      "step": 0.3,
+      "adjusted_high": 0.3,
+      "single": false
+    },
+    {
+      "low": 0.0,
+      "high_input": 0.29,
+      "step": 0.3,
+      "adjusted_high": 0.0,
+      "single": true
+    },
+    {
+      "low": 5.0,
+      "high_input": 5.0,
+      "step": null,
+      "adjusted_high": 5.0,
+      "single": true
+    },
+    {
+      "low": 5.0,
+      "high_input": 5.0,
+      "step": 0.1,
+      "adjusted_high": 5.0,
+      "single": true
+    },
+    {
+      "low": 1e-10,
+      "high_input": 1e-10,
+      "step": null,
+      "adjusted_high": 1e-10,
+      "single": true
+    },
+    {
+      "low": 0.0,
+      "high_input": 1e-15,
+      "step": null,
+      "adjusted_high": 1e-15,
+      "single": false
+    },
+    {
+      "low": 0.0,
+      "high_input": 1.0,
+      "step": 2.0,
+      "adjusted_high": 0.0,
+      "single": true
+    },
+    {
+      "low": 0.0,
+      "high_input": 1.0,
+      "step": 1.0,
+      "adjusted_high": 1.0,
+      "single": false
+    },
+    {
+      "low": 0.0,
+      "high_input": 1.0,
+      "step": 0.999,
+      "adjusted_high": 0.999,
+      "single": false
+    },
+    {
+      "low": 0.0,
+      "high_input": 1.0,
+      "step": 1.001,
+      "adjusted_high": 0.0,
+      "single": true
+    }
+  ],
+  "float_contains": [
+    {
+      "dist": "float_0_1",
+      "value": 0.0,
+      "expected": true
+    },
+    {
+      "dist": "float_0_1",
+      "value": 0.5,
+      "expected": true
+    },
+    {
+      "dist": "float_0_1",
+      "value": 1.0,
+      "expected": true
+    },
+    {
+      "dist": "float_0_1",
+      "value": -1e-15,
+      "expected": false
+    },
+    {
+      "dist": "float_0_1",
+      "value": 1.000000000000001,
+      "expected": false
+    },
+    {
+      "dist": "float_0_1",
+      "value": "nan",
+      "expected": false
+    },
+    {
+      "dist": "float_0_1",
+      "value": "inf",
+      "expected": false
+    },
+    {
+      "dist": "float_0_1",
+      "value": "-inf",
+      "expected": false
+    },
+    {
+      "dist": "float_0_1_step025",
+      "value": 0.0,
+      "expected": true
+    },
+    {
+      "dist": "float_0_1_step025",
+      "value": 0.25,
+      "expected": true
+    },
+    {
+      "dist": "float_0_1_step025",
+      "value": 0.5,
+      "expected": true
+    },
+    {
+      "dist": "float_0_1_step025",
+      "value": 0.75,
+      "expected": true
+    },
+    {
+      "dist": "float_0_1_step025",
+      "value": 1.0,
+      "expected": true
+    },
+    {
+      "dist": "float_0_1_step025",
+      "value": 0.1,
+      "expected": false
+    },
+    {
+      "dist": "float_0_1_step025",
+      "value": 0.3,
+      "expected": false
+    },
+    {
+      "dist": "float_0_1_step025",
+      "value": 0.125,
+      "expected": false
+    },
+    {
+      "dist": "float_0_1_step025",
+      "value": 0.250000001,
+      "expected": true
+    },
+    {
+      "dist": "float_0_1_step025",
+      "value": 0.249999999,
+      "expected": true
+    },
+    {
+      "dist": "float_0_1_step025",
+      "value": 0.250001,
+      "expected": false
+    },
+    {
+      "dist": "float_0_1_step025",
+      "value": 0.249999,
+      "expected": false
+    },
+    {
+      "dist": "float_log_001_100",
+      "value": 0.001,
+      "expected": true
+    },
+    {
+      "dist": "float_log_001_100",
+      "value": 1.0,
+      "expected": true
+    },
+    {
+      "dist": "float_log_001_100",
+      "value": 100.0,
+      "expected": true
+    },
+    {
+      "dist": "float_log_001_100",
+      "value": 0.0,
+      "expected": false
+    },
+    {
+      "dist": "float_log_001_100",
+      "value": -1.0,
+      "expected": false
+    },
+    {
+      "dist": "float_log_001_100",
+      "value": 100.001,
+      "expected": false
+    }
+  ],
+  "float_repr": [
+    {
+      "dist": "float_0_10",
+      "value": 0.0,
+      "internal": 0.0,
+      "external": 0.0
+    },
+    {
+      "dist": "float_0_10",
+      "value": 1.5,
+      "internal": 1.5,
+      "external": 1.5
+    },
+    {
+      "dist": "float_0_10",
+      "value": 5.0,
+      "internal": 5.0,
+      "external": 5.0
+    },
+    {
+      "dist": "float_0_10",
+      "value": 10.0,
+      "internal": 10.0,
+      "external": 10.0
+    },
+    {
+      "dist": "float_0_10",
+      "value": 3.14159265,
+      "internal": 3.14159265,
+      "external": 3.14159265
+    },
+    {
+      "dist": "float_0_10",
+      "value": 1e-10,
+      "internal": 1e-10,
+      "external": 1e-10
+    },
+    {
+      "dist": "float_0_10",
+      "value": 9.999999,
+      "internal": 9.999999,
+      "external": 9.999999
+    },
+    {
+      "dist": "float_log_001_100",
+      "value": 0.001,
+      "internal": 0.001,
+      "external": 0.001
+    },
+    {
+      "dist": "float_log_001_100",
+      "value": 0.1,
+      "internal": 0.1,
+      "external": 0.1
+    },
+    {
+      "dist": "float_log_001_100",
+      "value": 1.0,
+      "internal": 1.0,
+      "external": 1.0
+    },
+    {
+      "dist": "float_log_001_100",
+      "value": 50.0,
+      "internal": 50.0,
+      "external": 50.0
+    },
+    {
+      "dist": "float_log_001_100",
+      "value": 100.0,
+      "internal": 100.0,
+      "external": 100.0
+    }
+  ],
+  "int_adjust_high": [
+    {
+      "label": "step3",
+      "low": 0,
+      "high_input": 10,
+      "step": 3,
+      "adjusted_high": 9,
+      "single": false,
+      "contains": {
+        "0": true,
+        "9": true,
+        "10": false,
+        "3": true,
+        "6": true
+      }
+    },
+    {
+      "label": "step2",
+      "low": 0,
+      "high_input": 10,
+      "step": 2,
+      "adjusted_high": 10,
+      "single": false,
+      "contains": {
+        "0": true,
+        "10": true,
+        "2": true,
+        "4": true
+      }
+    },
+    {
+      "label": "step1",
+      "low": 0,
+      "high_input": 10,
+      "step": 1,
+      "adjusted_high": 10,
+      "single": false,
+      "contains": {
+        "0": true,
+        "10": true,
+        "1": true,
+        "2": true
+      }
+    },
+    {
+      "label": "step7",
+      "low": 0,
+      "high_input": 20,
+      "step": 7,
+      "adjusted_high": 14,
+      "single": false,
+      "contains": {
+        "0": true,
+        "14": true,
+        "20": false,
+        "7": true
+      }
+    },
+    {
+      "label": "step30",
+      "low": 0,
+      "high_input": 100,
+      "step": 30,
+      "adjusted_high": 90,
+      "single": false,
+      "contains": {
+        "0": true,
+        "90": true,
+        "100": false,
+        "30": true,
+        "60": true
+      }
+    },
+    {
+      "label": "offset5_step4",
+      "low": 5,
+      "high_input": 25,
+      "step": 4,
+      "adjusted_high": 25,
+      "single": false,
+      "contains": {
+        "5": true,
+        "25": true,
+        "9": true,
+        "13": true
+      }
+    },
+    {
+      "label": "offset5_step4_adj",
+      "low": 5,
+      "high_input": 26,
+      "step": 4,
+      "adjusted_high": 25,
+      "single": false,
+      "contains": {
+        "5": true,
+        "25": true,
+        "26": false,
+        "9": true,
+        "13": true
+      }
+    },
+    {
+      "label": "tiny_range",
+      "low": 0,
+      "high_input": 2,
+      "step": 5,
+      "adjusted_high": 0,
+      "single": true,
+      "contains": {
+        "0": true,
+        "2": false,
+        "5": false,
+        "10": false
+      }
+    },
+    {
+      "label": "zero_range",
+      "low": 0,
+      "high_input": 0,
+      "step": 1,
+      "adjusted_high": 0,
+      "single": true,
+      "contains": {
+        "0": true,
+        "1": false,
+        "2": false
+      }
+    },
+    {
+      "label": "large_range",
+      "low": 1,
+      "high_input": 1000,
+      "step": 1,
+      "adjusted_high": 1000,
+      "single": false,
+      "contains": {
+        "1": true,
+        "1000": true,
+        "2": true,
+        "3": true
+      }
+    },
+    {
+      "label": "large_step7",
+      "low": 1,
+      "high_input": 1000,
+      "step": 7,
+      "adjusted_high": 995,
+      "single": false,
+      "contains": {
+        "1": true,
+        "995": true,
+        "1000": false,
+        "8": true,
+        "15": true
+      }
+    }
+  ],
+  "int_single": [
+    {
+      "low": 0,
+      "high_input": 10,
+      "step": 1,
+      "log": false,
+      "adjusted_high": 10,
+      "single": false
+    },
+    {
+      "low": 5,
+      "high_input": 5,
+      "step": 1,
+      "log": false,
+      "adjusted_high": 5,
+      "single": true
+    },
+    {
+      "low": 5,
+      "high_input": 5,
+      "step": 1,
+      "log": true,
+      "adjusted_high": 5,
+      "single": true
+    },
+    {
+      "low": 1,
+      "high_input": 100,
+      "step": 1,
+      "log": true,
+      "adjusted_high": 100,
+      "single": false
+    },
+    {
+      "low": 0,
+      "high_input": 2,
+      "step": 5,
+      "log": false,
+      "adjusted_high": 0,
+      "single": true
+    },
+    {
+      "low": 0,
+      "high_input": 10,
+      "step": 5,
+      "log": false,
+      "adjusted_high": 10,
+      "single": false
+    },
+    {
+      "low": 0,
+      "high_input": 5,
+      "step": 5,
+      "log": false,
+      "adjusted_high": 5,
+      "single": false
+    },
+    {
+      "low": 0,
+      "high_input": 4,
+      "step": 5,
+      "log": false,
+      "adjusted_high": 0,
+      "single": true
+    }
+  ],
+  "int_contains": [
+    {
+      "dist": "int_0_10_step3",
+      "value": 0.0,
+      "expected": true
+    },
+    {
+      "dist": "int_0_10_step3",
+      "value": 3.0,
+      "expected": true
+    },
+    {
+      "dist": "int_0_10_step3",
+      "value": 6.0,
+      "expected": true
+    },
+    {
+      "dist": "int_0_10_step3",
+      "value": 9.0,
+      "expected": true
+    },
+    {
+      "dist": "int_0_10_step3",
+      "value": 10.0,
+      "expected": false
+    },
+    {
+      "dist": "int_0_10_step3",
+      "value": 1.0,
+      "expected": false
+    },
+    {
+      "dist": "int_0_10_step3",
+      "value": 2.0,
+      "expected": false
+    },
+    {
+      "dist": "int_0_10_step3",
+      "value": -1.0,
+      "expected": false
+    },
+    {
+      "dist": "int_0_10_step3",
+      "value": 12.0,
+      "expected": false
+    },
+    {
+      "dist": "int_0_10_step3",
+      "value": 0.5,
+      "expected": false
+    },
+    {
+      "dist": "int_0_10",
+      "value": "nan",
+      "expected": false
+    },
+    {
+      "dist": "int_0_10",
+      "value": "inf",
+      "expected": false
+    },
+    {
+      "dist": "int_0_10",
+      "value": "-inf",
+      "expected": false
+    }
+  ],
+  "int_repr": [
+    {
+      "dist": "int_0_10",
+      "value": 0,
+      "internal": 0.0,
+      "external": 0
+    },
+    {
+      "dist": "int_0_10",
+      "value": 5,
+      "internal": 5.0,
+      "external": 5
+    },
+    {
+      "dist": "int_0_10",
+      "value": 10,
+      "internal": 10.0,
+      "external": 10
+    }
+  ],
+  "categorical": [
+    {
+      "dist": "cat_abc",
+      "choice": "a",
+      "internal": 0,
+      "external": "a",
+      "single": false
+    },
+    {
+      "dist": "cat_abc",
+      "choice": "b",
+      "internal": 1,
+      "external": "b",
+      "single": false
+    },
+    {
+      "dist": "cat_abc",
+      "choice": "c",
+      "internal": 2,
+      "external": "c",
+      "single": false
+    },
+    {
+      "dist": "cat_mixed",
+      "choice": "None",
+      "choice_type": "NoneType",
+      "internal": 0,
+      "external_type": "NoneType",
+      "external": "None",
+      "single": false
+    },
+    {
+      "dist": "cat_mixed",
+      "choice": "True",
+      "choice_type": "bool",
+      "internal": 1,
+      "external_type": "bool",
+      "external": "True",
+      "single": false
+    },
+    {
+      "dist": "cat_mixed",
+      "choice": "42",
+      "choice_type": "int",
+      "internal": 2,
+      "external_type": "int",
+      "external": "42",
+      "single": false
+    },
+    {
+      "dist": "cat_mixed",
+      "choice": "3.14",
+      "choice_type": "float",
+      "internal": 3,
+      "external_type": "float",
+      "external": "3.14",
+      "single": false
+    },
+    {
+      "dist": "cat_mixed",
+      "choice": "hello",
+      "choice_type": "str",
+      "internal": 4,
+      "external_type": "str",
+      "external": "hello",
+      "single": false
+    },
+    {
+      "dist": "cat_xyz_contains",
+      "contains": [
+        {
+          "value": 0.0,
+          "expected": true
+        },
+        {
+          "value": 1.0,
+          "expected": true
+        },
+        {
+          "value": 2.0,
+          "expected": true
+        },
+        {
+          "value": 3.0,
+          "expected": false
+        },
+        {
+          "value": -1.0,
+          "expected": false
+        },
+        {
+          "value": 0.5,
+          "expected": true
+        },
+        {
+          "value": 2.9,
+          "expected": true
+        }
+      ]
+    },
+    {
+      "dist": "cat_single",
+      "single": true,
+      "internal_42": 0,
+      "external_0": 42
+    }
+  ],
+  "compatibility": [
+    {
+      "label": "float_same_log_false",
+      "compatible": true
+    },
+    {
+      "label": "float_diff_log",
+      "compatible": false
+    },
+    {
+      "label": "float_diff_step_ok",
+      "compatible": true
+    },
+    {
+      "label": "float_step_vs_none_ok",
+      "compatible": true
+    },
+    {
+      "label": "int_same_log_false",
+      "compatible": true
+    },
+    {
+      "label": "int_diff_log",
+      "compatible": false
+    },
+    {
+      "label": "int_diff_step_ok",
+      "compatible": true
+    },
+    {
+      "label": "cat_same",
+      "compatible": true
+    },
+    {
+      "label": "cat_diff",
+      "compatible": false
+    },
+    {
+      "label": "float_vs_int",
+      "compatible": false
+    },
+    {
+      "label": "float_vs_cat",
+      "compatible": false
+    },
+    {
+      "label": "int_vs_cat",
+      "compatible": false
+    }
+  ],
+  "single_value": [
+    {
+      "type": "float",
+      "low": 5.0,
+      "value": 5.0,
+      "value_type": "float"
+    },
+    {
+      "type": "float_step",
+      "low": 3.0,
+      "high_input": 3.1,
+      "step": 0.5,
+      "adjusted_high": 3.0,
+      "value": 3.0
+    },
+    {
+      "type": "int",
+      "low": 7,
+      "value": 7,
+      "value_type": "int"
+    },
+    {
+      "type": "int_step",
+      "low": 0,
+      "high_input": 2,
+      "step": 5,
+      "adjusted_high": 0,
+      "value": 0
+    },
+    {
+      "type": "categorical",
+      "choices": [
+        "only"
+      ],
+      "value": "only"
+    }
+  ],
+  "is_log": [
+    {
+      "label": "float_no_log",
+      "is_log": false
+    },
+    {
+      "label": "float_log",
+      "is_log": true
+    },
+    {
+      "label": "int_no_log",
+      "is_log": false
+    },
+    {
+      "label": "int_log",
+      "is_log": true
+    },
+    {
+      "label": "categorical",
+      "is_log": false
+    }
+  ],
+  "json_roundtrip": [
+    {
+      "label": "float_basic",
+      "json": "{\"name\": \"FloatDistribution\", \"attributes\": {\"step\": null, \"low\": 0.0, \"high\": 10.0, \"log\": false}}",
+      "roundtrip_ok": true
+    },
+    {
+      "label": "float_log",
+      "json": "{\"name\": \"FloatDistribution\", \"attributes\": {\"step\": null, \"low\": 1e-05, \"high\": 1.0, \"log\": true}}",
+      "roundtrip_ok": true
+    },
+    {
+      "label": "float_step",
+      "json": "{\"name\": \"FloatDistribution\", \"attributes\": {\"step\": 0.1, \"low\": 0.0, \"high\": 1.0, \"log\": false}}",
+      "roundtrip_ok": true
+    },
+    {
+      "label": "float_step03",
+      "json": "{\"name\": \"FloatDistribution\", \"attributes\": {\"step\": 0.3, \"low\": 0.0, \"high\": 0.9, \"log\": false}}",
+      "roundtrip_ok": true
+    },
+    {
+      "label": "int_basic",
+      "json": "{\"name\": \"IntDistribution\", \"attributes\": {\"log\": false, \"step\": 1, \"low\": 0, \"high\": 100}}",
+      "roundtrip_ok": true
+    },
+    {
+      "label": "int_log",
+      "json": "{\"name\": \"IntDistribution\", \"attributes\": {\"log\": true, \"step\": 1, \"low\": 1, \"high\": 1000}}",
+      "roundtrip_ok": true
+    },
+    {
+      "label": "int_step3",
+      "json": "{\"name\": \"IntDistribution\", \"attributes\": {\"log\": false, \"step\": 3, \"low\": 0, \"high\": 9}}",
+      "roundtrip_ok": true
+    },
+    {
+      "label": "cat_str",
+      "json": "{\"name\": \"CategoricalDistribution\", \"attributes\": {\"choices\": [\"x\", \"y\", \"z\"]}}",
+      "roundtrip_ok": true
+    },
+    {
+      "label": "cat_mixed",
+      "json": "{\"name\": \"CategoricalDistribution\", \"attributes\": {\"choices\": [null, 1, 2.5, \"hi\"]}}",
+      "roundtrip_ok": true
+    }
+  ]
+}
